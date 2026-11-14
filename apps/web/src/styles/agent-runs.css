@@ -1,0 +1,335 @@
+.agent-run-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 24px;
+  background: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.agent-run-heading {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 13px;
+  color: var(--muted-foreground);
+}
+.agent-run-heading strong {
+  color: var(--text, var(--foreground));
+  font-size: 13px;
+}
+.agent-run-heading svg {
+  margin-top: 3px;
+}
+.agent-run-form fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+.agent-run-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+.agent-run-form button {
+  align-self: flex-start;
+}
+.agent-run {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+}
+.agent-run header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--muted-foreground);
+}
+.agent-run header button {
+  margin-left: auto;
+}
+.agent-run h3 {
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.agent-run section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.agent-run section > button {
+  align-self: flex-start;
+}
+.agent-run-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-weight: 600;
+  background: var(--muted);
+  color: var(--secondary-foreground);
+}
+.agent-run-status .spinner {
+  width: 12px;
+  height: 12px;
+}
+.agent-run-succeeded .agent-run-status {
+  background: var(--muted);
+  color: #1e6b37;
+}
+.agent-run-failed .agent-run-status {
+  background: var(--accent-soft);
+  color: var(--primary);
+}
+.agent-run-running .agent-run-status,
+.agent-run-queued .agent-run-status {
+  background: #f1edfb;
+  color: #5b3fa3;
+}
+.agent-tool-calls {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12.5px;
+}
+.agent-tool-calls pre {
+  margin: 4px 0 0;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--muted);
+  font-size: 12.5px;
+}
+.agent-tool-rejected span,
+.agent-tool-error span {
+  color: var(--primary);
+}
+.agent-run-history {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+}
+.agent-run-history .agent-run {
+  margin-top: 10px;
+}
+.agent-live {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.agent-live-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.agent-live-heading h3 {
+  margin: 0;
+}
+.agent-live-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  background: var(--muted);
+  color: var(--secondary-foreground);
+}
+.agent-live-on {
+  background: var(--muted);
+  color: #1e6b37;
+}
+.agent-mcp-servers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12.5px;
+}
+.agent-mcp-servers li {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--muted);
+  color: var(--secondary-foreground);
+}
+.agent-mcp-connected {
+  background: var(--muted) !important;
+  color: #1e6b37 !important;
+}
+.agent-mcp-failed {
+  background: var(--accent-soft) !important;
+  color: var(--primary) !important;
+}
+.agent-live-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 520px;
+  overflow-y: auto;
+  font-size: 13px;
+}
+.agent-live-status {
+  color: var(--muted-foreground);
+  font-style: italic;
+}
+.agent-live-assistant,
+.agent-live-user,
+.agent-live-question {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f6f4fc;
+}
+.agent-live-user {
+  align-self: flex-end;
+  max-width: 85%;
+  background: #eaf2fd;
+}
+.agent-live-user p {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+}
+.agent-live-question {
+  border-left: 3px solid #5b3fa3;
+}
+.agent-live-answer {
+  margin: 6px 0 0;
+  font-weight: 600;
+  color: #1e6b37;
+}
+.agent-live-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 13px;
+  margin-left: 2px;
+  background: #5b3fa3;
+  animation: agent-live-blink 1s steps(2, start) infinite;
+}
+@keyframes agent-live-blink {
+  to {
+    visibility: hidden;
+  }
+}
+.agent-live-tool summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  cursor: pointer;
+}
+.agent-live-tool .spinner {
+  width: 10px;
+  height: 10px;
+}
+.agent-live-tool pre {
+  margin: 4px 0 0;
+  max-width: 100%;
+  max-height: 240px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--muted);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+}
+.agent-live-tool-failed summary {
+  color: var(--primary);
+}
+.agent-live-server {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #f1edfb;
+  color: #5b3fa3;
+  font-size: 12px;
+  font-weight: 600;
+}
+.agent-live-permission {
+  font-size: 12.5px;
+  color: var(--muted-foreground);
+}
+.agent-live-permission-denied {
+  color: var(--primary);
+}
+.agent-live-error {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--primary);
+}
+.agent-live-form fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+.agent-live-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+.agent-live-form button[type='submit'] {
+  align-self: flex-start;
+}
+.agent-live-ask fieldset {
+  padding: 12px;
+  border: 1px solid #d9cff3;
+  border-radius: 8px;
+  background: #fbfaff;
+}
+.agent-live-ask legend {
+  font-weight: 600;
+  font-size: 13px;
+}
+.agent-live-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+@media (max-width: 600px) {
+  .agent-run-panel {
+    padding: 14px 12px;
+  }
+}
+
+.agent-trigger-client_reply {
+  color: #a16207;
+  background: #fefce8;
+  border-color: #fef08a;
+}
+.agent-trigger-auto {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+.agent-trigger-incident_review {
+  color: #6d28d9;
+  background: #f5f3ff;
+  border-color: #ddd6fe;
+}
+.agent-trigger-flow {
+  color: #0f766e;
+  background: #f0fdfa;
+  border-color: #99f6e4;
+}

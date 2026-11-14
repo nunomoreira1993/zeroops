@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Hook post-receive do repositorio bare /opt/zeroops/repo.git em Qualidade.
+# So publica o ramo main; o script de deploy usado e o do proprio commit recebido.
+set -euo pipefail
+unset GIT_DIR
+
+while read -r _old new ref; do
+  [ "$ref" = "refs/heads/main" ] || {
+    echo "ZeroOps: ref $ref recebida sem deploy (so main publica)."
+    continue
+  }
+  [ "$new" != "0000000000000000000000000000000000000000" ] || continue
+  script=$(mktemp)
+  git --git-dir=/opt/zeroops/repo.git show "$new:deploy/qa/deploy-from-git.sh" >"$script"
+  chmod 700 "$script"
+  echo "ZeroOps: a publicar $new em Qualidade..."
+  status=0
+  bash "$script" "$new" || status=$?
+  rm -f "$script"
+  exit "$status"
+done

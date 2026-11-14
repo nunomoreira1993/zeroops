@@ -1,0 +1,35 @@
+[Unit]
+Description=ZeroOps - mysqld_exporter (estado do MariaDB, so 127.0.0.1)
+After=network-online.target mariadb.service
+
+[Service]
+Type=simple
+User=zeroops-metrics
+Group=zeroops-metrics
+ExecStart=/opt/zeroops-metrics/bin/mysqld_exporter \
+  --config.my-cnf=/etc/zeroops-metrics/mysqld-exporter.cnf \
+  --web.listen-address=127.0.0.1:9104
+Restart=always
+RestartSec=10
+
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=10%
+MemoryLimit=64M
+MemoryMax=64M
+TasksMax=16
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

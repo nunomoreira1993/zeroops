@@ -1,0 +1,71 @@
+# Prometheus do ZeroOps em Qualidade. Tudo escuta em 127.0.0.1 (rede do host).
+# A label `env` separa os ambientes: a integracao "Metricas" de cada ambiente filtra por ela.
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+# Regras geradas pelo ZeroOps a partir da configuracao de cada projeto (Saude > Regras de alerta).
+rule_files:
+  - /etc/prometheus/rules.d/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['127.0.0.1:9093']
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+        labels: { env: quality, service: prometheus }
+
+  - job_name: node
+    static_configs:
+      - targets: ['127.0.0.1:9100']
+        labels: { env: quality, service: servidor, role: qa }
+    relabel_configs: &qa_instance
+      - target_label: instance
+        replacement: uqphorders24-dev
+
+  - job_name: redis
+    static_configs:
+      - targets: ['127.0.0.1:9121']
+        labels: { env: quality, service: redis, role: qa }
+    relabel_configs: *qa_instance
+
+  - job_name: mysql
+    static_configs:
+      - targets: ['127.0.0.1:9104']
+        labels: { env: quality, service: mysql, role: qa }
+    relabel_configs: *qa_instance
+
+  # Monitorizacao externa (HTTP 2xx) via blackbox exporter; um pedido por minuto e alvo.
+  # A label `probe_module` escolhe o modulo (http_2xx_interno para certificados de CA interna).
+  - job_name: http
+    scrape_interval: 60s
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets: ['https://devpizzahut.uq.pt/']
+        labels: { env: quality, service: site, probe_module: http_2xx_interno }
+      - targets: ['http://127.0.0.1:4311/api/health']
+        labels: { env: quality, service: zeroops }
+      - targets: ['https://encomendar.pizzahut.pt/']
+        labels: { env: production, service: site }
+      # Pizza Movil: a label `project` encaminha os alertas para o projeto no ZeroOps (alertmanager.yml).
+      - targets: ['https://dev.pizzamovil.es/']
+        labels: { env: quality, service: site, project: pizzamovil, probe_module: http_2xx_interno }
+      - targets: ['https://www.pizzamovil.es/es/']
+        labels: { env: production, service: site, project: pizzamovil }
+    relabel_configs:
+      - source_labels: [probe_module]
+        regex: (.+)
+        target_label: __param_module
+      - action: labeldrop
+        regex: probe_module
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 127.0.0.1:9115

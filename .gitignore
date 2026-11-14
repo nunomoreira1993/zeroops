@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-browser/
+.env
+.env.*
+!.env.example
+coverage/
+*.log
+*.tsbuildinfo
+test-results/
+__pycache__/
+*.pyc
+*.cnf
+*.pem
+*.key

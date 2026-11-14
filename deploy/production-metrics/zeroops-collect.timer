@@ -1,0 +1,10 @@
+[Unit]
+Description=ZeroOps - coletor textfile a cada 30 s
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

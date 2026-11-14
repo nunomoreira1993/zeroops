@@ -1,0 +1,169 @@
+{
+  "start": "analise",
+  "nodes": [
+    {
+      "id": "analise",
+      "op": "copilot_task",
+      "label": "Copilot lê o alerta",
+      "config": { "mode": "analysis", "askClient": false }
+    },
+    {
+      "id": "tentativa",
+      "op": "copilot_task",
+      "label": "Copilot tenta a correção",
+      "instructions": "Com base no alerta e na análise, tenta a correção configurada para o projeto. Trabalha numa cópia temporária: não alteres o ambiente. Em summary explica a causa provável, a alteração feita e a evidência que a suporta; em proposedTests indica como verificar a recuperação. Se não for possível corrigir por código ou configuração, explica o que tentaste e o que ficou por confirmar.",
+      "config": { "mode": "develop" }
+    },
+    {
+      "id": "correcao",
+      "op": "action",
+      "label": "Aplicar correção no ambiente",
+      "config": { "action": "health_remediation", "procedure": "" }
+    },
+    {
+      "id": "verificar",
+      "op": "action",
+      "label": "Verificar recuperação",
+      "config": { "action": "verify_health_recovery", "timeoutMinutes": 30 }
+    },
+    {
+      "id": "relatorio",
+      "op": "copilot_task",
+      "label": "Relatório da correção",
+      "instructions": "O incidente recuperou. Em summary escreve o relatório técnico para a equipa: o que aconteceu, a correção preparada (diff), se foi aplicada no ambiente e a evidência da recuperação. Em replyDraft escreve só o corpo da mensagem final ao cliente, em português de Portugal, sem detalhes sensíveis.",
+      "config": { "mode": "report" }
+    },
+    {
+      "id": "mensagem_cliente",
+      "op": "action",
+      "label": "Mensagem final ao cliente",
+      "config": {
+        "action": "client_message",
+        "source": "previous_reply",
+        "body": "O incidente detetado foi corrigido e o serviço está a funcionar normalmente."
+      }
+    },
+    {
+      "id": "relatorio_falha",
+      "op": "copilot_task",
+      "label": "Registo da tentativa",
+      "instructions": "A correção falhou ou não foi possível verificar a recuperação. Em summary regista para a equipa: o que foi tentado, o que ficou por confirmar e o próximo passo recomendado, com as evidências.",
+      "config": { "mode": "report" }
+    },
+    {
+      "id": "nota_falha",
+      "op": "action",
+      "label": "Nota para a equipa",
+      "config": {
+        "action": "internal_note",
+        "source": "previous_summary",
+        "body": "A correção automática não ficou verificada. Próximo passo: a equipa analisa o incidente."
+      }
+    },
+    {
+      "id": "equipa",
+      "op": "human_decision",
+      "label": "Decisão da equipa",
+      "assignee": { "kind": "team" },
+      "config": {
+        "options": [
+          {
+            "port": "resolve",
+            "label": "Resolver",
+            "requiresComment": true,
+            "commentVisibility": "public"
+          },
+          { "port": "retry", "label": "Tentar de novo", "requiresComment": true },
+          { "port": "escalate", "label": "Escalar", "requiresComment": true }
+        ]
+      }
+    },
+    { "id": "resolvido", "op": "end", "label": "Resolvido", "config": { "outcome": "resolved" } },
+    { "id": "escalado", "op": "end", "label": "Escalado", "config": { "outcome": "escalated" } }
+  ],
+  "edges": [
+    { "id": "analise-done", "source": "analise", "port": "done", "target": "tentativa" },
+    {
+      "id": "analise-needs_information",
+      "source": "analise",
+      "port": "needs_information",
+      "target": "tentativa"
+    },
+    { "id": "analise-failed", "source": "analise", "port": "failed", "target": "tentativa" },
+    { "id": "tentativa-done", "source": "tentativa", "port": "done", "target": "correcao" },
+    {
+      "id": "tentativa-failed",
+      "source": "tentativa",
+      "port": "failed",
+      "target": "relatorio_falha"
+    },
+    { "id": "correcao-done", "source": "correcao", "port": "done", "target": "verificar" },
+    {
+      "id": "correcao-unavailable",
+      "source": "correcao",
+      "port": "unavailable",
+      "target": "verificar"
+    },
+    {
+      "id": "correcao-failed",
+      "source": "correcao",
+      "port": "failed",
+      "target": "relatorio_falha"
+    },
+    { "id": "verificar-passed", "source": "verificar", "port": "passed", "target": "relatorio" },
+    {
+      "id": "verificar-failed",
+      "source": "verificar",
+      "port": "failed",
+      "target": "relatorio_falha"
+    },
+    {
+      "id": "verificar-unknown",
+      "source": "verificar",
+      "port": "unknown",
+      "target": "relatorio_falha"
+    },
+    { "id": "relatorio-done", "source": "relatorio", "port": "done", "target": "mensagem_cliente" },
+    {
+      "id": "relatorio-failed",
+      "source": "relatorio",
+      "port": "failed",
+      "target": "mensagem_cliente"
+    },
+    {
+      "id": "mensagem_cliente-done",
+      "source": "mensagem_cliente",
+      "port": "done",
+      "target": "resolvido"
+    },
+    {
+      "id": "relatorio_falha-done",
+      "source": "relatorio_falha",
+      "port": "done",
+      "target": "nota_falha"
+    },
+    {
+      "id": "relatorio_falha-failed",
+      "source": "relatorio_falha",
+      "port": "failed",
+      "target": "nota_falha"
+    },
+    { "id": "nota_falha-done", "source": "nota_falha", "port": "done", "target": "equipa" },
+    { "id": "equipa-resolve", "source": "equipa", "port": "resolve", "target": "resolvido" },
+    { "id": "equipa-retry", "source": "equipa", "port": "retry", "target": "tentativa" },
+    { "id": "equipa-escalate", "source": "equipa", "port": "escalate", "target": "escalado" }
+  ],
+  "layout": {
+    "analise": { "x": 0, "y": 0 },
+    "tentativa": { "x": 280, "y": 0 },
+    "correcao": { "x": 560, "y": 0 },
+    "verificar": { "x": 840, "y": 0 },
+    "relatorio": { "x": 1120, "y": -105 },
+    "mensagem_cliente": { "x": 1400, "y": -105 },
+    "resolvido": { "x": 1680, "y": -105 },
+    "relatorio_falha": { "x": 1120, "y": 135 },
+    "nota_falha": { "x": 1400, "y": 135 },
+    "equipa": { "x": 1680, "y": 135 },
+    "escalado": { "x": 1960, "y": 135 }
+  }
+}

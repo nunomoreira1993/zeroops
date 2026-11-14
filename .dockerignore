@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-browser
+apps/web/dist
+apps/web/node_modules
+.git
+.env
+.env.*
+coverage
+test-results
+*.log

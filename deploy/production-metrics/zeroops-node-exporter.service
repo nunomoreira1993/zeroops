@@ -1,0 +1,35 @@
+[Unit]
+Description=ZeroOps - node_exporter (metricas do servidor, so 127.0.0.1)
+After=network-online.target
+
+[Service]
+Type=simple
+User=zeroops-metrics
+Group=zeroops-metrics
+ExecStart=/opt/zeroops-metrics/bin/node_exporter \
+  --web.listen-address=127.0.0.1:9100 \
+  --collector.textfile.directory=/var/lib/zeroops-metrics/textfile \
+  --collector.filesystem.mount-points-exclude=^/(dev|proc|run|sys|snap|var/lib/docker/.+)($$|/)
+Restart=always
+RestartSec=10
+
+# Nunca competir com o site: prioridade minima de CPU/IO e limites de recursos.
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=10%
+MemoryLimit=64M
+MemoryMax=64M
+TasksMax=16
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

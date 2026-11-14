@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "outDir": "dist-browser"
+  },
+  "include": ["tests/e2e/browser.ts", "tests/helpers/cluster.ts"],
+  "exclude": ["node_modules", "dist", "dist-browser", "apps/web", "**/*.test.ts"]
+}

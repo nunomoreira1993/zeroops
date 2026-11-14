@@ -1,0 +1,742 @@
+/* Fluxos de resolução: editor, desenho e acompanhamento no pedido. */
+
+.flow-editor {
+  display: grid;
+  gap: 1rem;
+}
+
+.flow-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.flow-toolbar-spacer {
+  flex: 1;
+}
+
+.flow-dirty {
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
+}
+
+.flow-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 400px);
+  gap: 1rem;
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .flow-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.flow-main,
+.flow-side {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.flow-side-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.flow-side-tabs button {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 2px solid transparent;
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
+}
+
+.flow-side-tabs button[aria-pressed='true'] {
+  color: var(--accent-dark);
+  border-bottom-color: var(--primary);
+  font-weight: 600;
+}
+
+.flow-canvas {
+  width: 100%;
+  min-height: 280px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fafafa;
+  overflow: hidden;
+}
+
+.flow-canvas .react-flow__edges {
+  z-index: 0;
+}
+
+.flow-canvas .react-flow__nodes {
+  z-index: 1;
+}
+
+.flow-canvas .react-flow__edge-path.flow-orthogonal-path {
+  stroke: #64748b;
+  stroke-width: 1.8;
+}
+
+.flow-canvas .react-flow__edge.flow-edge-selected .react-flow__edge-path,
+.flow-canvas .react-flow__edge-path.flow-edge-selected {
+  stroke: var(--primary);
+  stroke-width: 3;
+}
+
+.flow-edge-label {
+  position: absolute;
+  z-index: 2;
+  padding: 0.12rem 0.45rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #fff;
+  color: #334155;
+  box-shadow: 0 1px 3px rgb(15 23 42 / 14%);
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.25;
+  max-width: 152px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.flow-edge-label-success {
+  border-color: #86efac;
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.flow-edge-label-failure {
+  border-color: #fca5a5;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.flow-edge-label-unroutable {
+  border-color: #dc2626;
+  border-radius: 0.35rem;
+  background: #fff7ed;
+  color: #991b1b;
+  white-space: normal;
+}
+
+.flow-edge-label.flow-edge-selected {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 22%, transparent);
+}
+
+/* Etapas */
+.flow-step {
+  position: relative;
+  width: 280px;
+  padding: 0.6rem 0.75rem 0.5rem;
+  border: 1px solid #d4d4d8;
+  border-left-width: 4px;
+  border-radius: 0.5rem;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 6%);
+  font-size: 0.875rem;
+  line-height: 1.3;
+}
+
+.flow-step.is-selected {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.flow-step.flow-path-origin {
+  outline: 3px solid #2563eb;
+  outline-offset: 3px;
+}
+
+.flow-step.flow-path-destination {
+  outline: 3px solid #7c3aed;
+  outline-offset: 3px;
+}
+
+.flow-op-action {
+  border-left-color: #64748b;
+}
+
+.flow-op-copilot_task {
+  border-left-color: #7c3aed;
+}
+
+.flow-op-human_decision {
+  border-left-color: #d97706;
+}
+
+.flow-op-end {
+  border-left-color: #16a34a;
+}
+
+.flow-step-head {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.2rem;
+  color: var(--muted-foreground);
+}
+
+.flow-step-op {
+  display: inline-flex;
+}
+
+.flow-step-kind {
+  flex: 1;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.flow-step-badge {
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  background: var(--secondary);
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+
+.flow-step-label {
+  display: block;
+  color: var(--foreground);
+  font-size: 0.875rem;
+}
+
+.flow-step-assignee {
+  display: block;
+  margin-top: 0.15rem;
+  color: var(--muted-foreground);
+}
+
+.flow-step-ports {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.45rem;
+  padding-top: 0.4rem;
+  border-top: 1px dashed var(--border);
+}
+
+.flow-port {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--secondary);
+  font-size: 0.7rem;
+  text-align: center;
+  overflow-wrap: break-word;
+}
+
+.flow-port-success {
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.flow-port-failure {
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.flow-step .flow-handle-in,
+.flow-step .flow-handle-out {
+  width: 10px;
+  height: 10px;
+  background: #71717a;
+  border: 2px solid #fff;
+}
+
+.flow-step .flow-handle-out {
+  background: var(--primary);
+  z-index: 3;
+}
+
+/* Marcas: proposta do assistente, percurso do pedido, simulação e validação */
+.flow-mark-added {
+  border-color: #16a34a;
+  background: #f0fdf4;
+}
+
+.flow-mark-changed {
+  border-color: #ca8a04;
+  background: #fefce8;
+}
+
+.flow-mark-removed {
+  border-style: dashed;
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+
+.flow-mark-done {
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
+.flow-mark-current {
+  border-color: var(--primary);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 25%, transparent);
+}
+
+.flow-mark-possible {
+  border-style: dashed;
+  border-color: #60a5fa;
+}
+
+.flow-mark-issue {
+  border-color: var(--destructive);
+  background: #fef2f2;
+}
+
+.flow-mark-stopped {
+  border-color: #f59e0b;
+  background: #fffbeb;
+  box-shadow: 0 0 0 3px rgb(245 158 11 / 25%);
+}
+
+.flow-edge-added .react-flow__edge-path {
+  stroke: #16a34a;
+  stroke-width: 2.5;
+}
+
+.flow-edge-removed .react-flow__edge-path {
+  stroke: #a1a1aa;
+  stroke-dasharray: 5 4;
+}
+
+.flow-edge-done .react-flow__edge-path {
+  stroke: #16a34a;
+  stroke-width: 2.5;
+}
+
+.flow-edge-possible .react-flow__edge-path {
+  stroke: #3b82f6;
+}
+
+.flow-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.8rem;
+}
+
+.flow-legend span::before {
+  content: '';
+  display: inline-block;
+  width: 0.75rem;
+  height: 0.75rem;
+  margin-right: 0.35rem;
+  border-radius: 3px;
+  vertical-align: -0.1rem;
+  border: 2px solid;
+}
+
+.flow-legend-done::before {
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
+.flow-legend-current::before {
+  border-color: var(--primary);
+  background: var(--accent-soft);
+}
+
+.flow-legend-possible::before {
+  border-color: #60a5fa;
+  border-style: dashed !important;
+}
+
+/* Painéis laterais e formulários */
+.flow-config,
+.flow-settings,
+.flow-simulator,
+.flow-assistant {
+  display: grid;
+  gap: 0.75rem;
+}
+
+/* .panel não tem padding; o painel do ticket (.detail-section) usa .panel-padding. */
+.flows-list > .panel,
+.flow-config.stack,
+.flow-settings,
+.flow-simulator,
+.flow-assistant.stack,
+.flow-versions {
+  padding: 20px;
+}
+
+.flow-config.stack > .panel-heading {
+  margin: -20px -20px 0;
+}
+
+.flow-config label,
+.flow-settings label,
+.flow-simulator label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+}
+
+.flow-fieldset {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.flow-fieldset legend {
+  padding: 0 0.25rem;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.tech-logos {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: 0.3rem;
+}
+
+.flow-techs summary .tech-logos {
+  display: inline-flex;
+  margin: 0 0 0 0.35rem;
+  vertical-align: middle;
+}
+
+.tech-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--muted-foreground);
+}
+
+.tech-logo-text {
+  padding: 0 0.25rem;
+  border-radius: 3px;
+  background: #054ada;
+  color: #fff;
+  font-size: 0.6rem;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.flow-techs summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.flow-tech-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: 0.25rem 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.flow-tech-grid .checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+}
+
+.flow-option-row,
+.flow-port-row,
+.flow-scenario-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.flow-config-actions,
+.flow-decisions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.flow-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+}
+
+.checkbox-row {
+  display: inline-flex !important;
+  grid-template-columns: none;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.875rem;
+}
+
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-dark);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.flow-issues {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+}
+
+.flow-external {
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius);
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 0.85rem;
+}
+
+.flow-chip {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  background: var(--secondary);
+  color: var(--secondary-foreground);
+  font-size: 0.72rem;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
+.flow-chip-internal {
+  background: #f4f4f5;
+  color: #52525b;
+}
+
+.flow-chip-public {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.flow-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.flow-table th,
+.flow-table td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.flow-versions {
+  font-size: 0.85rem;
+}
+
+/* Assistente */
+.flow-assistant-history {
+  display: grid;
+  gap: 0.75rem;
+  max-height: 520px;
+  overflow-y: auto;
+  padding: 0;
+  list-style: none;
+}
+
+.flow-assistant-history > li {
+  display: grid;
+  gap: 0.4rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px dashed var(--border);
+}
+
+.flow-assistant-user {
+  font-size: 0.875rem;
+}
+
+.flow-assistant-answer {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  font-size: 0.875rem;
+}
+
+.flow-assistant-question {
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid #d97706;
+  background: #fffbeb;
+}
+
+/* Simulação */
+.flow-simulation-result {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fafafa;
+}
+
+.flow-sim-steps {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0;
+  padding-left: 1.25rem;
+  font-size: 0.85rem;
+}
+
+/* Acompanhamento no pedido */
+.flow-step-detail {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.flow-attempt {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.flow-attempt header {
+  font-size: 0.85rem;
+  color: var(--muted-foreground);
+}
+
+.flow-output {
+  gap: 0.6rem;
+}
+
+.flow-output-block h5,
+.flow-output-block summary {
+  margin-bottom: 0.25rem;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: default;
+}
+
+.flow-output-block summary {
+  cursor: pointer;
+}
+
+.flow-patch {
+  max-height: 420px;
+  overflow: auto;
+  padding: 0.75rem;
+  border-radius: var(--radius);
+  background: #18181b;
+  color: #e4e4e7;
+  font-size: 0.75rem;
+  white-space: pre;
+}
+
+.flow-path-list .flow-dot-completed {
+  background: #16a34a;
+}
+
+.flow-path-list .flow-dot-waiting,
+.flow-path-list .flow-dot-active {
+  background: var(--primary);
+}
+
+.flow-path-list .flow-dot-failed {
+  background: var(--destructive);
+}
+
+.flow-next textarea {
+  width: 100%;
+}
+/* Incidente (Health) no ticket */
+.incident-components {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 0.75rem;
+}
+
+.incident-component {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.incident-component.is-different {
+  border-color: #d97706;
+  background: color-mix(in srgb, #d97706 6%, transparent);
+}
+
+.incident-resource {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.incident-facts {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+}
+
+.incident-facts > div {
+  display: grid;
+  grid-template-columns: minmax(8rem, 12rem) 1fr;
+  gap: 0.5rem;
+}
+
+.incident-facts dt {
+  color: var(--muted-foreground);
+}
+
+.incident-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.incident-measurements .is-ok {
+  color: #15803d;
+}
+
+.incident-measurements .is-fail {
+  color: #b91c1c;
+}
+
+.incident-status {
+  font-weight: 600;
+}
+
+.incident-status-succeeded,
+.incident-status-simulated {
+  color: #15803d;
+}
+
+.incident-status-failed,
+.incident-status-refused {
+  color: #b91c1c;
+}
+
+.incident-interventions td {
+  vertical-align: top;
+}
+
+@media (max-width: 640px) {
+  .incident-facts > div {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+}

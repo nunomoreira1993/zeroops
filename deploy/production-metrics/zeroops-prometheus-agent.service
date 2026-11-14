@@ -1,0 +1,41 @@
+[Unit]
+Description=ZeroOps - Prometheus em modo agente (remote write para o ZeroOps)
+After=network-online.target zeroops-node-exporter.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zeroops-metrics
+Group=zeroops-metrics
+ExecStart=/opt/zeroops-metrics/bin/prometheus \
+  --enable-feature=agent \
+  --config.file=/etc/zeroops-metrics/prometheus-agent.yml \
+  --storage.agent.path=/var/lib/zeroops-metrics/agent \
+  --storage.agent.retention.max-time=6h \
+  --web.listen-address=127.0.0.1:9090
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=20%
+MemoryLimit=160M
+MemoryMax=160M
+TasksMax=32
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zeroops-metrics
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

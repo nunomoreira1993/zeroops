@@ -1,0 +1,196 @@
+/* Passos técnicos do agente (recolhidos, ao estilo do VS Code) e consumo do Copilot. */
+
+.agent-steps details > summary,
+.agent-step details > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  list-style: none;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.agent-steps details > summary::-webkit-details-marker,
+.agent-step details > summary::-webkit-details-marker {
+  display: none;
+}
+.agent-step-chevron {
+  display: inline-flex;
+  flex: none;
+  color: var(--muted-foreground, #71717a);
+  transition: transform 0.15s ease;
+}
+details[open] > summary > .agent-step-chevron {
+  transform: rotate(90deg);
+}
+
+.agent-steps > details > summary {
+  padding: 4px 8px;
+  font-size: 12.5px;
+  color: var(--muted-foreground, #71717a);
+}
+.agent-steps > details > summary:hover,
+.agent-step details > summary:hover {
+  background: var(--muted, #f4f4f5);
+  color: var(--foreground, #18181b);
+}
+.agent-steps .spinner {
+  width: 10px;
+  height: 10px;
+  flex: none;
+}
+.agent-steps-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.agent-steps-meta {
+  flex: none;
+  margin-left: auto;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.agent-steps-warn > details > summary .agent-steps-meta {
+  color: var(--primary, #c8102e);
+}
+.agent-steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+  margin: 4px 0 4px 14px;
+  padding: 0 0 0 8px;
+  border-left: 1px solid var(--border, #e4e4e7);
+}
+
+.agent-step {
+  font-size: 12.5px;
+}
+.agent-step details > summary {
+  padding: 3px 6px;
+}
+.agent-step-label {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-step-command {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted-foreground, #71717a);
+}
+.agent-step-flag {
+  flex: none;
+  color: var(--primary, #c8102e);
+  font-weight: 600;
+}
+.agent-step-state {
+  display: inline-flex;
+  flex: none;
+}
+.agent-step-succeeded {
+  color: #1e6b37;
+}
+.agent-step-failed {
+  color: var(--primary, #c8102e);
+}
+.agent-step .spinner {
+  width: 10px;
+  height: 10px;
+  flex: none;
+}
+.agent-step .agent-env-badge {
+  flex: none;
+  margin: 0;
+}
+.agent-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0 8px 18px;
+}
+.agent-step-meta {
+  margin: 0;
+  color: var(--muted-foreground, #71717a);
+}
+.agent-step-caption {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted-foreground, #71717a);
+}
+.agent-step-body pre {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--muted, #f4f4f5);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.agent-step-status {
+  padding: 2px 6px;
+  font-style: italic;
+  color: var(--muted-foreground, #71717a);
+}
+.agent-step-permission {
+  padding: 2px 6px;
+  color: var(--muted-foreground, #71717a);
+}
+.agent-step-permission-denied {
+  color: var(--primary, #c8102e);
+}
+
+/* Consumo (premium requests estimados e tokens) e quota. */
+.agent-usage-summary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 0 auto;
+}
+p.agent-usage-summary {
+  display: flex;
+  margin: 6px 0 0;
+}
+.agent-usage-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--border, #e4e4e7);
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: var(--muted-foreground, #71717a);
+  white-space: nowrap;
+  cursor: help;
+}
+.agent-usage-badge strong {
+  color: var(--foreground, #18181b);
+  font-weight: 600;
+}
+.agent-usage-label {
+  font-weight: 600;
+}
+.agent-usage-model {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent-quota-low {
+  border-color: var(--primary, #c8102e);
+  color: var(--primary, #c8102e);
+}
+.agent-live-usage {
+  display: flex;
+  justify-content: flex-end;
+}

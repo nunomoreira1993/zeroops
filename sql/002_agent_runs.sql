@@ -1,0 +1,26 @@
+-- Execucoes do agente Copilot por ticket. Um ticket tem no maximo um run ativo (queued/running).
+CREATE TABLE IF NOT EXISTS agent_runs (
+  id CHAR(36) CHARACTER SET ascii NOT NULL PRIMARY KEY,
+  ticket_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  project_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  requested_by CHAR(36) CHARACTER SET ascii NOT NULL,
+  mode VARCHAR(20) NOT NULL DEFAULT 'investigate' CHECK (mode IN ('investigate')),
+  status VARCHAR(20) NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+  instructions TEXT NULL CHECK (instructions IS NULL OR CHAR_LENGTH(instructions) <= 4000),
+  ticket_version INT NOT NULL,
+  progress VARCHAR(200) NULL,
+  summary LONGTEXT NULL,
+  reply_draft LONGTEXT NULL,
+  evidence LONGTEXT NULL CHECK (evidence IS NULL OR JSON_VALID(evidence)),
+  error_code VARCHAR(100) NULL,
+  cancel_requested TINYINT(1) NOT NULL DEFAULT 0,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  started_at DATETIME(3) NULL,
+  finished_at DATETIME(3) NULL,
+  active_ticket CHAR(36) CHARACTER SET ascii AS (IF(status IN ('queued', 'running'), ticket_id, NULL)) PERSISTENT,
+  UNIQUE KEY agent_runs_one_active (active_ticket),
+  KEY agent_runs_queue (status, created_at),
+  KEY agent_runs_ticket (ticket_id, created_at),
+  CONSTRAINT agent_runs_ticket_fk FOREIGN KEY (ticket_id, project_id) REFERENCES tickets(id, project_id),
+  CONSTRAINT agent_runs_requester_fk FOREIGN KEY (requested_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

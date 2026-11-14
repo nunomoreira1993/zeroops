@@ -1,0 +1,19 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/inter';
+@import '@keenthemes/ktui/styles.css';
+@import './styles/theme.css';
+@import '@xyflow/react/dist/style.css';
+
+/* O CSS das páginas fica na layer de componentes, depois do KTUI, para os utilitários Tailwind continuarem a prevalecer. */
+@import './styles/base.css' layer(components);
+@import './styles/shell.css' layer(components);
+@import './styles/pages.css' layer(components);
+@import './styles/auth.css' layer(components);
+@import './styles/conversation.css' layer(components);
+@import './styles/identity.css' layer(components);
+@import './styles/agent-runs.css' layer(components);
+@import './styles/health.css' layer(components);
+@import './styles/health-tabs.css' layer(components);
+@import './styles/agent-settings.css' layer(components);
+@import './styles/project-admin.css' layer(components);
+@import './styles/flows.css' layer(components);

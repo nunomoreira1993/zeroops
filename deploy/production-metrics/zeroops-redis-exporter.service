@@ -1,0 +1,37 @@
+[Unit]
+Description=ZeroOps - redis_exporter (estado do Redis, so 127.0.0.1)
+After=network-online.target redis-server.service
+
+[Service]
+Type=simple
+User=zeroops-metrics
+Group=zeroops-metrics
+# REDIS_PASSWORD (lida do redis.conf pelo install.sh; ficheiro 640 root:zeroops-metrics).
+EnvironmentFile=/etc/zeroops-metrics/redis-exporter.env
+ExecStart=/opt/zeroops-metrics/bin/redis_exporter \
+  --redis.addr=redis://127.0.0.1:6379 \
+  --web.listen-address=127.0.0.1:9121
+Restart=always
+RestartSec=10
+
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=10%
+MemoryLimit=64M
+MemoryMax=64M
+TasksMax=16
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,65 @@
+# Prometheus de Producao em modo agente: so recolhe e envia (remote write) para o ZeroOps.
+# Gerado por install.sh a partir deste modelo (__HOST__, __URL__); nao guarda dados localmente
+# alem do WAL de envio. Os exporters locais escutam so em 127.0.0.1; os dos outros servidores
+# (frontend/static) escutam no IP privado e so aceitam este servidor (ver install.sh --role).
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  external_labels:
+    env: production
+
+scrape_configs:
+  - job_name: node
+    static_configs:
+      - targets: ['127.0.0.1:9100']
+        labels: { service: servidor, role: db }
+    relabel_configs: &instance
+      - target_label: instance
+        replacement: __HOST__
+
+  - job_name: mysql
+    static_configs:
+      - targets: ['127.0.0.1:9104']
+        labels: { service: mysql, role: db }
+    relabel_configs: *instance
+
+  - job_name: redis
+    static_configs:
+      - targets: ['127.0.0.1:9121']
+        labels: { service: redis, role: db }
+    relabel_configs: *instance
+
+  # Outros servidores de Producao: lista em /etc/zeroops-metrics/remote-nodes.yml (instance e role
+  # definidos em cada alvo). Alteracoes ao ficheiro sao lidas sem reiniciar o agente.
+  - job_name: node-remote
+    file_sd_configs:
+      - files: [/etc/zeroops-metrics/remote-nodes.yml]
+        refresh_interval: 5m
+    relabel_configs:
+      - target_label: service
+        replacement: servidor
+
+remote_write:
+  - url: __URL__/api/monitoring/remote-write
+    authorization:
+      credentials_file: /etc/zeroops-metrics/token
+    tls_config:
+      ca_file: /etc/zeroops-metrics/zeroops-ca.pem
+    remote_timeout: 30s
+    # Lotes grandes e poucos envios: ~2 pedidos por minuto.
+    queue_config:
+      max_shards: 2
+      min_shards: 1
+      capacity: 10000
+      max_samples_per_send: 5000
+      batch_send_deadline: 30s
+    # So as series usadas pela Saude, pelas regras de alerta e pelos graficos do ZeroOps.
+    write_relabel_configs:
+      - source_labels: [__name__]
+        action: keep
+        regex: >-
+          up|zeroops_.+|node_filesystem_(avail_bytes|size_bytes|files_free|files|device_error|readonly)|node_load(1|5|15)|node_cpu_seconds_total|node_memory_(MemAvailable|MemTotal|MemFree|Buffers|Cached|SwapTotal|SwapFree)_bytes|node_network_(receive|transmit)_(bytes|errs|drop)_total|node_netstat_Tcp_(CurrEstab|RetransSegs)|node_sockstat_TCP_tw|node_disk_(read_bytes|written_bytes|io_time_seconds)_total|node_procs_(running|blocked)|node_textfile_scrape_error|redis_(up|connected_clients|blocked_clients|memory_used_bytes|memory_max_bytes|uptime_in_seconds|commands_processed_total|keyspace_hits_total|keyspace_misses_total|evicted_keys_total|expired_keys_total|db_keys)|mysql_(up|global_status_(threads_connected|threads_running|slow_queries|questions|uptime|connections|aborted_connects|aborted_clients|max_used_connections|innodb_row_lock_waits|innodb_row_lock_time|created_tmp_disk_tables|bytes_received|bytes_sent|buffer_pool_pages|innodb_buffer_pool_read_requests|innodb_buffer_pool_reads)|global_variables_(max_connections|innodb_buffer_pool_size))
+      # Interfaces virtuais e discos de particao nao interessam aos graficos.
+      - source_labels: [__name__, device]
+        action: drop
+        regex: 'node_(network_.+|disk_.+);(lo|veth.*|docker.*|br-.*|loop\d+|dm-\d+|sr\d+)'

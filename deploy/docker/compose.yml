@@ -1,0 +1,219 @@
+# ZeroOps em Qualidade. Rede do host: a API so escuta em 127.0.0.1 e o Apache faz o proxy TLS.
+# O ficheiro de ambiente fica fora do checkout/webroot (ex.: /etc/zeroops/zeroops.env, modo 600).
+name: zeroops
+
+x-zeroops: &zeroops
+  image: zeroops:${ZEROOPS_IMAGE_TAG:-latest}
+  network_mode: host
+  env_file: ${ZEROOPS_ENV_FILE:-/etc/zeroops/zeroops.env}
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options: { max-size: 10m, max-file: '3' }
+
+x-observability: &observability
+  network_mode: host
+  restart: unless-stopped
+  security_opt: [no-new-privileges:true]
+  cpus: 0.25
+  logging:
+    driver: json-file
+    options: { max-size: 5m, max-file: '2' }
+
+services:
+  api:
+    <<: *zeroops
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    command: ['node', 'dist/apps/api/src/main.js']
+    environment:
+      ZEROOPS_VERSION: ${ZEROOPS_VERSION:-local}
+      # Webhooks do Alertmanager recebidos com a BD indisponivel (reprocessados quando volta).
+      ZEROOPS_ALERT_SPOOL_DIR: /var/lib/zeroops/alert-spool
+      # Regras de alerta geradas a partir da configuracao de cada projeto (Saude > Regras de alerta).
+      ZEROOPS_PROMETHEUS_RULES_DIR: /var/lib/zeroops/prometheus-rules
+      ZEROOPS_PROMETHEUS_URL: http://127.0.0.1:9090
+      # Raizes tecnicas read-only para descoberta limitada de instrucoes/agentes/skills do projeto.
+      ZEROOPS_AGENT_SITES_ROOT: /sources
+    volumes:
+      # A API so le caminhos tecnicos allowlisted; credenciais do site ficam mascaradas.
+      - ${ZEROOPS_SITE_SOURCES:-/var/www/vhosts/pizzahut.pt/httpdocs}:/sources/pizzahut:ro
+      - /dev/null:/sources/pizzahut/lib/db.config.credentials.php:ro
+      - /dev/null:/sources/pizzahut/lib/db.config.credentials.original.php:ro
+      - /dev/null:/sources/pizzahut/api/api.parceiros.class.php:ro
+      - /dev/null:/sources/pizzahut/api-public/api.parceiros.class.php:ro
+      - ${ZEROOPS_PIZZAMOVIL_SOURCES:-/var/www/vhosts/pizzamovil.es/httpdocs}:/sources/pizzamovil:ro
+      - /dev/null:/sources/pizzamovil/lib/db.config.credentials.php:ro
+      - /dev/null:/sources/pizzamovil/lib/db.config.credentials.original.php:ro
+      - /dev/null:/sources/pizzamovil/api/api.parceiros.class.php:ro
+      # Certificado publico da CA do portal (anexado aos convites). Ver ZEROOPS_ACCESS_CA_FILE.
+      - ${ZEROOPS_ACCESS_DIR:-/etc/zeroops/access}:/etc/zeroops-access:ro
+      - alert-spool:/var/lib/zeroops/alert-spool
+      - prometheus-rules:/var/lib/zeroops/prometheus-rules
+    mem_limit: 384m
+
+  worker:
+    <<: *zeroops
+    command: ['node', 'dist/apps/worker/src/main.js']
+    volumes:
+      - ${ZEROOPS_ACCESS_DIR:-/etc/zeroops/access}:/etc/zeroops-access:ro
+    mem_limit: 256m
+    depends_on: [api]
+
+  # Execucao pontual: docker compose run --rm migrate
+  migrate:
+    <<: *zeroops
+    restart: 'no'
+    command: ['node', 'dist/packages/backend/src/database/migrate.js']
+    profiles: [admin]
+
+  # Conectores de leitura (BD do site, Loki). Credenciais vem da pagina Integracoes (cifradas na BD);
+  # so escuta em 127.0.0.1:4312 e so responde a tokens de runs ativos.
+  connectors:
+    <<: *zeroops
+    command: ['node', 'dist/apps/connectors/src/main.js']
+    mem_limit: 128m
+    depends_on: [api]
+
+  # Executor do Copilot CLI. Corre como root so para lancar o agente com o uid 1000; o agente
+  # nao le o ambiente do executor, so tem o workspace (tmpfs) e o codigo do site em leitura.
+  executor:
+    <<: *zeroops
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: executor
+    image: zeroops-executor:${ZEROOPS_IMAGE_TAG:-latest}
+    command: ['node', 'dist/apps/executor/src/main.js']
+    user: root
+    mem_limit: 640m
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE, FOWNER, KILL]
+    tmpfs:
+      - /tmp
+      - /work:uid=1000,gid=1000,mode=0755
+      - /home/node:uid=1000,gid=1000,mode=0700
+    environment:
+      ZEROOPS_AGENT_UID: '1000'
+      ZEROOPS_AGENT_HOME: /home/node
+      ZEROOPS_AGENT_WORKSPACE: /work
+      ZEROOPS_CONNECTOR_URL: http://127.0.0.1:4312
+      # Codigo de cada site em /sources/<site> (site do projeto); sem site, usa a Pizza Hut.
+      ZEROOPS_AGENT_SITES_ROOT: /sources
+      ZEROOPS_AGENT_SOURCE_DIRS: /sources/pizzahut
+      ZEROOPS_AGENT_SOURCES: 'Codigo PHP do site Pizza Hut (so leitura) em /sources/pizzahut'
+      # sdk = conversa interativa (streaming, perguntas, MCP); cli = modo nao interativo (fallback).
+      ZEROOPS_COPILOT_TRANSPORT: ${ZEROOPS_COPILOT_TRANSPORT:-sdk}
+      ZEROOPS_AGENT_QUESTION_TIMEOUT_MS: ${ZEROOPS_AGENT_QUESTION_TIMEOUT_MS:-600000}
+      ZEROOPS_AGENT_FOLLOWUP_MS: ${ZEROOPS_AGENT_FOLLOWUP_MS:-120000}
+      COPILOT_HOME: /home/node/.copilot
+      COPILOT_CACHE_HOME: /opt/copilot-cache
+      COPILOT_AUTO_UPDATE: 'false'
+      USE_TGREP: 'false'
+    volumes:
+      # Ficheiros com segredos ficam vazios para o agente: o acesso a dados passa so pelos conectores.
+      # Cada mascara tem de existir no site (bind :ro nao cria pontos de montagem).
+      - ${ZEROOPS_SITE_SOURCES:-/var/www/vhosts/pizzahut.pt/httpdocs}:/sources/pizzahut:ro
+      - /dev/null:/sources/pizzahut/lib/db.config.credentials.php:ro
+      - /dev/null:/sources/pizzahut/lib/db.config.credentials.original.php:ro
+      - /dev/null:/sources/pizzahut/api/api.parceiros.class.php:ro
+      - /dev/null:/sources/pizzahut/api-public/api.parceiros.class.php:ro
+      - ${ZEROOPS_PIZZAMOVIL_SOURCES:-/var/www/vhosts/pizzamovil.es/httpdocs}:/sources/pizzamovil:ro
+      - /dev/null:/sources/pizzamovil/lib/db.config.credentials.php:ro
+      - /dev/null:/sources/pizzamovil/lib/db.config.credentials.original.php:ro
+      - /dev/null:/sources/pizzamovil/api/api.parceiros.class.php:ro
+    depends_on: [connectors]
+
+  # --- Observabilidade (Prometheus/Alertmanager + exporters), so em 127.0.0.1 ---
+  # Segredos fora do git: /etc/zeroops/observability.env (REDIS_PASSWORD, MYSQLD_EXPORTER_PASSWORD)
+  # e /etc/zeroops/observability/alertmanager-token (token zoh_ do agente de saude).
+  prometheus:
+    <<: *observability
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=95d
+      # Limite em disco: ~95 dias de 4 servidores de Producao + QA cabem com folga (ver README).
+      - --storage.tsdb.retention.size=6GB
+      - --web.listen-address=127.0.0.1:9090
+      # Recebe o remote write do Prometheus de Producao (modo agente) via API do ZeroOps.
+      - --web.enable-remote-write-receiver
+      # A API recarrega as regras (POST /-/reload) quando a configuracao de um projeto muda.
+      - --web.enable-lifecycle
+    volumes:
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Regras geradas pela API (zeroops-<site>.yml), so leitura para o Prometheus.
+      - prometheus-rules:/etc/prometheus/rules.d:ro
+      - prometheus-data:/prometheus
+    mem_limit: 256m
+
+  alertmanager:
+    <<: *observability
+    image: prom/alertmanager:v0.27.0
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=127.0.0.1:9093
+      - --cluster.listen-address=
+    volumes:
+      - ../observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - /etc/zeroops/observability/alertmanager-token:/etc/alertmanager/token:ro
+      # Tokens de outros projetos (um ficheiro por site, ver alertmanager.yml).
+      - /etc/zeroops/observability/projects:/etc/alertmanager/projects:ro
+      - alertmanager-data:/alertmanager
+    mem_limit: 64m
+
+  node-exporter:
+    <<: *observability
+    image: prom/node-exporter:v1.8.2
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=127.0.0.1:9100
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|run|sys|var/lib/docker/.+)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+    mem_limit: 48m
+
+  redis-exporter:
+    <<: *observability
+    image: oliver006/redis_exporter:v1.62.0
+    command: ['--redis.addr=redis://127.0.0.1:6379', '--web.listen-address=127.0.0.1:9121']
+    env_file:
+      - path: /etc/zeroops/observability.env
+        required: false
+    mem_limit: 48m
+
+  mysqld-exporter:
+    <<: *observability
+    image: prom/mysqld-exporter:v0.15.1
+    command:
+      - --mysqld.address=127.0.0.1:3306
+      - --mysqld.username=zeroops_exporter
+      - --web.listen-address=127.0.0.1:9104
+    env_file:
+      - path: /etc/zeroops/observability.env
+        required: false
+    mem_limit: 48m
+
+  blackbox-exporter:
+    <<: *observability
+    image: prom/blackbox-exporter:v0.25.0
+    command: ['--config.file=/etc/blackbox/blackbox.yml', '--web.listen-address=127.0.0.1:9115']
+    # dev.pizzamovil.es nao tem DNS publico; o vhost de QA esta neste servidor.
+    extra_hosts:
+      - 'dev.pizzamovil.es:192.168.90.79'
+    volumes:
+      - ../observability/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    mem_limit: 48m
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  alert-spool:
+  prometheus-rules:

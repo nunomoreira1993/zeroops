@@ -1,0 +1,31 @@
+[Unit]
+Description=ZeroOps - coletor textfile (Apache, PHP-FPM, nginx, MySQL, DB2), so leituras em localhost
+After=network-online.target
+
+[Service]
+Type=oneshot
+# root: le os sockets PHP-FPM (www-data), o MySQL por socket e o DSN ODBC do DB2. Nao escreve
+# fora de /var/lib/zeroops-metrics.
+# O systemd nao define HOME: sem isto, o cliente mysql nao le o /root/.my.cnf (so leitura).
+Environment=HOME=/root
+ExecStart=/usr/bin/python3 /opt/zeroops-metrics/lib/zeroops-collect.py
+TimeoutStartSec=100
+
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=10%
+MemoryLimit=128M
+MemoryMax=128M
+TasksMax=16
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zeroops-metrics
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

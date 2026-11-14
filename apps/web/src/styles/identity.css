@@ -1,0 +1,208 @@
+.identity-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+  margin: 24px 0;
+}
+.identity-grid .panel,
+.page-content > .panel.stack {
+  padding: 24px;
+  margin-bottom: 24px;
+}
+.identity-dialog {
+  /* O reset do Tailwind anula a margem automática que centra o <dialog> modal. */
+  margin: auto;
+  border: 1px solid #d9dfeb;
+  border-radius: 16px;
+  padding: 28px;
+  width: min(520px, calc(100vw - 32px));
+  max-height: 90vh;
+  overflow: auto;
+  color: var(--foreground);
+}
+.identity-dialog::backdrop {
+  background: rgb(13 22 38 / 65%);
+}
+.identity-filters {
+  display: grid;
+  grid-template-columns: 2fr repeat(3, 1fr);
+  gap: 16px;
+}
+.identity-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  max-width: 340px;
+  font-size: 13px;
+}
+.identity-table {
+  border-collapse: collapse;
+  width: 100%;
+  text-align: left;
+  font-size: 13.5px;
+}
+.identity-table th,
+.identity-table td {
+  padding: 12px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.identity-table th {
+  padding-block: 10px;
+  background: var(--muted);
+  color: var(--secondary-foreground);
+  font-size: 13px;
+  font-weight: 400;
+}
+.identity-table td {
+  color: var(--secondary-foreground);
+}
+.identity-table td strong {
+  color: var(--foreground);
+  font-weight: 500;
+}
+.enrollment svg {
+  display: block;
+  background: white;
+  padding: 12px;
+  box-sizing: content-box;
+  max-width: calc(100% - 24px);
+}
+.enrollment input {
+  font-family: monospace;
+}
+.recovery-page {
+  max-width: 760px;
+  margin: clamp(24px, 6vh, 64px) auto;
+  padding: 0 24px;
+}
+.recovery-card {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  width: 100%;
+  max-width: 712px;
+  margin-inline: auto;
+  padding: 32px;
+  box-shadow: 0 8px 32px rgb(23 34 55 / 5%);
+}
+.recovery-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+.recovery-symbol {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  border: 1px solid #f3d9ce;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent-dark);
+}
+.recovery-heading .eyebrow {
+  margin-bottom: 6px;
+}
+.recovery-heading h2 {
+  font-size: clamp(19px, 2.5vw, 23px);
+  line-height: 1.35;
+}
+.recovery-description {
+  margin-top: 10px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+.recovery-codes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.recovery-codes li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--muted);
+}
+.recovery-code-number {
+  flex-shrink: 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.recovery-codes code {
+  min-width: 0;
+  overflow-x: auto;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: nowrap;
+  user-select: all;
+}
+.recovery-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border-top: 1px solid var(--border);
+  padding-top: 24px;
+}
+.recovery-footer p {
+  max-width: 235px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+.recovery-footer .button {
+  white-space: normal;
+}
+.delivery-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.delivery-list > li {
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+@media (max-width: 760px) {
+  .identity-grid,
+  .identity-filters {
+    grid-template-columns: 1fr;
+  }
+  .identity-table {
+    min-width: 620px;
+  }
+}
+@media (max-width: 560px) {
+  .recovery-page {
+    padding-inline: 16px;
+  }
+  .recovery-card {
+    padding: 20px;
+    gap: 20px;
+  }
+  .recovery-heading {
+    flex-direction: column;
+    gap: 12px;
+  }
+  .recovery-codes {
+    grid-template-columns: 1fr;
+  }
+  .recovery-footer {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 16px;
+    padding-top: 20px;
+  }
+  .recovery-footer p {
+    max-width: none;
+  }
+}

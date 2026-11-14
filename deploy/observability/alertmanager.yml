@@ -1,0 +1,38 @@
+# Alertmanager -> webhook do ZeroOps. O token (zoh_) do agente de saude de cada projeto fica num
+# ficheiro fora do git (dono 65534, modo 400); o token identifica o projeto que recebe o alerta:
+#   /etc/zeroops/observability/alertmanager-token            projeto principal (Pizza Hut)
+#   /etc/zeroops/observability/projects/<site>               outros projetos (ex.: pizzamovil)
+# Alertas com a label `project` (alvos do site em prometheus.yml) vao para esse projeto; os da
+# infraestrutura partilhada (servidores, BD, Redis) ficam no projeto principal.
+route:
+  receiver: zeroops
+  group_by: [alertname, instance]
+  group_wait: 30s
+  group_interval: 5m
+  # O ZeroOps ignora repetições de um alerta já ativo; a repetição serve de nova tentativa e
+  # limita a deduplicação de um grupo cuja resolução se perdeu (ex.: reinício).
+  repeat_interval: 30m
+  routes:
+    - receiver: pizzamovil
+      matchers: [project="pizzamovil"]
+# As paragens planeadas (ex.: IBM i desligado de madrugada) nao sao silenciadas aqui: o ZeroOps
+# recebe todos os alertas e aplica as janelas configuradas em cada projeto (Saude > Paragens
+# planeadas), sem e-mail nem ticket durante a janela e com envio no fim se o alerta continuar ativo.
+
+receivers:
+  - name: zeroops
+    webhook_configs:
+      - url: http://127.0.0.1:4311/api/monitoring/alertmanager
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/token
+  - name: pizzamovil
+    webhook_configs:
+      - url: http://127.0.0.1:4311/api/monitoring/alertmanager
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/projects/pizzamovil

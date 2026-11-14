@@ -1,0 +1,50 @@
+.project-admin-heading {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 16px 20px;
+}
+
+.project-admin-heading > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.project-admin-heading h2,
+.project-admin-heading p {
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+
+.project-admin-heading p {
+  color: var(--color-muted-foreground);
+  margin-top: 0.3rem;
+}
+
+.project-admin-lifecycle {
+  border-inline-start: 3px solid var(--color-warning, #b7791f);
+}
+
+/* .panel não tem padding: os cartões dos separadores precisam do seu próprio espaço interior. */
+.project-admin-tabpanel {
+  padding-top: 8px;
+}
+
+.project-admin-tabpanel > .panel.stack {
+  padding: 24px;
+}
+
+.project-admin-tabpanel > .form-actions {
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  border-top: 0;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+@media (max-width: 600px) {
+  .project-admin-heading {
+    flex-wrap: wrap;
+  }
+}
