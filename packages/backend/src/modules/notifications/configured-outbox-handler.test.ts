@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Role, User } from '../../../../contracts/src/index.js';
 import { IdentityService } from '../identity/identity.service.js';
 import { TicketsService } from '../tickets/tickets.service.js';
+import { recordTicketMove } from '../tickets/ticket-move.js';
 import type { SmtpConfig } from '../smtp/smtp-transport.js';
 import {
   ConfiguredOutboxHandler,
@@ -122,5 +123,61 @@ describe('configured outbox handler', () => {
       errorCode: 'unsupported_topic',
     });
     expect(sent).toBe(false);
+  });
+
+  it('notifies the author about an automatic flow transition without an actor', async () => {
+    const ticket = await tickets.create(actor('client'), {
+      title: 'Encerramento automático de teste',
+      description: 'O motor encerra o pedido depois da publicação confirmada.',
+      category: 'improvement',
+      environment: 'quality',
+      priority: 'low',
+    });
+    await fixture.db.transaction((client) =>
+      recordTicketMove(client, {
+        ticketId: ticket.id,
+        projectId: admin.projectId,
+        from: ticket.status,
+        to: 'resolved',
+        version: ticket.version,
+        actorId: null,
+        action: 'flow.completed',
+      }),
+    );
+    const row = (
+      await fixture.db.query<{
+        id: string;
+        topic: string;
+        payload: Record<string, unknown>;
+      }>(
+        `SELECT id,topic,payload FROM notification_outbox
+          WHERE topic='ticket.changed'
+            AND JSON_UNQUOTE(JSON_EXTRACT(payload,'$.ticketId'))=$1`,
+        [ticket.id],
+      )
+    ).rows[0]!;
+    const sent: { to: string[]; text: string }[] = [];
+    const smtp: SmtpConfig = { host: 'smtp.example.test', port: 25, from: 'zeroops@example.test' };
+    const handler = new ConfiguredOutboxHandler(
+      fixture.db,
+      { runtimeSmtp: async () => smtp },
+      'quality',
+      undefined,
+      'https://tickets.example.test',
+      async (_smtp, message) => {
+        sent.push(message);
+      },
+    );
+
+    await expect(handler.deliver(row.id, row.topic, row.payload)).resolves.toEqual({
+      status: 'sent',
+    });
+    expect(sent[0]?.to).toEqual(['client@example.test']);
+    expect(sent[0]?.text).toContain('resolved');
+    expect(sent[0]?.text).toContain(`#tickets/${ticket.id}`);
+    await expect(
+      handler.deliver(row.id, row.topic, { ...row.payload, actorId: 'invalid' }),
+    ).resolves.toEqual({ status: 'blocked', errorCode: 'payload_invalid' });
+    expect(sent).toHaveLength(1);
   });
 });

@@ -142,15 +142,25 @@ export class DevelopmentRunner {
       previousHead ?? baseSha,
       ...(owner ? [owner] : []),
     );
-    for (const command of repository.setupCommands) {
-      const result = await this.manager.runConfigured(checkout, command);
-      if (result.exitCode !== 0) {
-        await this.manager.removeCheckout(checkout);
-        throw new DevelopmentFailure(
-          'setup_failed',
-          `Preparação «${command.name}» falhou: ${result.log.slice(-500)}`,
-        );
+    try {
+      for (const command of repository.setupCommands) {
+        const result = await this.manager.runConfigured(checkout, command);
+        if (result.exitCode !== 0)
+          throw new DevelopmentFailure(
+            'setup_failed',
+            `Preparação «${command.name}» falhou: ${result.log.slice(-500)}`,
+          );
       }
+    } catch (error) {
+      // Preparação parcial: o worktree criado não fica para trás (o erro original prevalece).
+      await this.manager.removeCheckout(checkout).catch((cleanup: unknown) =>
+        this.options.log?.({
+          event: 'development.checkout_cleanup_failed',
+          runId,
+          message: cleanup instanceof Error ? cleanup.message.slice(0, 300) : undefined,
+        }),
+      );
+      throw error;
     }
     this.options.log?.({
       event: 'development.prepared',
@@ -466,13 +476,34 @@ export class DevelopmentRunner {
     );
   }
 
-  /** Fim da tentativa: remove o worktree (o bare e a branch ficam) e liberta o workspace. */
+  /**
+   * Fim da tentativa: remove o worktree (o bare e a branch ficam) e liberta o workspace. Os dois
+   * passos correm sempre; uma falha a remover o worktree é propagada (F02: o chamador não pode
+   * tratar a limpeza como confirmada).
+   */
   async release(prepared: PreparedDevelopment | null, lease: JobLease, failed: boolean) {
     if (!prepared) return;
-    await this.manager.removeCheckout(prepared.checkout).catch(() => undefined);
+    const removal = await this.manager.removeCheckout(prepared.checkout).then(
+      () => null,
+      (error: unknown) => error,
+    );
     await this.store
       .releaseWorkspace(lease, prepared.context.workspace.id, failed)
-      .catch(() => undefined);
+      .catch((error: unknown) =>
+        this.options.log?.({
+          event: 'development.workspace_release_failed',
+          runId: prepared.runId,
+          message: error instanceof Error ? error.message.slice(0, 300) : undefined,
+        }),
+      );
+    if (removal) {
+      this.options.log?.({
+        event: 'development.checkout_cleanup_failed',
+        runId: prepared.runId,
+        message: removal instanceof Error ? removal.message.slice(0, 300) : undefined,
+      });
+      throw removal;
+    }
   }
 
   /** Limpeza por retenção: o diretório do workspace (artefactos ficam na BD). */

@@ -1,6 +1,10 @@
+import { execFile } from 'node:child_process';
 import { chmod, chown, lstat, mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import type { AgentIdentity } from './copilot-process.js';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Identidade de sistema atribuída a um único job (run, assistente, entrega). Enquanto o job dura,
@@ -25,6 +29,28 @@ export class JobIdentityExhausted extends Error {
   }
 }
 
+/** A limpeza de um uid não ficou confirmada: o uid fica em quarentena (não é reutilizado). */
+export class JobIdentityCleanupError extends Error {
+  constructor(
+    readonly uid: number,
+    readonly failures: { step: string; message: string }[],
+  ) {
+    super(
+      `Limpeza do uid ${uid} por confirmar (${failures.map((item) => `${item.step}: ${item.message}`).join('; ')}).`,
+    );
+    this.name = 'JobIdentityCleanupError';
+  }
+}
+
+/** Diagnóstico de um uid em quarentena. */
+export interface QuarantinedIdentity {
+  uid: number;
+  since: Date;
+  attempts: number;
+  nextRetryAt: Date;
+  failures: { step: string; message: string }[];
+}
+
 /** Operações de sistema do pool (injetáveis nos testes). */
 export interface SandboxSystem {
   prepareHome(path: string, uid: number, gid: number): Promise<void>;
@@ -33,6 +59,11 @@ export interface SandboxSystem {
   killProcesses(uid: number): Promise<number>;
   /** Remove as entradas de topo de `directory` que pertencem a `uid` (ex.: `/tmp`, `/dev/shm`). */
   removeOwnedEntries(directory: string, uid: number): Promise<number>;
+  /**
+   * Remove os worktrees de tentativas (`<root>/<projeto>/<workspace>/attempts/<n>`) que pertencem a
+   * `uid`. Os repositórios bare e o resto do workspace ficam intactos.
+   */
+  removeOwnedWorktrees(root: string, uid: number): Promise<number>;
 }
 
 export interface JobIdentityPoolOptions {
@@ -42,18 +73,33 @@ export interface JobIdentityPoolOptions {
   homeRoot: string;
   /** Diretórios partilhados onde um job pode deixar ficheiros (limpos no fim do job). */
   scratchDirectories?: string[];
+  /** Raízes dos workspaces Git (`ZEROOPS_DEV_WORKSPACES`): worktrees do uid são removidos. */
+  worktreeRoots?: string[];
+  /** Espera inicial antes de nova limpeza de um uid em quarentena (duplica até 15 min). */
+  recoveryDelayMs?: number;
   system?: SandboxSystem;
+  log?: (event: Record<string, unknown>) => void;
+  now?: () => number;
 }
+
+const MAX_RECOVERY_DELAY_MS = 15 * 60_000;
+const errorMessage = (error: unknown) =>
+  (error instanceof Error ? error.message : String(error)).slice(0, 300);
 
 /**
  * Pool de uids exclusivos (P-A/F02). Cada job recebe um uid livre e uma home nova `0700`; no fim
- * os processos do uid são terminados e a home e os temporários do uid são apagados antes de o uid
- * voltar ao pool. Pressupõe um único executor por intervalo de uids (o pool é em memória).
+ * os processos do uid são terminados e a home, os temporários e os worktrees do uid são apagados
+ * antes de o uid voltar ao pool. Se a limpeza não ficar confirmada, o uid fica em quarentena e só
+ * volta depois de uma limpeza completa (tentada com intervalos crescentes). Pressupõe um único
+ * executor por intervalo de uids (o pool é em memória; depois de um reinício cada uid é limpo
+ * antes da primeira utilização).
  */
 export class JobIdentityPool implements JobIdentitySource {
   private readonly inUse = new Set<number>();
+  private readonly quarantine = new Map<number, QuarantinedIdentity>();
   private next = 0;
   private readonly system: SandboxSystem;
+  private readonly now: () => number;
 
   constructor(private readonly options: JobIdentityPoolOptions) {
     if (!Number.isInteger(options.uidBase) || options.uidBase < 1000)
@@ -61,6 +107,7 @@ export class JobIdentityPool implements JobIdentitySource {
     if (!Number.isInteger(options.count) || options.count < 1 || options.count > 65_536)
       throw new Error('ZEROOPS_JOB_UID_COUNT inválido.');
     this.system = options.system ?? linuxSandboxSystem;
+    this.now = options.now ?? Date.now;
   }
 
   get size() {
@@ -71,27 +118,70 @@ export class JobIdentityPool implements JobIdentitySource {
     return this.inUse.size;
   }
 
-  async acquire(): Promise<JobIdentity> {
-    let uid: number | null = null;
-    for (let index = 0; index < this.options.count; index += 1) {
-      const candidate = this.options.uidBase + ((this.next + index) % this.options.count);
-      if (!this.inUse.has(candidate)) {
-        uid = candidate;
-        this.next = (this.next + index + 1) % this.options.count;
-        break;
+  /** uids indisponíveis por limpeza não confirmada (diagnóstico). */
+  get quarantined(): QuarantinedIdentity[] {
+    return [...this.quarantine.values()].map((item) => ({ ...item, failures: [...item.failures] }));
+  }
+
+  /**
+   * Nova limpeza dos uids em quarentena cujo intervalo já passou (`force`: todos). Um uid só volta
+   * ao pool quando todos os passos da limpeza forem confirmados.
+   */
+  async recover(force = false) {
+    let recovered = 0;
+    for (const item of [...this.quarantine.values()]) {
+      if (!force && item.nextRetryAt.getTime() > this.now()) continue;
+      try {
+        await this.scrub(item.uid, this.home(item.uid));
+      } catch (error) {
+        this.isolate(item.uid, error);
+        continue;
       }
+      this.quarantine.delete(item.uid);
+      this.inUse.delete(item.uid);
+      recovered += 1;
+      this.options.log?.({
+        event: 'job_identity.recovered',
+        uid: item.uid,
+        attempts: item.attempts,
+      });
     }
-    if (uid === null) throw new JobIdentityExhausted();
-    this.inUse.add(uid);
-    const home = join(this.options.homeRoot, String(uid));
-    try {
-      // Restos de um job anterior com este uid (ex.: executor reiniciado a meio) nunca passam.
-      await this.scrub(uid, home);
-      await this.system.prepareHome(home, uid, uid);
-    } catch (error) {
-      this.inUse.delete(uid);
-      throw error;
+    return recovered;
+  }
+
+  async acquire(): Promise<JobIdentity> {
+    if (this.quarantine.size) await this.recover();
+    for (;;) {
+      let uid: number | null = null;
+      for (let index = 0; index < this.options.count; index += 1) {
+        const candidate = this.options.uidBase + ((this.next + index) % this.options.count);
+        if (!this.inUse.has(candidate)) {
+          uid = candidate;
+          this.next = (this.next + index + 1) % this.options.count;
+          break;
+        }
+      }
+      if (uid === null) throw new JobIdentityExhausted();
+      this.inUse.add(uid);
+      const home = this.home(uid);
+      try {
+        // Restos de um job anterior com este uid (ex.: executor reiniciado a meio) nunca passam.
+        await this.scrub(uid, home);
+      } catch (error) {
+        this.isolate(uid, error);
+        continue;
+      }
+      try {
+        await this.system.prepareHome(home, uid, uid);
+      } catch (error) {
+        this.inUse.delete(uid);
+        throw error;
+      }
+      return this.identity(uid, home);
     }
+  }
+
+  private identity(uid: number, home: string): JobIdentity {
     let released = false;
     return {
       uid,
@@ -101,18 +191,75 @@ export class JobIdentityPool implements JobIdentitySource {
       exclusive: true,
       release: async () => {
         if (released) return;
-        await this.scrub(uid, home);
+        try {
+          await this.scrub(uid, home);
+        } catch (error) {
+          released = true;
+          this.isolate(uid, error);
+          throw error;
+        }
         released = true;
+        this.quarantine.delete(uid);
         this.inUse.delete(uid);
       },
     };
   }
 
+  private home(uid: number) {
+    return join(this.options.homeRoot, String(uid));
+  }
+
+  /** O uid continua ocupado (nenhum job o recebe) até uma limpeza completa em `recover`. */
+  private isolate(uid: number, error: unknown) {
+    const failures =
+      error instanceof JobIdentityCleanupError
+        ? error.failures
+        : [{ step: 'cleanup', message: errorMessage(error) }];
+    const previous = this.quarantine.get(uid);
+    const attempts = (previous?.attempts ?? 0) + 1;
+    const delay = Math.min(
+      (this.options.recoveryDelayMs ?? 60_000) * 2 ** (attempts - 1),
+      MAX_RECOVERY_DELAY_MS,
+    );
+    this.inUse.add(uid);
+    this.quarantine.set(uid, {
+      uid,
+      since: previous?.since ?? new Date(this.now()),
+      attempts,
+      nextRetryAt: new Date(this.now() + delay),
+      failures,
+    });
+    this.options.log?.({
+      event: 'job_identity.quarantined',
+      uid,
+      attempts,
+      retryInMs: delay,
+      failures,
+    });
+  }
+
+  /**
+   * Termina os processos e remove home, temporários e worktrees do uid. Cada passo corre mesmo
+   * que um anterior falhe; qualquer falha deixa a limpeza por confirmar.
+   */
   private async scrub(uid: number, home: string) {
-    await this.system.killProcesses(uid);
-    await this.system.removeHome(home);
+    const failures: { step: string; message: string }[] = [];
+    const step = async (name: string, action: () => Promise<unknown>) => {
+      try {
+        await action();
+      } catch (error) {
+        failures.push({ step: name, message: errorMessage(error) });
+      }
+    };
+    await step('processes', () => this.system.killProcesses(uid));
+    await step('home', () => this.system.removeHome(home));
     for (const directory of this.options.scratchDirectories ?? [])
-      await this.system.removeOwnedEntries(directory, uid);
+      await step(`scratch:${directory}`, () => this.system.removeOwnedEntries(directory, uid));
+    for (const root of this.options.worktreeRoots ?? [])
+      await step(`worktrees:${root}`, () => this.system.removeOwnedWorktrees(root, uid));
+    // Processos que tenham sobrevivido à primeira passagem podiam recriar ficheiros.
+    if (failures.length) await step('processes', () => this.system.killProcesses(uid));
+    if (failures.length) throw new JobIdentityCleanupError(uid, failures);
   }
 }
 
@@ -137,6 +284,7 @@ export class SharedIdentitySource implements JobIdentitySource {
 export function jobIdentitiesFromEnv(
   env: NodeJS.ProcessEnv,
   shared: AgentIdentity | undefined,
+  log?: (event: Record<string, unknown>) => void,
 ): JobIdentitySource {
   if (!env.ZEROOPS_JOB_UID_BASE) return new SharedIdentitySource(shared);
   if (process.platform === 'win32') throw new Error('O pool de uids exige Linux.');
@@ -144,10 +292,15 @@ export function jobIdentitiesFromEnv(
     uidBase: Number(env.ZEROOPS_JOB_UID_BASE),
     count: Number(env.ZEROOPS_JOB_UID_COUNT ?? 64),
     homeRoot: env.ZEROOPS_JOB_HOME_ROOT ?? '/home/node/jobs',
-    scratchDirectories: (env.ZEROOPS_JOB_SCRATCH_DIRS ?? '/tmp,/dev/shm')
-      .split(/[;,]/)
+    scratchDirectories: [
+      ...(env.ZEROOPS_JOB_SCRATCH_DIRS ?? '/tmp,/dev/shm').split(/[;,]/),
+      // Diretórios `run-*` dos runs (entregues ao uid do job).
+      ...(env.ZEROOPS_AGENT_WORKSPACE ? [env.ZEROOPS_AGENT_WORKSPACE] : []),
+    ]
       .map((item) => item.trim())
-      .filter(Boolean),
+      .filter((item, index, all) => item && all.indexOf(item) === index),
+    worktreeRoots: env.ZEROOPS_DEV_WORKSPACES ? [env.ZEROOPS_DEV_WORKSPACES] : [],
+    ...(log ? { log } : {}),
   });
 }
 
@@ -226,7 +379,11 @@ export const linuxSandboxSystem: SandboxSystem = {
   },
   async removeOwnedEntries(directory, uid) {
     let removed = 0;
-    for (const entry of await readdir(directory)) {
+    // Diretório inexistente: nada do uid pode lá estar.
+    for (const entry of await readdir(directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return [] as string[];
+      throw error;
+    })) {
       const path = join(directory, entry);
       let info: Awaited<ReturnType<typeof lstat>>;
       try {
@@ -241,4 +398,52 @@ export const linuxSandboxSystem: SandboxSystem = {
     }
     return removed;
   },
+  removeOwnedWorktrees,
 };
+
+const directories = async (path: string) => {
+  const entries = await readdir(path, { withFileTypes: true }).catch(
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return [];
+      throw error;
+    },
+  );
+  // `withFileTypes` usa lstat: symlinks nunca são seguidos.
+  return entries.filter((entry) => entry.isDirectory()).map((entry) => join(path, entry.name));
+};
+
+/**
+ * Worktrees de tentativas de `uid` em `<root>/<projeto>/<workspace>/attempts/*`. Remove a árvore e
+ * depois limpa os metadados do bare (`git worktree prune`, sem efeito nos commits nem nas branches).
+ */
+export async function removeOwnedWorktrees(root: string, uid: number) {
+  let removed = 0;
+  for (const project of await directories(root))
+    for (const workspace of await directories(project)) {
+      const attempts = join(workspace, 'attempts');
+      let owned = 0;
+      for (const entry of await readdir(attempts).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return [] as string[];
+        throw error;
+      })) {
+        const path = join(attempts, entry);
+        const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+        if (!info || info.uid !== uid) continue;
+        await rm(path, { recursive: true, force: true });
+        owned += 1;
+      }
+      if (owned)
+        await execFileAsync(
+          'git',
+          ['--git-dir', join(workspace, 'repo.git'), 'worktree', 'prune'],
+          {
+            timeout: 30_000,
+          },
+        ).catch(() => undefined);
+      removed += owned;
+    }
+  return removed;
+}

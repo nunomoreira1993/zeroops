@@ -42,6 +42,7 @@ import type { DevelopmentCommand } from '../../../packages/contracts/src/index.j
 import {
   canonicalEnvironmentKey,
   canonicalIntegrationKey,
+  legacyIntegrationKey,
   normalizeResourceUrl,
   renewResourceLock,
 } from '../../../packages/backend/src/database/resource-locks.js';
@@ -453,12 +454,19 @@ describe('P09 — entrega por pipeline controlada pelo fluxo', { timeout: 180_00
       t2.id,
       'f'.repeat(40),
     ]);
-    await drive();
-    const rework = (await deliveryOf(t2.id))!;
-    expect(rework.state).toBe('rework');
-    expect(rework.state_reason).toMatch(/mudou depois da aprovação/);
-    expect(await remoteBranchSha(p.origin.url, 'main')).toBe(mainBefore);
-    expect((await app.flows.ticketFlow(p.technical, t2.id))!.next?.nodeId).toBe('dev');
+    const applicationNow = Date.now();
+    try {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date(applicationNow - 60_000));
+      await drive();
+      const rework = (await deliveryOf(t2.id))!;
+      expect(rework.state).toBe('rework');
+      expect(rework.state_reason).toMatch(/mudou depois da aprovação/);
+      expect(await remoteBranchSha(p.origin.url, 'main')).toBe(mainBefore);
+      expect((await app.flows.ticketFlow(p.technical, t2.id))!.next?.nodeId).toBe('dev');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('A entra antes de B; B é revalidado sobre a base atual; o ambiente é exclusivo; callbacks idempotentes', async () => {
@@ -703,7 +711,38 @@ const runnerEvents = async (deliveryId: string) =>
 describe('Entrega A — integridade da execução', { timeout: 240_000 }, () => {
   it('F03: chaves canónicas identificam o recurso real, seja qual for a configuração', () => {
     expect(normalizeResourceUrl('HTTPS://user:pw@GitHub.com/org/Repo.git/')).toBe(
-      'https://github.com/org/Repo',
+      'github:org/repo',
+    );
+    // GitHub: proprietário e repositório não distinguem maiúsculas, seja qual for o transporte.
+    const github = canonicalIntegrationKey(
+      'https://github.com/Deloitte-Portugal/PizzaHut.git',
+      'main',
+    );
+    for (const variant of [
+      'https://github.com/deloitte-portugal/pizzahut',
+      'https://www.GitHub.com/DELOITTE-PORTUGAL/pizzahut/',
+      'ssh://git@github.com/Deloitte-Portugal/pizzahut.git',
+      'git@github.com:deloitte-portugal/PizzaHut.git',
+      'github.com:Deloitte-Portugal/pizzahut',
+    ])
+      expect(canonicalIntegrationKey(variant, 'main')).toBe(github);
+    // As branches continuam a distinguir maiúsculas.
+    expect(canonicalIntegrationKey('https://github.com/org/repo', 'Main')).not.toBe(
+      canonicalIntegrationKey('https://github.com/org/repo', 'main'),
+    );
+    // Outros fornecedores e caminhos locais mantêm a semântica do caminho.
+    expect(normalizeResourceUrl('https://gitlab.com/Org/Repo.git')).toBe(
+      'https://gitlab.com/Org/Repo',
+    );
+    expect(normalizeResourceUrl('file:///srv/Repos/App.git')).not.toBe(
+      normalizeResourceUrl('file:///srv/repos/app.git'),
+    );
+    expect(normalizeResourceUrl('https://github.com/org/repo/tree/main')).not.toBe(
+      'github:org/repo',
+    );
+    // A chave anterior (só para a migração) distingue-se da atual quando o caminho tinha maiúsculas.
+    expect(legacyIntegrationKey('https://github.com/Org/Repo', 'main')).not.toBe(
+      canonicalIntegrationKey('https://github.com/Org/Repo', 'main'),
     );
     expect(canonicalIntegrationKey('https://github.com/org/repo.git', 'main')).toBe(
       canonicalIntegrationKey('https://GITHUB.com/org/repo/', 'main'),
@@ -1046,7 +1085,240 @@ describe('Entrega A — integridade da execução', { timeout: 240_000 }, () => 
     await drive();
     const blocked = (await deliveryOf(t.id))!;
     expect(blocked.state).toBe('blocked');
-    expect(blocked.state_reason).toMatch(/repositório de destino da entrega mudou/);
+    expect(blocked.state_reason).toMatch(/destino da entrega.*mudou/);
     expect(await remoteBranchSha(other.url, 'main')).toBe(mainBefore);
+  });
+
+  /** Executor com transporte instrumentado (conta todos os pedidos, incluindo GET/cancel). */
+  const countingRunner = (calls: string[], workerId: string) =>
+    new DeliveryRunner(app.deliveries, app.manager, {
+      workerId,
+      allowedOrigins: [PIPELINE_ORIGIN],
+      publicUrl: 'https://zeroops.test',
+      transport: async (request) => {
+        calls.push(`${request.method} ${request.url}`);
+        return provider.transport(request);
+      },
+      leaseSeconds: 60,
+    });
+  const driveWith = async (runner: DeliveryRunner, rounds = 4) => {
+    for (let round = 0; round < rounds; round += 1) {
+      await fixture.db.query(
+        'UPDATE delivery_runs SET next_check_at=NULL WHERE finished_at IS NULL',
+      );
+      for (let index = 0; index < 20 && (await runner.runOnce()); index += 1);
+    }
+    await app.engine.tick(50);
+  };
+  const setEndpoint = (pipelineId: string, url: string) =>
+    fixture.db.query('UPDATE project_pipelines SET endpoint_url=$2 WHERE id=$1', [pipelineId, url]);
+  /** Isola o teste: fecha entregas ainda abertas de testes anteriores (ambiente `quality` partilhado). */
+  const freeSharedEnvironment = async () => {
+    await fixture.db.query(
+      "UPDATE delivery_runs SET state='blocked',finished_at=NOW(3),lease_until=NULL WHERE finished_at IS NULL",
+    );
+    await fixture.db.query('DELETE FROM resource_locks');
+  };
+  /** Termina (só na BD de teste) as entregas dos tickets e liberta os seus locks partilhados. */
+  const releaseTicketDeliveries = async (ticketIds: string[]) => {
+    for (const ticketId of ticketIds) {
+      const d = await deliveryOf(ticketId);
+      if (!d) continue;
+      await fixture.db.query('DELETE FROM resource_locks WHERE holder_id=$1', [d.id]);
+      await fixture.db.query(
+        "UPDATE delivery_runs SET state='blocked',finished_at=NOW(3),lease_until=NULL WHERE id=$1 AND finished_at IS NULL",
+        [d.id],
+      );
+    }
+  };
+
+  it('F01: endpoint alterado depois do claim — o gate e o POST usam o mesmo contexto; nada vai para o antigo', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'Endpoint alterado após o claim');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'endpoint.txt'), 'E\n'));
+    await approve(p.qa, t.id, head);
+    const calls: string[] = [];
+    const runner = countingRunner(calls, 'executor-f01-endpoint');
+    const original = app.deliveries.claimNext.bind(app.deliveries);
+    const claim = vi.spyOn(app.deliveries, 'claimNext').mockImplementation(async (...args) => {
+      const job = await original(...args);
+      // A alteração chega depois de o executor ter carregado o contexto (endpoint antigo).
+      if (job?.delivery.ticket_id === t.id && job.delivery.state === 'starting')
+        await setEndpoint(p.pipeline.id, `${PIPELINE_ORIGIN}/hooks-novo`);
+      return job;
+    });
+    try {
+      await driveWith(runner);
+    } finally {
+      claim.mockRestore();
+    }
+    const d = (await deliveryOf(t.id))!;
+    expect(d.state).toBe('blocked');
+    expect(d.state_reason).toMatch(/não é redirecionada/);
+    expect(calls).toEqual([]);
+    expect(provider.posts.filter((post) => post.deliveryId === d.id)).toEqual([]);
+    const blocked = (await runnerEvents(d.id)).find((event) => event.status === 'effect_blocked');
+    expect(blocked?.payload).toMatchObject({ effect: 'start', configChanged: 'target' });
+  });
+
+  it('F01: repositório alterado durante os testes longos da integração — sem push para nenhum dos dois', async () => {
+    const p = await project();
+    const a = await ticket(p.client, 'Base F01 repositório');
+    const b = await ticket(p.client, 'Combinação F01 repositório');
+    const headA = await develop(a.id, (dir) => writeFile(join(dir, 'a-repo.txt'), 'A\n'));
+    const headB = await develop(b.id, (dir) => writeFile(join(dir, 'b-repo.txt'), 'B\n'));
+    await approve(p.qa, a.id, headA);
+    await approve(p.qa2, b.id, headB);
+    const other = await createOrigin();
+    const otherBefore = await remoteBranchSha(other.url, 'main');
+    const manager = new HookedManager(join(root, 'workspaces'));
+    let changed = false;
+    // Só B corre os testes (merge sobre A); o URL muda durante esses testes.
+    manager.hook = async (_checkout, command, _signal, run) => {
+      if (!changed) {
+        changed = true;
+        await fixture.db.query('UPDATE project_git_repositories SET url=$2 WHERE id=$1', [
+          p.repository.id,
+          other.url,
+        ]);
+      }
+      return run(command);
+    };
+    const runner = new DeliveryRunner(app.deliveries, manager, {
+      workerId: 'executor-f01-repo',
+      allowedOrigins: [PIPELINE_ORIGIN],
+      publicUrl: 'https://zeroops.test',
+      transport: provider.transport,
+      leaseSeconds: 60,
+    });
+    try {
+      await driveWith(runner, 3);
+      expect(changed).toBe(true);
+      const dB = (await deliveryOf(b.id))!;
+      expect(dB.state).toBe('blocked');
+      // A entrou antes da alteração; a combinação com B não chegou a nenhum remoto.
+      expect(await remoteBranchSha(p.origin.url, 'main')).toBe(headA);
+      expect(await remoteBranchSha(other.url, 'main')).toBe(otherBefore);
+      const events = await runnerEvents(dB.id);
+      expect(events.map((event) => event.status)).not.toContain('pushed');
+      expect(events.find((event) => event.status === 'effect_blocked')?.payload).toMatchObject({
+        effect: 'push',
+        configChanged: 'target',
+      });
+    } finally {
+      await releaseTicketDeliveries([a.id, b.id]);
+    }
+  });
+
+  it('F01: endpoint alterado antes do retry (estado incerto) — nem consulta, nem novo POST', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'Endpoint alterado antes do retry');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'retry-endpoint.txt'), 'R\n'));
+    await freeSharedEnvironment();
+    await approve(p.qa, t.id, head);
+    provider.loseNextRequest = true;
+    await drive(1);
+    const uncertain = (await deliveryOf(t.id))!;
+    expect(uncertain.state).toBe('uncertain');
+    await setEndpoint(p.pipeline.id, `${PIPELINE_ORIGIN}/hooks-novo`);
+    const calls: string[] = [];
+    await driveWith(countingRunner(calls, 'executor-f01-retry'), 2);
+    const d = (await deliveryOf(t.id))!;
+    expect(d.state).toBe('uncertain');
+    expect(d.finished_at).not.toBeNull();
+    expect(d.state_reason).toMatch(/confirmado manualmente/);
+    expect(calls).toEqual([]);
+    const statuses = (await runnerEvents(d.id)).map((event) => event.status);
+    expect(statuses).not.toContain('start_retry');
+    expect(statuses.filter((status) => status === 'start_sent')).toHaveLength(1);
+  });
+
+  it('F01: destino alterado durante a publicação — sem consulta nem cancelamento no destino novo', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'Destino alterado em publicação');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'publishing.txt'), 'P\n'));
+    await freeSharedEnvironment();
+    await approve(p.qa, t.id, head);
+    await drive();
+    expect((await deliveryOf(t.id))!.state).toBe('publishing');
+    await setEndpoint(p.pipeline.id, `${PIPELINE_ORIGIN}/hooks-novo`);
+    await fixture.db.query('UPDATE delivery_runs SET cancel_requested=1 WHERE ticket_id=$1', [
+      t.id,
+    ]);
+    const calls: string[] = [];
+    await driveWith(countingRunner(calls, 'executor-f01-publishing'), 2);
+    const d = (await deliveryOf(t.id))!;
+    expect(d.state).toBe('uncertain');
+    expect(calls).toEqual([]);
+    expect(
+      (await runnerEvents(d.id)).find((event) => event.status === 'effect_blocked')?.payload,
+    ).toMatchObject({ effect: 'reconcile', configChanged: 'target' });
+    // Liberta o ambiente partilhado para os testes seguintes.
+    await releaseTicketDeliveries([t.id]);
+  });
+
+  it('F01: autorização de integração alterada depois do claim — nenhum efeito com a antiga; novo claim', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'Autorização alterada após o claim');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'auth.txt'), 'A\n'));
+    await approve(p.qa, t.id, head);
+    const mainBefore = await remoteBranchSha(p.origin.url, 'main');
+    const original = app.deliveries.claimNext.bind(app.deliveries);
+    let toggled = false;
+    const claim = vi.spyOn(app.deliveries, 'claimNext').mockImplementation(async (...args) => {
+      const job = await original(...args);
+      if (!toggled && job?.delivery.ticket_id === t.id) {
+        toggled = true;
+        await fixture.db.query('UPDATE project_pipelines SET allow_integration=0 WHERE id=$1', [
+          p.pipeline.id,
+        ]);
+      }
+      return job;
+    });
+    try {
+      await drive(1);
+    } finally {
+      claim.mockRestore();
+    }
+    expect(toggled).toBe(true);
+    const d = (await deliveryOf(t.id))!;
+    const events = await runnerEvents(d.id);
+    expect(events.find((event) => event.status === 'effect_blocked')?.payload).toMatchObject({
+      effect: 'integrate',
+      configChanged: 'authorization',
+    });
+    // O claim seguinte já usa a autorização atual: não integra no repositório.
+    expect(events.map((event) => event.status)).not.toContain('pushed');
+    expect(await remoteBranchSha(p.origin.url, 'main')).toBe(mainBefore);
+    await releaseTicketDeliveries([t.id]);
+  });
+
+  it('F03: entregas ativas com a chave anterior migram para a chave GitHub canónica', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'Migração da chave');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'chave.txt'), 'K\n'));
+    await approve(p.qa, t.id, head);
+    const d = (await deliveryOf(t.id))!;
+    const url = 'https://github.com/Deloitte-Portugal/PizzaHut-F03-' + d.id.slice(0, 8);
+    const legacy = legacyIntegrationKey(url, 'main');
+    await fixture.db.query('UPDATE project_git_repositories SET url=$2 WHERE id=$1', [
+      p.repository.id,
+      url,
+    ]);
+    await fixture.db.query('UPDATE delivery_runs SET integration_key=$2 WHERE id=$1', [
+      d.id,
+      legacy,
+    ]);
+    expect(await app.deliveries.migrateIntegrationKeys()).toBeGreaterThanOrEqual(1);
+    const migrated = (await deliveryOf(t.id))!;
+    expect(migrated.integration_key).toBe(canonicalIntegrationKey(url.toLowerCase(), 'main'));
+    // Idempotente.
+    const again = await fixture.db.query<{ integration_key: string }>(
+      'SELECT integration_key FROM delivery_runs WHERE id=$1',
+      [d.id],
+    );
+    await app.deliveries.migrateIntegrationKeys();
+    expect((await deliveryOf(t.id))!.integration_key).toBe(again.rows[0]!.integration_key);
+    await releaseTicketDeliveries([t.id]);
   });
 });

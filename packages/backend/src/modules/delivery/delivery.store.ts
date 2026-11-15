@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   deliveryNodeConfig,
   FLOW_SUCCESS,
@@ -31,6 +31,8 @@ import {
   acquireResourceLock,
   canonicalEnvironmentKey,
   canonicalIntegrationKey,
+  legacyIntegrationKey,
+  normalizeResourceUrl,
   releaseLocksOf,
   releaseResourceLock,
   renewResourceLock,
@@ -52,6 +54,11 @@ export interface DeliveryRow {
   target_branch: string;
   /** F03: chave canónica do repositório real + branch (NULL em entregas anteriores à 047). */
   integration_key: string | null;
+  /**
+   * F01: impressão digital do destino material fixado na criação (NULL em entregas anteriores à
+   * 048, preenchida na primeira posse). Uma configuração diferente nunca redireciona a entrega.
+   */
+  config_fingerprint: string | null;
   candidate_base_sha: string;
   candidate_head_sha: string;
   candidate_scope_hash: string;
@@ -99,6 +106,42 @@ export type DeliveryGates =
       required: number;
     }
   | { ok: false; reason: string; rework?: boolean; pending?: boolean };
+
+/** F01: a configuração material mudou depois de fixada (destino) ou do claim (autorização). */
+export type DeliveryConfigChange = {
+  ok: false;
+  reason: string;
+  configChanged: 'target' | 'authorization';
+};
+
+/**
+ * F01: impressão digital, sem segredos, do destino material da entrega: pipeline, repositório real,
+ * branch, ambiente, endpoint efetivamente chamado e alvo canónico do lock. Alterações de nome,
+ * política ou segredo não mudam o destino.
+ */
+export function deliveryTargetFingerprint(input: {
+  pipeline: Pick<
+    PipelineRow,
+    'id' | 'repository_id' | 'target_branch' | 'environment' | 'endpoint_url' | 'target_key'
+  >;
+  repositoryUrl: string | null;
+}) {
+  const { pipeline } = input;
+  const material = {
+    pipeline: pipeline.id,
+    repository: pipeline.repository_id,
+    repositoryUrl: input.repositoryUrl === null ? null : normalizeResourceUrl(input.repositoryUrl),
+    branch: pipeline.target_branch,
+    environment: pipeline.environment,
+    endpoint: pipeline.endpoint_url.trim().replace(/\/+$/, ''),
+    target: canonicalEnvironmentKey({
+      targetKey: pipeline.target_key,
+      endpointUrl: pipeline.endpoint_url,
+      environment: pipeline.environment,
+    }),
+  };
+  return createHash('sha256').update(JSON.stringify(material)).digest('hex');
+}
 
 const ACTIVE_FLOW = "('running','waiting')";
 
@@ -234,8 +277,9 @@ export async function createDelivery(
   await client.query(
     `INSERT INTO delivery_runs(id,project_id,ticket_id,execution_id,step_id,node_id,pipeline_id,
        repository_id,workspace_id,review_step_id,environment,target_branch,candidate_base_sha,
-       candidate_head_sha,candidate_scope_hash,approvals,idempotency_key,state,integration_key)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'queued',$18)`,
+       candidate_head_sha,candidate_scope_hash,approvals,idempotency_key,state,integration_key,
+       config_fingerprint)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'queued',$18,$19)`,
     [
       id,
       input.projectId,
@@ -255,6 +299,10 @@ export async function createDelivery(
       JSON.stringify({ required: gates.required, actors: gates.approvals }),
       randomUUID(),
       repository ? canonicalIntegrationKey(repository.url, gates.pipeline.target_branch) : null,
+      deliveryTargetFingerprint({
+        pipeline: gates.pipeline,
+        repositoryUrl: repository?.url ?? null,
+      }),
     ],
   );
   return id;
@@ -303,6 +351,8 @@ export interface DeliveryJob {
    * repositório + branch; alvo explícito ou endpoint + ambiente).
    */
   locks: { integration: string | null; environment: string };
+  /** F01: destino material da configuração carregada neste claim (a usada nos efeitos). */
+  configFingerprint: string;
 }
 
 export type DeliveryWrite = 'accepted' | 'stale';
@@ -311,6 +361,38 @@ export type DeliveryWrite = 'accepted' | 'stale';
 export type DeliveryEventOutcome = DeliveryEventView['outcome'];
 
 const terminal = (row: Pick<DeliveryRow, 'finished_at'>) => row.finished_at !== null;
+
+/**
+ * F01: compara o destino atual com o fixado na entrega e com o do claim; `allowIntegration`
+ * (quando indicado) com a autorização carregada no claim.
+ */
+function configChange(
+  row: Pick<DeliveryRow, 'config_fingerprint'>,
+  current: string | null,
+  claimed: { configFingerprint: string; pipeline?: { allowIntegration: boolean } } | undefined,
+  allowIntegration: boolean | null,
+): DeliveryConfigChange | null {
+  const fixed = row.config_fingerprint ?? claimed?.configFingerprint ?? current;
+  if (current === null || current !== fixed || (claimed && claimed.configFingerprint !== current))
+    return {
+      ok: false,
+      configChanged: 'target',
+      reason:
+        'O destino da entrega (repositório, branch, pipeline, endpoint ou alvo) mudou depois de ter sido fixado: a entrega não é redirecionada e exige decisão humana.',
+    };
+  if (
+    allowIntegration !== null &&
+    claimed?.pipeline &&
+    claimed.pipeline.allowIntegration !== allowIntegration
+  )
+    return {
+      ok: false,
+      configChanged: 'authorization',
+      reason:
+        'A autorização de integração da pipeline mudou durante a tentativa: nenhum efeito com a configuração anterior; a entrega é retomada com a atual.',
+    };
+  return null;
+}
 
 /**
  * Persistência das entregas. As escritas do executor exigem a posse atual (worker + época +
@@ -376,10 +458,19 @@ export class DeliveryStore {
     );
   }
 
-  /** Revalida os gates com a definição publicada da execução e a posse da etapa no fluxo. */
+  /**
+   * Revalida os gates com a definição publicada da execução e a posse da etapa no fluxo. F01: com
+   * `claimed` (o contexto efetivamente usado pelo executor), confirma também que o destino material
+   * continua o fixado na criação e o do claim, e que a autorização de integração não mudou.
+   */
   async revalidate(
     lease: DeliveryLease,
-  ): Promise<DeliveryGates | { ok: false; reason: string; cancelled: true } | 'stale'> {
+    claimed?: Pick<DeliveryJob, 'configFingerprint'> & {
+      pipeline: Pick<DeliveryJob['pipeline'], 'allowIntegration'>;
+    },
+  ): Promise<
+    DeliveryGates | DeliveryConfigChange | { ok: false; reason: string; cancelled: true } | 'stale'
+  > {
     return this.fenced(lease, null, async (client, row) => {
       const step = (
         await client.query<{ flow_definition: unknown }>(
@@ -411,7 +502,43 @@ export class DeliveryStore {
       });
       if (gates.ok && gates.pipeline.id !== row.pipeline_id)
         return { ok: false as const, reason: 'A pipeline da etapa mudou.' };
+      if (gates.ok) {
+        const repository = await activeRepository(client, row.project_id, row.repository_id);
+        const current = deliveryTargetFingerprint({
+          pipeline: gates.pipeline,
+          repositoryUrl: repository?.url ?? null,
+        });
+        const change = configChange(
+          row,
+          current,
+          claimed,
+          Boolean(gates.pipeline.allow_integration),
+        );
+        if (change) return change;
+      }
       return gates;
+    });
+  }
+
+  /**
+   * F01: antes de um efeito de reconciliação (consulta/cancelamento no fornecedor) confirma que o
+   * destino material atual é o fixado e o do claim. Não reavalia os gates do fluxo.
+   */
+  async targetCheck(
+    lease: DeliveryLease,
+    claimed: Pick<DeliveryJob, 'configFingerprint'>,
+  ): Promise<DeliveryConfigChange | { ok: true } | 'stale'> {
+    return this.fenced(lease, null, async (client, row) => {
+      const pipeline = (
+        await client.query<PipelineRow>('SELECT * FROM project_pipelines WHERE id=$1', [
+          row.pipeline_id,
+        ])
+      ).rows[0];
+      const repository = await activeRepository(client, row.project_id, row.repository_id);
+      const current = pipeline
+        ? deliveryTargetFingerprint({ pipeline, repositoryUrl: repository?.url ?? null })
+        : null;
+      return configChange(row, current, claimed, null) ?? { ok: true as const };
     });
   }
 
@@ -851,6 +978,26 @@ export class DeliveryStore {
         'UPDATE delivery_runs SET integration_key=$2 WHERE id=$1 AND integration_key IS NULL',
         [row.id, row.integration_key],
       );
+    } else if (repository && row.integration_key) {
+      const migrated = await this.migrateIntegrationKey(row, repository.url);
+      if (migrated) row.integration_key = migrated;
+    }
+    const configFingerprint = deliveryTargetFingerprint({
+      pipeline,
+      repositoryUrl: repository?.url ?? null,
+    });
+    if (row.config_fingerprint === null) {
+      // F01: entregas anteriores à 048 fixam o destino na primeira posse.
+      await this.db.query(
+        'UPDATE delivery_runs SET config_fingerprint=$2 WHERE id=$1 AND config_fingerprint IS NULL',
+        [row.id, configFingerprint],
+      );
+      row.config_fingerprint = (
+        await this.db.query<{ config_fingerprint: string }>(
+          'SELECT config_fingerprint FROM delivery_runs WHERE id=$1',
+          [row.id],
+        )
+      ).rows[0]!.config_fingerprint;
     }
     return {
       lease: { deliveryId: row.id, workerId, epoch: Number(row.lease_epoch) },
@@ -889,6 +1036,45 @@ export class DeliveryStore {
           environment: row.environment,
         }),
       },
+      configFingerprint,
     };
+  }
+
+  /**
+   * F03: a chave anterior à normalização GitHub (caminho com maiúsculas) passa à chave atual. Só
+   * altera a chave que corresponde exatamente à legada do URL atual do repositório.
+   */
+  private async migrateIntegrationKey(
+    row: Pick<DeliveryRow, 'id' | 'integration_key' | 'target_branch'>,
+    url: string,
+  ) {
+    const current = canonicalIntegrationKey(url, row.target_branch);
+    const legacy = legacyIntegrationKey(url, row.target_branch);
+    if (row.integration_key === current || row.integration_key !== legacy) return null;
+    await this.db.query(
+      'UPDATE delivery_runs SET integration_key=$2 WHERE id=$1 AND integration_key=$3',
+      [row.id, current, legacy],
+    );
+    return current;
+  }
+
+  /**
+   * F03: migração das chaves de integração das entregas ativas no arranque do executor. Pressupõe
+   * a drenagem do deploy (nenhum executor antigo ativo); é idempotente.
+   */
+  async migrateIntegrationKeys() {
+    const rows = await this.db.query<{
+      id: string;
+      integration_key: string | null;
+      target_branch: string;
+      url: string;
+    }>(
+      `SELECT d.id,d.integration_key,d.target_branch,r.url FROM delivery_runs d
+         JOIN project_git_repositories r ON r.id=d.repository_id
+        WHERE d.finished_at IS NULL AND d.integration_key IS NOT NULL`,
+    );
+    let migrated = 0;
+    for (const row of rows.rows) if (await this.migrateIntegrationKey(row, row.url)) migrated += 1;
+    return migrated;
   }
 }

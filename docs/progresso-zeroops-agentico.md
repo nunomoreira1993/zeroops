@@ -2648,3 +2648,143 @@ Produção.
   `/sources` partilhado em leitura e pressuposto de um executor por intervalo
   de UIDs. Não foram validados testes reais de integração Copilot/CI nem vários
   executores simultâneos.
+
+## Entrega A — correções finais F01/F02/F03 — 2026-11-15
+
+### Correções
+
+- **F02 — limpeza confirmada antes de reutilizar um UID.** `DevelopmentRunner.release`
+  executa sempre a remoção do worktree e a libertação do workspace e propaga a falha
+  de remoção. A preparação parcial remove o checkout sem ocultar o erro original. O
+  `delivery-runner` e o `investigation-runner` libertam a identidade mesmo quando a
+  remoção falha, registando o evento. `JobIdentityPool.scrub` executa cada passo de
+  forma independente (processos, home, scratch e worktrees do UID em
+  `ZEROOPS_DEV_WORKSPACES/*/*/attempts/*`, preservando `repo.git`) e volta a terminar
+  processos quando algum passo falha. Um UID cuja limpeza não fique confirmada vai
+  para quarentena (`JobIdentityCleanupError`, evento observável e backoff entre
+  60 s e 15 min), não é reutilizado e só volta ao pool depois de `recover()`
+  confirmar a limpeza. Isto acontece na manutenção ou no `acquire` seguinte. Após
+  um reinício, cada UID é limpo antes da primeira utilização.
+- **F03 — identidade GitHub insensível a maiúsculas.** `canonicalGithubRepository`
+  reduz as URLs https, ssh, git e scp de `github.com` para `github:owner/repo`, em
+  minúsculas e sem `.git`. As branches mantêm a distinção de maiúsculas. Os outros
+  providers e os caminhos locais usam a normalização anterior. As entregas ativas
+  com chave antiga migram no arranque do executor e no `job()`; a transição exige
+  drenagem, que o `deploy-from-git.sh` faz.
+- **F01 — configuração alterada não produz efeitos.** A migration
+  `048_delivery_config_fingerprint.sql` (aditiva) fixa o SHA-256 do destino material
+  da entrega: pipeline, repositório, URL canónico, branch, ambiente, endpoint e alvo
+  canónico, sem segredos. `revalidate(lease, job)` compara a impressão atual com a da
+  criação e a do claim. Se o destino mudou, a entrega fica `blocked` com
+  `effect_blocked`/`configChanged:'target'` e nunca é redirecionada. Se a autorização
+  de integração mudou, nada é executado com a autorização antiga e é feito um novo
+  claim. Nas reconciliações (`publishing`/`uncertain`), um destino alterado deixa a
+  entrega `uncertain` para verificação manual, sem GET nem cancel no destino novo. A
+  verificação corre antes do push, do POST, de cada retry e da reconciliação. Os
+  gates de review, aprovações, permissões, capacidades e lease mantêm-se.
+- **Janela residual:** entre o commit de `revalidate` e o push/POST efetivo
+  (milissegundos a segundos) uma alteração de configuração não é detetada. Não existe
+  atomicidade distribuída entre BD, Git e fornecedor externo.
+
+### Validação local
+
+- `npm run typecheck`, `npm run lint` e `npm run build`: passaram. A build mantém o
+  aviso de bundle web acima de 500 kB, que já existia.
+- `prettier --check` nos 9 ficheiros TypeScript alterados: passou.
+- Regressões focadas (`job-sandbox.test.ts` + `delivery.e2e.test.ts`): 29/29.
+  - F02: falha na remoção do worktree, UID em quarentena e recuperação só com
+    limpeza confirmada; reinício do executor com resíduos; worktree real com
+    propagação da falha; `removeOwnedWorktrees` remove só o UID indicado.
+  - F03: variantes https/ssh/scp e maiúsculas partilham a chave; `main`/`Main`
+    continuam independentes; GitLab e `file://` preservam maiúsculas; migração de
+    chaves legadas de entregas ativas.
+  - F01 (e2e): endpoint alterado depois do claim, repositório alterado durante
+    testes longos da integração, endpoint alterado antes do retry após 404, destino
+    alterado durante a publicação e autorização alterada depois do claim. Em todos,
+    o destino antigo não recebe push nem POST.
+- **Suite integral vitest (ronda única, 1325 s):** 74 ficheiros passaram, 2
+  falharam e 1 foi ignorado; 502 testes passaram, 4 falharam e 2 foram ignorados.
+  - O bloqueio anterior (>19 min) **não era um processo parado**:
+    `fileParallelism: false` faz correr tudo em série e `delivery.e2e` demora ~10 min
+    sozinho (Git e MariaDB reais). A ronda completa termina em ~22 min.
+  - 3 falhas em `architecture.boundaries` são dívida existente (allowlist/ciclos de
+    `incidents` e 8 lacunas de JSDoc em ficheiros não tocados).
+  - 1 falha intermitente em P09 «sem o review exigido…»: o estado `rework`, o motivo
+    e a ausência de push estavam corretos; só a passagem do fluxo para `dev` ainda
+    não tinha ocorrido. Passou na execução isolada do ficheiro e em 3 repetições
+    isoladas. O ponto que acorda o fluxo (`wake_at=NOW(3)`) não foi alterado; a
+    hipótese é uma corrida entre o relógio do MariaDB e o do Node em `tick()`. Fica
+    **pendente de diagnóstico**; a validação global não é declarada aprovada.
+- Suite web: não executada nesta ronda porque nenhum ficheiro web mudou; reutiliza
+  o resultado aprovado anterior.
+- `format:check` global continua com a dívida histórica de 35 ficheiros.
+
+### Publicação em QA
+
+- Commit de código `55b4363c2c41f0b2cf26e0c360e1fbb13e303afa`, branch
+  `feat/entrega-a-integridade-execucao` enviada para o remoto interno `qa`. O hook
+  só publica `main` e respondeu «recebida sem deploy», por isso não houve deploy
+  duplicado.
+- Pré-verificação: 0 entregas abertas, 0 `resource_locks` e 0 `agent_runs` ativos.
+- Deploy único com o script do próprio commit (`deploy-from-git.sh <SHA>`):
+  drenagem (0 jobs), backup
+  `/var/backups/zeroops/zeroops-20261115T160017-g55b4363c2c41.sql.gz` (`gzip -t` OK,
+  SHA-256 `e65f940c46e2fc09bda2ccbe2b81e567497c8dc1081945f01fa8dff5f55138ff`),
+  migration 048 aplicada (checksum no journal igual ao do ficheiro; coluna
+  `config_fingerprint char(64)` presente), `DEPLOY_EXIT=0`.
+- Versão ativa: `VERSION` e `/api/health` → `55b4363…`, `ready`; conectores
+  `ready`; contentores `Up`.
+- Executor: `ZEROOPS_JOB_UID_BASE=61000`, `ZEROOPS_JOB_UID_COUNT=64` (UIDs
+  61000–61063). O pool é em memória: **não está certificado** executar vários
+  executores com intervalos de UID sobrepostos.
+- Smoke controlado num contentor descartável da imagem publicada
+  (`--network none`, tmpfs, UIDs 65000–65001, sem tocar em tickets reais):
+  - F02: com falha injetada na remoção dos worktrees, `release` falhou com
+    `JobIdentityCleanupError`; o UID ficou em quarentena e não foi reutilizado
+    (`acquire` → esgotado); o resíduo manteve-se. Depois de `recover`, o resíduo foi
+    removido, `repo.git` preservado e o UID voltou a ser atribuído (eventos
+    `job_identity.quarantined`/`recovered`). No reinício com resíduos e limpeza
+    falhada, nenhum UID foi reutilizado.
+  - F03: as variantes de maiúsculas e de URL do mesmo repositório GitHub dão a
+    mesma chave; `qa`/`QA` dão chaves distintas; `file://` preserva maiúsculas.
+  - F01: validado só nos e2e locais; em QA foram verificadas a migration e a
+    coluna, sem exercer um efeito real com configuração alterada.
+
+### Teste ponta a ponta no site Pizza Hut (ZO-38)
+
+- Fluxo de teste «Teste E2E site Pizza Hut» v1 (`2d56cd45…`): desenvolvimento com
+  PR no repositório «Pizza Hut website» (`numoreira/pizzahut`, base `qa`) → review
+  humana → fim, sem pipeline de entrega. Regra: equipa, `improvement`, `quality`,
+  `low`, prioridade 111. A pipeline «Rollout ZeroOps QA» não foi usada.
+- Ticket ZO-38: o Copilot real criou apenas `adm/zeroops-server-check.php` (padrão
+  de `adm/phpinfo.php`, `Autenticacao('informacoes_sistema')`, `pr()` só de
+  `SERVER_NAME`, `HTTP_HOST`, `REQUEST_URI`, `REMOTE_ADDR`, `SERVER_SOFTWARE` e
+  `REQUEST_TIME`) e `zeroops-check.txt`. Smoke `test -s zeroops-check.txt`
+  passou; branch `zeroops/zo-38-ed623111` (`c7bfd006`, base `2c38b0f5`) e PR
+  `numoreira/pizzahut#1` publicados com o token do projeto.
+- **Parado na review:** a separação de funções (`separationOfDuties`, por omissão
+  `true`) impede o autor do ticket de aprovar; o ticket foi criado com a conta do
+  administrador, que é também o único revisor configurado. A salvaguarda não foi
+  desativada.
+- Pendente de intervenção humana:
+  1. Review por outro revisor (ou nova versão do fluxo de teste com outro revisor).
+  2. Merge do PR #1 em `qa` com a conta `numoreira`. A conta EMU do browser e a
+     conta `gh` do QA não veem o repositório privado.
+  3. No QA, como `pizzahut` em `/var/www/vhosts/pizzahut.pt/httpdocs` (branch
+     `qa`, HEAD `2c38b0f5`, 18 não versionados a preservar): `git pull --ff-only`
+     interativo. O checkout não tem credencial para o GitHub
+     (`could not read Username`).
+  4. Abrir `https://dev.pizzahut.pt/adm/zeroops-server-check.php` com sessão de
+     backoffice e, no fim, remover os dois ficheiros por novo commit em `qa` e
+     `pull`.
+
+### Estado
+
+- F01, F02 e F03: corrigidos, com regressões e publicados em QA. F04 (heartbeat e
+  perda de posse) foi concluído na fase anterior da Entrega A e mantém-se coberto
+  pelas suites.
+- A Entrega A **não é declarada globalmente validada**: o P09 intermitente continua
+  por diagnosticar e o E2E do site espera pelos passos humanos acima.
+- Isto não equivale a prontidão para Produção.
+- Entregas seguintes: integração real Git/CI (pipeline do site), Health/relay e
+  validação pelo browser.

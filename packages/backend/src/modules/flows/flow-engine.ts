@@ -252,9 +252,15 @@ export class FlowEngine {
   constructor(
     private readonly db: Database,
     private readonly actions: FlowActionRegistry = defaultFlowActions,
-    private readonly clock: () => Date = () => new Date(),
+    private readonly clock?: () => Date,
     private readonly agentProfiles: AgentProfilesService = new AgentProfilesService(db),
   ) {}
+
+  /** Despertares, prazos e timestamps usam a referência da BD; os testes podem injetar um relógio. */
+  private async now(client: Queryable = this.db): Promise<Date> {
+    if (this.clock) return this.clock();
+    return (await client.query<{ now: Date }>('SELECT NOW(3) AS now')).rows[0]!.now;
+  }
 
   /**
    * Hook de criação: associação explícita da Saúde ou regra estruturada inequívoca entram logo no
@@ -386,7 +392,7 @@ export class FlowEngine {
   readonly incidentDelegate: IncidentDelegate = async (client, ticketId) => {
     const updated = await client.query(
       "UPDATE flow_executions SET wake_at=$2 WHERE ticket_id=$1 AND status IN ('running','waiting')",
-      [ticketId, this.clock()],
+      [ticketId, await this.now(client)],
     );
     return updated.rowCount > 0;
   };
@@ -457,7 +463,7 @@ export class FlowEngine {
       ...(resolved.error ? { resourceResolutionError: resolved.error } : {}),
     };
     const executionId = randomUUID();
-    const now = this.clock();
+    const now = await this.now(client);
     await client.query(
       `INSERT INTO flow_executions(id,ticket_id,project_id,flow_id,version_id,status,execution_context,started_at,finished_at)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
@@ -722,7 +728,7 @@ export class FlowEngine {
         WHERE status IN ('running','waiting') AND suspended_at IS NULL AND wake_at IS NOT NULL AND wake_at <= $1
           AND NOT EXISTS(SELECT 1 FROM ticket_purge_maintenance p WHERE p.project_id=flow_executions.project_id AND p.lease_until>NOW(3))
         ORDER BY wake_at LIMIT ${Math.max(1, Math.min(limit, 100))}`,
-      [this.clock()],
+      [await this.now()],
     );
     const orphans = await this.db.query<{ ticket_id: string }>(
       `SELECT e.ticket_id FROM flow_executions e
@@ -849,7 +855,7 @@ export class FlowEngine {
     await run.client.query(
       `INSERT INTO flow_execution_events(id,execution_id,step_id,kind,actor_id,event_details,created_at)
        VALUES($1,$2,$3,$4,$5,$6,$7)`,
-      [randomUUID(), run.execution.id, stepId, kind, actorId, details, this.clock()],
+      [randomUUID(), run.execution.id, stepId, kind, actorId, details, await this.now(run.client)],
     );
   }
 
@@ -954,7 +960,7 @@ export class FlowEngine {
         `«${node.label}» atingiu o limite de ${maxVisits(node)} passagens. A equipa tem de rever o pedido.`,
       );
     const stepId = randomUUID();
-    const now = this.clock();
+    const now = await this.now(run.client);
     const assignee = node.op === 'human_decision' ? await this.assigneeView(run, node) : null;
     await run.client.query(
       `INSERT INTO flow_execution_steps(id,execution_id,node_id,attempt,step_sequence,status,step_assignee,step_input,started_at)
@@ -1054,7 +1060,7 @@ export class FlowEngine {
     await run.client.query(
       `UPDATE flow_execution_steps SET status='completed',port=$2,step_output=$3,actor_id=$4,finished_at=$5
         WHERE id=$1`,
-      [step.id, port, detailed, actorId, this.clock()],
+      [step.id, port, detailed, actorId, await this.now(run.client)],
     );
     await this.event(run, step.id, 'step_completed', actorId, {
       nodeId: step.node_id,
@@ -1082,9 +1088,13 @@ export class FlowEngine {
     if (run.execution.current_step_id)
       await run.client.query(
         "UPDATE flow_execution_steps SET status='failed',finished_at=$2 WHERE id=$1 AND status<>'completed'",
-        [run.execution.current_step_id, this.clock()],
+        [run.execution.current_step_id, await this.now(run.client)],
       );
-    await this.setExecution(run, { status: 'failed', finished_at: this.clock(), wake_at: null });
+    await this.setExecution(run, {
+      status: 'failed',
+      finished_at: await this.now(run.client),
+      wake_at: null,
+    });
     await this.event(run, run.execution.current_step_id, 'failed', null, { reason });
     await this.moveTicket(run, 'blocked', null);
     await appendAutomatedComment(run.client, {
@@ -1101,11 +1111,11 @@ export class FlowEngine {
     const outcome = endOutcome(node);
     await run.client.query(
       "UPDATE flow_execution_steps SET status='completed',finished_at=$2 WHERE id=$1",
-      [step.id, this.clock()],
+      [step.id, await this.now(run.client)],
     );
     await this.setExecution(run, {
       status: 'completed',
-      finished_at: this.clock(),
+      finished_at: await this.now(run.client),
       wake_at: null,
     });
     await this.event(run, step.id, 'completed', null, { outcome });
@@ -1149,7 +1159,7 @@ export class FlowEngine {
       step: { id: step.id, attempt: step.attempt, startedAt: new Date(step.started_at) },
       execution: { id: run.execution.id, definition: run.definition },
       previous: await this.previousCopilot(run),
-      now: this.clock(),
+      now: await this.now(run.client),
       effects: databaseActionEffects(run.client, ticket),
     });
     if ('wait' in result) {
@@ -1452,7 +1462,7 @@ export class FlowEngine {
       );
       await this.setExecution(run, {
         status: 'waiting',
-        wake_at: new Date(this.clock().getTime() + RETRY_MS),
+        wake_at: new Date((await this.now(run.client)).getTime() + RETRY_MS),
       });
       return;
     }

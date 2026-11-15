@@ -1,21 +1,29 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { agentEnvironment } from './copilot-process.js';
+import { DevelopmentRunner } from './development-runner.js';
 import {
+  JobIdentityCleanupError,
   JobIdentityExhausted,
   JobIdentityPool,
   SharedIdentitySource,
   jobIdentitiesFromEnv,
   ownerOf,
+  removeOwnedWorktrees,
   type SandboxSystem,
 } from './job-sandbox.js';
-import { runCommand, worktreeAdminDir } from './workspace-manager.js';
+import { WorkspaceManager, runCommand, worktreeAdminDir } from './workspace-manager.js';
 
 class FakeSystem implements SandboxSystem {
   readonly calls: string[] = [];
   failPrepare = false;
+  /** Worktrees residuais por uid (simulados) e falha injetada na sua remoção. */
+  readonly worktrees = new Map<number, string[]>();
+  failWorktrees = false;
 
   async prepareHome(path: string, uid: number) {
     this.calls.push(`prepare:${uid}`);
@@ -32,6 +40,13 @@ class FakeSystem implements SandboxSystem {
   async removeOwnedEntries(directory: string, uid: number) {
     this.calls.push(`scratch:${directory}:${uid}`);
     return 0;
+  }
+  async removeOwnedWorktrees(root: string, uid: number) {
+    this.calls.push(`worktrees:${root}:${uid}`);
+    if (this.failWorktrees) throw new Error('EBUSY: worktree ocupado');
+    const removed = this.worktrees.get(uid)?.length ?? 0;
+    this.worktrees.delete(uid);
+    return removed;
   }
 }
 
@@ -140,6 +155,181 @@ describe('F02 — identidades exclusivas por job', () => {
           system: new FakeSystem(),
         }),
     ).toThrow(/UID_COUNT/);
+  });
+});
+
+describe('F02 — limpeza confirmada antes de reutilizar o uid', () => {
+  const clockedPool = (
+    system: SandboxSystem,
+    count: number,
+    clock: { now: number },
+    log: unknown[],
+  ) =>
+    new JobIdentityPool({
+      uidBase: 61_000,
+      count,
+      homeRoot: '/var/lib/zeroops/jobs',
+      scratchDirectories: ['/tmp'],
+      worktreeRoots: ['/ws'],
+      recoveryDelayMs: 1000,
+      system,
+      now: () => clock.now,
+      log: (event) => log.push(event),
+    });
+
+  it('uma falha a remover o worktree deixa o uid em quarentena; recupera só com limpeza confirmada', async () => {
+    const system = new FakeSystem();
+    const clock = { now: 1_000_000 };
+    const log: Record<string, unknown>[] = [];
+    const identities = clockedPool(system, 1, clock, log);
+    const identity = await identities.acquire();
+    system.worktrees.set(identity.uid, ['/ws/p/w/attempts/r1-1']);
+    system.failWorktrees = true;
+    system.calls.length = 0;
+    await expect(identity.release()).rejects.toBeInstanceOf(JobIdentityCleanupError);
+    // Os restantes passos correram apesar da falha; processos voltam a ser terminados no fim.
+    expect(system.calls).toEqual([
+      'kill:61000',
+      'rmhome:61000',
+      'scratch:/tmp:61000',
+      'worktrees:/ws:61000',
+      'kill:61000',
+    ]);
+    expect(identities.quarantined).toMatchObject([
+      { uid: 61_000, attempts: 1, failures: [{ step: 'worktrees:/ws' }] },
+    ]);
+    expect(log).toContainEqual(expect.objectContaining({ event: 'job_identity.quarantined' }));
+    // Não reutilizado: nem antes do intervalo de recuperação nem com nova falha.
+    await expect(identities.acquire()).rejects.toBeInstanceOf(JobIdentityExhausted);
+    clock.now += 1001;
+    await expect(identities.acquire()).rejects.toBeInstanceOf(JobIdentityExhausted);
+    expect(identities.quarantined[0]!.attempts).toBe(2);
+    expect(system.worktrees.get(61_000)).toEqual(['/ws/p/w/attempts/r1-1']);
+    // Limpeza confirmada: o uid volta ao pool, sem restos.
+    system.failWorktrees = false;
+    clock.now += 2001;
+    const reused = await identities.acquire();
+    expect(reused.uid).toBe(61_000);
+    expect(system.worktrees.has(61_000)).toBe(false);
+    expect(identities.quarantined).toEqual([]);
+    expect(log).toContainEqual(expect.objectContaining({ event: 'job_identity.recovered' }));
+  });
+
+  it('depois de um reinício do executor, um uid com restos por limpar é saltado e isolado', async () => {
+    const system = new FakeSystem();
+    system.worktrees.set(61_000, ['/ws/p/w/attempts/antigo']);
+    system.failWorktrees = true;
+    const clock = { now: 0 };
+    const identities = clockedPool(system, 2, clock, []);
+    await expect(identities.acquire()).rejects.toBeInstanceOf(JobIdentityExhausted);
+    system.failWorktrees = false;
+    system.worktrees.set(61_000, ['/ws/p/w/attempts/antigo']);
+    // Pool novo (reinício): cada uid é limpo antes da primeira utilização.
+    const restarted = clockedPool(system, 2, clock, []);
+    const identity = await restarted.acquire();
+    expect(identity.uid).toBe(61_000);
+    expect(system.worktrees.has(61_000)).toBe(false);
+  });
+
+  it('worktree real: release propaga a falha de remoção e o uid só volta com o worktree apagado', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'zeroops-f02-'));
+    try {
+      const git = (cwd: string, ...args: string[]) =>
+        execFileSync('git', args, { cwd, stdio: 'pipe' }).toString().trim();
+      const source = join(root, 'source');
+      await mkdir(source);
+      git(source, 'init', '-q', '-b', 'main');
+      await writeFile(join(source, 'a.txt'), 'a\n');
+      git(source, 'add', '.');
+      git(source, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'base');
+      const workspaces = join(root, 'workspaces');
+      const manager = new WorkspaceManager(workspaces);
+      const { gitDir, remoteBaseSha } = await manager.fetchBase({
+        projectId: randomUUID(),
+        workspaceId: randomUUID(),
+        url: source,
+        baseBranch: 'main',
+        credential: null,
+      });
+      const checkout = await manager.checkout(gitDir, 'run1-1', remoteBaseSha);
+      await writeFile(join(checkout.path, 'residuo.txt'), 'segredo do job\n');
+      const releases: string[] = [];
+      const runner = new DevelopmentRunner(
+        {
+          releaseWorkspace: async (_lease: unknown, workspaceId: string) => {
+            releases.push(workspaceId);
+          },
+        } as never,
+        manager,
+      );
+      manager.removeCheckout = async () => {
+        throw new Error('EBUSY: remoção injetada');
+      };
+      const prepared = {
+        runId: 'run1',
+        context: { workspace: { id: 'w1' } },
+        checkout,
+      } as never;
+      await expect(runner.release(prepared, {} as never, false)).rejects.toThrow(
+        /remoção injetada/,
+      );
+      expect(releases).toEqual(['w1']);
+      await expect(readFile(join(checkout.path, 'residuo.txt'), 'utf8')).resolves.toContain(
+        'segredo',
+      );
+
+      // Pool: o uid do job (61000) é o dono real dos ficheiros do worktree.
+      const ownerUid = (await lstat(checkout.path)).uid;
+      const system = new FakeSystem();
+      let mode: 'idle' | 'fail' | 'real' = 'idle';
+      system.removeOwnedWorktrees = async (directory, uid) => {
+        if (mode === 'idle') return 0;
+        if (mode === 'fail') throw new Error('EBUSY: worktree ocupado');
+        return removeOwnedWorktrees(directory, uid === 61_000 ? ownerUid : -1);
+      };
+      const clock = { now: 0 };
+      const pool = new JobIdentityPool({
+        uidBase: 61_000,
+        count: 1,
+        homeRoot: join(root, 'homes'),
+        worktreeRoots: [workspaces],
+        recoveryDelayMs: 10,
+        system,
+        now: () => clock.now,
+      });
+      const identity = await pool.acquire();
+      mode = 'fail';
+      await expect(identity.release()).rejects.toBeInstanceOf(JobIdentityCleanupError);
+      await expect(pool.acquire()).rejects.toBeInstanceOf(JobIdentityExhausted);
+      await expect(readFile(join(checkout.path, 'residuo.txt'), 'utf8')).resolves.toContain(
+        'segredo',
+      );
+      mode = 'real';
+      clock.now += 20;
+      expect((await pool.acquire()).uid).toBe(61_000);
+      await expect(lstat(checkout.path)).rejects.toThrow();
+      // O repositório bare (commits e branches) fica.
+      expect((await lstat(join(gitDir, 'HEAD'))).isFile()).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it('removeOwnedWorktrees só remove worktrees do uid indicado', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'zeroops-wt-'));
+    try {
+      const attempts = join(root, 'p', 'w', 'attempts');
+      await mkdir(join(attempts, 'r1-1'), { recursive: true });
+      await mkdir(join(root, 'p', 'w', 'repo.git'), { recursive: true });
+      const uid = (await lstat(join(attempts, 'r1-1'))).uid;
+      expect(await removeOwnedWorktrees(root, uid + 12_345)).toBe(0);
+      expect(await removeOwnedWorktrees(join(root, 'nao-existe'), uid)).toBe(0);
+      expect(await removeOwnedWorktrees(root, uid)).toBe(1);
+      await expect(lstat(join(attempts, 'r1-1'))).rejects.toThrow();
+      expect((await lstat(join(root, 'p', 'w', 'repo.git'))).isDirectory()).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
   });
 });
 

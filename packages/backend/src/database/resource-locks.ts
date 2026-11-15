@@ -30,11 +30,53 @@ export const environmentLockKey = (pipelineId: string, environment: string) =>
 
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 
+const GITHUB_HOSTS = new Set(['github.com', 'www.github.com']);
+
+/**
+ * F03: repositório GitHub (`https://`, `ssh://` ou `git@github.com:`) como `github:owner/repo`.
+ * O GitHub não distingue maiúsculas no proprietário nem no nome do repositório; só se aplica a
+ * caminhos com exatamente `owner/repo`. Devolve `null` para outros hosts ou formatos.
+ */
+function canonicalGithubRepository(url: string) {
+  const value = url.trim();
+  let host: string;
+  let path: string;
+  const scp = /^(?:[^@/\s]+@)?([^:/\s]+):(?!\/)(.+)$/.exec(value);
+  if (scp && !/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    host = scp[1]!;
+    path = scp[2]!;
+  } else {
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      return null;
+    }
+    if (!['https:', 'http:', 'ssh:', 'git:'].includes(parsed.protocol)) return null;
+    host = parsed.hostname;
+    path = decodeURIComponent(parsed.pathname);
+  }
+  if (!GITHUB_HOSTS.has(host.toLowerCase())) return null;
+  const segments = path
+    .replace(/\/+$/, '')
+    .replace(/\.git$/i, '')
+    .split('/')
+    .filter(Boolean);
+  if (segments.length !== 2) return null;
+  return `github:${segments.join('/').toLowerCase()}`;
+}
+
 /**
  * URL de repositório/endpoint normalizado para identificar o recurso real: esquema e host em
  * minúsculas, sem credenciais, query, fragmento, porta por omissão, barras finais nem `.git`.
+ * Repositórios GitHub ficam `github:owner/repo` (sem distinção de maiúsculas); nos restantes
+ * hosts e caminhos locais o caminho mantém as maiúsculas.
  */
 export function normalizeResourceUrl(url: string) {
+  return canonicalGithubRepository(url) ?? normalizeGenericUrl(url);
+}
+
+function normalizeGenericUrl(url: string) {
   try {
     const parsed = new URL(url.trim());
     const path = decodeURIComponent(parsed.pathname)
@@ -56,6 +98,13 @@ export function normalizeResourceUrl(url: string) {
  */
 export const canonicalIntegrationKey = (url: string, branch: string) =>
   `integrate:${sha256(`${normalizeResourceUrl(url)}\n${branch}`)}`;
+
+/**
+ * Chave calculada antes da normalização GitHub (047, caminho com maiúsculas). Só serve para migrar
+ * entregas ativas para a chave atual; a transição exige o executor drenado (sem versões antigas).
+ */
+export const legacyIntegrationKey = (url: string, branch: string) =>
+  `integrate:${sha256(`${normalizeGenericUrl(url)}\n${branch}`)}`;
 
 /**
  * F03: lock canónico do ambiente — o identificador explícito do alvo quando configurado; caso

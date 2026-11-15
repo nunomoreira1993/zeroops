@@ -208,19 +208,26 @@ export class DeliveryRunner {
     job: DeliveryJob,
     from: DeliveryState[],
     effect: string,
-  ): Promise<null | undefined> {
-    const gates = await this.store.revalidate(job.lease);
+  ): Promise<number | null | undefined> {
+    const gates = await this.store.revalidate(job.lease, job);
     accepted(gates);
     if (gates === 'stale') return null;
     if (!gates.ok) {
       await this.store.recordRunnerEvent(job.lease, 'effect_blocked', {
         effect,
         reason: gates.reason,
+        ...('configChanged' in gates ? { configChanged: gates.configChanged } : {}),
       });
+      // F01: autorização alterada — nenhum efeito com a configuração antiga; novo claim, nova leitura.
+      if ('configChanged' in gates && gates.configChanged === 'authorization') return 0;
       return this.block(
         job,
         from,
-        'cancelled' in gates ? 'cancelled' : gates.rework ? 'rework' : 'blocked',
+        'cancelled' in gates
+          ? 'cancelled'
+          : 'rework' in gates && gates.rework
+            ? 'rework'
+            : 'blocked',
         gates.reason,
       );
     }
@@ -412,7 +419,14 @@ export class DeliveryRunner {
           ...(owner ? [owner] : []),
         );
       } catch (error) {
-        await identity?.release();
+        // Preparação parcial: o pool limpa o que o checkout tenha deixado com este uid.
+        await identity?.release().catch((releaseError: unknown) =>
+          this.options.log?.({
+            event: 'delivery.identity_release_failed',
+            deliveryId: delivery.id,
+            message: message(releaseError).slice(0, 300),
+          }),
+        );
         throw error;
       }
       try {
@@ -456,8 +470,22 @@ export class DeliveryRunner {
           return this.block(job, ['integrating'], revalidation.state, revalidation.reason);
         evidence = { ...evidence, revalidation: revalidation.evidence };
       } finally {
-        await this.manager.removeCheckout(checkout);
-        await identity?.release();
+        // F02: uma falha a remover o worktree não impede a libertação; o pool só recicla o uid
+        // depois de confirmar que também os worktrees desse uid desapareceram.
+        await this.manager.removeCheckout(checkout).catch((error: unknown) =>
+          this.options.log?.({
+            event: 'delivery.checkout_cleanup_failed',
+            deliveryId: delivery.id,
+            message: message(error).slice(0, 300),
+          }),
+        );
+        await identity?.release().catch((error: unknown) =>
+          this.options.log?.({
+            event: 'delivery.identity_release_failed',
+            deliveryId: delivery.id,
+            message: message(error).slice(0, 300),
+          }),
+        );
       }
     }
 
@@ -712,6 +740,23 @@ export class DeliveryRunner {
     const { delivery, lease } = job;
     const from: DeliveryState[] = ['publishing', 'uncertain'];
     const evidence = jsonValue<Record<string, unknown>>(delivery.evidence, {});
+    // F01: a publicação foi pedida a um destino; com o destino alterado não se consulta, cancela
+    // nem repete noutro — o resultado fica para verificação humana.
+    const target = await this.store.targetCheck(lease, job);
+    accepted(target);
+    if (target !== 'stale' && !target.ok) {
+      await this.store.recordRunnerEvent(lease, 'effect_blocked', {
+        effect: 'reconcile',
+        reason: target.reason,
+        configChanged: target.configChanged,
+      });
+      return this.block(
+        job,
+        from,
+        'uncertain',
+        `${target.reason} O estado da publicação já pedida tem de ser confirmado manualmente.`,
+      );
+    }
     if (delivery.cancel_requested && !evidence.cancelSent) {
       const cancel = await this.call(
         job,

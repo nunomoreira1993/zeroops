@@ -21,7 +21,7 @@ import { discoverAgentCommands } from './agent-commands.js';
 import { CopilotCliAdapter } from './copilot.adapter.js';
 import { CopilotSdkAdapter, sdkClientFactory } from './copilot-sdk.adapter.js';
 import { CopilotProcess, type AgentIdentity } from './copilot-process.js';
-import { jobIdentitiesFromEnv } from './job-sandbox.js';
+import { JobIdentityPool, jobIdentitiesFromEnv } from './job-sandbox.js';
 import { InvestigationRunner } from './investigation-runner.js';
 import { FlowAssistantRunner } from './flow-assistant-runner.js';
 import { ModelCatalogRefresher } from './model-catalog.js';
@@ -56,7 +56,9 @@ const identity: AgentIdentity | undefined = env.ZEROOPS_AGENT_UID
 if (identity && (!Number.isInteger(identity.uid) || identity.uid < 1))
   throw new Error('ZEROOPS_AGENT_UID invalido.');
 /** F02: um uid exclusivo por job (ZEROOPS_JOB_UID_BASE); sem pool, a identidade partilhada. */
-const identities = jobIdentitiesFromEnv(env, identity);
+const identities = jobIdentitiesFromEnv(env, identity, (event) =>
+  console.info(JSON.stringify(event)),
+);
 const connectorUrl = env.ZEROOPS_CONNECTOR_URL;
 
 const jobs = executorJobConfig(env);
@@ -293,6 +295,12 @@ async function recover() {
 
 console.info(JSON.stringify({ event: 'executor.started', ...jobs }));
 await recover();
+/** F03: entregas ativas passam às chaves canónicas GitHub (o deploy drena os executores antigos). */
+const migratedKeys = await deliveryStore.migrateIntegrationKeys();
+if (migratedKeys)
+  console.warn(
+    JSON.stringify({ event: 'delivery.integration_keys_migrated', count: migratedKeys }),
+  );
 
 /** P10: drenagem pedida pelo rollout (deixa de reclamar jobs novos até ser libertada/expirar). */
 const drain = new RuntimeDrainWatcher(db, {
@@ -361,6 +369,9 @@ const maintenance = setInterval(() => {
       )
       .catch(logError('development.cleanup_failed'));
   void deliveryStore.maintenance().catch(logError('delivery.maintenance_failed'));
+  // F02: nova limpeza dos uids em quarentena (só voltam ao pool com limpeza confirmada).
+  if (identities instanceof JobIdentityPool)
+    void identities.recover().catch(logError('job_identity.recovery_failed'));
   void reconcileUncertainInterventions(db).catch(logError('health.reconcile_failed'));
   void capabilities.syncActive().catch(logError('capability.sync_failed'));
   if (modelCatalog) void modelCatalog.refreshOnce().catch(logError('agent.models_refresh_failed'));

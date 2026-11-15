@@ -375,9 +375,22 @@ export class InvestigationRunner {
       await cleanupCapabilities?.().catch(() => undefined);
       await this.options.development
         ?.release(development, lease, developmentFailed)
-        .catch(() => undefined);
-      await rm(workspace, { recursive: true, force: true });
-      // Termina processos que o job tenha deixado e apaga a home/temporários do uid.
+        .catch((error: unknown) =>
+          this.log({
+            event: 'agent.development_release_failed',
+            runId,
+            message: error instanceof Error ? error.message.slice(0, 300) : undefined,
+          }),
+        );
+      await rm(workspace, { recursive: true, force: true }).catch((error: unknown) =>
+        this.log({
+          event: 'agent.run_workspace_cleanup_failed',
+          runId,
+          message: error instanceof Error ? error.message.slice(0, 300) : undefined,
+        }),
+      );
+      // Termina processos que o job tenha deixado e apaga home, temporários e worktrees do uid;
+      // sem limpeza confirmada o uid fica em quarentena no pool (não é reutilizado).
       await identity?.release().catch((error: unknown) =>
         this.log({
           event: 'agent.identity_release_failed',

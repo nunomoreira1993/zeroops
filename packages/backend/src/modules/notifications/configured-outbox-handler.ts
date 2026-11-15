@@ -11,7 +11,7 @@ import type { OutboxHandler } from './outbox.js';
 const eventSchema = z.object({
   ticketId: z.uuid(),
   projectId: z.uuid(),
-  actorId: z.uuid().optional(),
+  actorId: z.uuid().nullish(),
   userId: z.uuid().optional(),
   commentId: z.uuid().optional(),
   status: z.string().optional(),
@@ -155,7 +155,7 @@ export class ConfiguredOutboxHandler implements OutboxHandler {
     projectId: string,
     ticketId: string,
     topic: string,
-    options: { actorId?: string; userId?: string; internal: boolean },
+    options: { actorId?: string | null; userId?: string; internal: boolean },
   ): Promise<string[]> {
     if (topic === 'ticket.created') {
       const result = await this.db.query<RecipientRow>(

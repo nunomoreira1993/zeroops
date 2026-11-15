@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FlowDefinition, Role, User } from '../../../../contracts/src/index.js';
 import { startTestDatabase } from '../../../../../tests/helpers/test-database.js';
 import { leaseJob } from '../../../../../tests/helpers/job-lease.js';
@@ -133,6 +133,88 @@ function legacyHealthDefinition(): FlowDefinition {
 }
 
 describe('FlowEngine', () => {
+  it.each([-60_000, 60_000])(
+    'usa o relógio da BD para despertar ações, com o relógio da aplicação desviado %i ms',
+    async (offset) => {
+      const p = await project();
+      const general = await flowByTemplate(p.admin, p.id, 'general');
+      const end = general.draft.nodes.find((node) => node.op === 'end')!;
+      const saved = await app.flows.saveDraft(p.admin, p.id, general.id, {
+        expectedDraftVersion: general.draftVersion,
+        definition: {
+          ...general.draft,
+          start: 'wait',
+          nodes: [
+            {
+              id: 'wait',
+              op: 'action',
+              label: 'Espera controlada',
+              config: { action: 'internal_note', body: 'Ensaio do relógio da BD.' },
+            },
+            end,
+          ],
+          edges: [
+            { id: 'done', source: 'wait', port: 'success', target: end.id },
+            { id: 'failed', source: 'wait', port: 'failure', target: end.id },
+          ],
+          layout: {},
+        },
+      });
+      await app.flows.publish(p.admin, p.id, general.id, {
+        expectedDraftVersion: saved.draftVersion,
+      });
+      let evaluations = 0;
+      const engine = new FlowEngine(fixture.db, {
+        ...createFlowActionRegistry(fixture.db),
+        internal_note: async (context) => {
+          evaluations += 1;
+          return evaluations === 1
+            ? { wait: new Date(context.now.getTime() + 30_000) }
+            : { port: 'done' };
+        },
+      });
+      const tickets = new TicketsService(
+        fixture.db,
+        [engine.onPublicComment],
+        [engine.onTicketCreated],
+      );
+      const ticket = await tickets.create(p.client, {
+        title: 'Despertar após efeito externo',
+        description: 'O fim da entrega acorda a etapa usando NOW(3).',
+        category: 'question',
+        environment: 'quality',
+        priority: 'medium',
+      });
+      const databaseNow = (
+        await fixture.db.query<{ now: Date }>('SELECT NOW(3) AS now')
+      ).rows[0]!.now;
+      try {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(new Date(databaseNow.getTime() + offset));
+        await fixture.db.query(
+          'UPDATE flow_executions SET wake_at=TIMESTAMPADD(SECOND,30,NOW(3)) WHERE ticket_id=$1',
+          [ticket.id],
+        );
+        await engine.tick(100);
+        expect(evaluations, 'uma etapa futura não pode correr cedo').toBe(1);
+        await fixture.db.query(
+          'UPDATE flow_executions SET wake_at=NOW(3) WHERE ticket_id=$1',
+          [ticket.id],
+        );
+        await engine.tick(100);
+        expect(evaluations, 'uma etapa acordada pela BD não pode ficar para outro tick').toBe(2);
+        expect((await app.flows.ticketFlow(p.technical, ticket.id))!.execution.status).toBe(
+          'completed',
+        );
+      } finally {
+        vi.useRealTimers();
+        await fixture.db.query('UPDATE flow_executions SET wake_at=NULL WHERE ticket_id=$1', [
+          ticket.id,
+        ]);
+      }
+    },
+  );
+
   it('Saúde: o modelo antigo não personalizado passa a «Incidente (Health)» sem mudar os tickets em curso', async () => {
     const p = await project();
     const health = await flowByTemplate(p.admin, p.id, 'health');
