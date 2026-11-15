@@ -6,10 +6,8 @@ export function unconfiguredCapabilities(): Capabilities {
     implementation: false,
     deployment: false,
     blockers: [
-      'Servidor, caminhos e isolamento de qualidade ainda nao validados.',
-      'Identidade Copilot e politica de envio de contexto ainda nao confirmadas.',
-      'Conectores de leitura e operador de producao ainda nao ativados.',
-      'O portal permite triagem e propostas humanas; nao apresenta automacao simulada como real.',
+      'O gate global está em modo fail-closed e ainda não consome o estado das integrações por projeto.',
+      'Este bloqueio de configuração do serviço não representa indisponibilidade da conta do utilizador.',
     ],
   };
 }

@@ -368,14 +368,14 @@ export function Shell({ route, children }: { route: string; children: ReactNode 
               <div>
                 <strong>
                   {t(
-                    'Automatização com integrações pendentes',
-                    'Automation has pending integrations',
+                    'Automação condicionada por configuração',
+                    'Automation is gated by configuration',
                   )}
                 </strong>
                 <span>
                   {t(
-                    'Análise, implementação ou publicação indisponíveis. Consulte os bloqueios antes de aprovar.',
-                    'Analysis, implementation or deployment unavailable. Review the blockers before approving.',
+                    'Este aviso refere-se aos gates do serviço, não à disponibilidade da sua conta. Consulte as integrações.',
+                    'This notice describes service gates, not your account availability. Review the integrations.',
                   )}
                 </span>
               </div>

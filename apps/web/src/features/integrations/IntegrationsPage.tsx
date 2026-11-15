@@ -26,7 +26,7 @@ const integrations: {
   {
     key: 'deployment',
     title: 'Publicação automática',
-    description: 'Publicação após aprovação do cliente, aprovação técnica, QA e release.',
+    description: 'Depende do pipeline e das aprovações definidos no fluxo associado ao pedido.',
     icon: 'external',
   },
 ];
@@ -37,7 +37,7 @@ export function IntegrationsPage() {
     <>
       <PageHeader
         title="Integrações"
-        description="Estado real das capacidades que suportam o ciclo de manutenção."
+        description="Estado dos gates globais de automação; este estado não representa a disponibilidade da sua conta."
         action={
           <button
             className="button button-secondary"
@@ -63,7 +63,7 @@ export function IntegrationsPage() {
                     className={`status-badge ${resource.data?.[item.key] ? 'status-resolved' : 'status-blocked'}`}
                   >
                     <span />
-                    {resource.data?.[item.key] ? 'Disponível' : 'Bloqueada'}
+                    {resource.data?.[item.key] ? 'Gate aberto' : 'Gate fechado'}
                   </span>
                 </div>
                 <h2>{item.title}</h2>
@@ -72,7 +72,7 @@ export function IntegrationsPage() {
                   <Icon name={resource.data?.[item.key] ? 'check' : 'warning'} size={16} />
                   {resource.data?.[item.key]
                     ? 'Capacidade confirmada pelo serviço.'
-                    : 'Não executa enquanto a infraestrutura não estiver validada.'}
+                    : 'O serviço mantém este gate fechado em modo seguro; consulte os conectores abaixo.'}
                 </div>
               </article>
             ))}

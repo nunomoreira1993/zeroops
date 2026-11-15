@@ -2283,26 +2283,32 @@ Estados: **verificado** (código + teste + evidência real em QA),
 **parcial** (implementado, mas com parte só simulada ou não ensaiada),
 **bloqueado**, **não implementado**.
 
-| Fase | Requisito                                  | Implementação / evidência                                                                                                    | Estado     |
-| ---- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| P00  | Baseline, SDK/CLI, ADRs                    | SDK real verificado em QA; ADRs e inventário de mutação em `compatibilidade-…-p00.md`                                        | verificado |
-| P00  | MySQL 5.7                                  | Só MariaDB 10.3 (QA) ensaiado                                                                                                | parcial    |
-| P00  | Browser local                              | Edge local bloqueado por políticas; browser validado em QA (P06)                                                             | parcial    |
-| P01  | Permissões delegáveis e revogação imediata | Testes de autorização; QA em P01 e de novo em P11 (isolamento, revogação)                                                    | verificado |
-| P02  | Fluxos V2, versões e ativação explícita    | Testes; ativação em QA por serviço/script, não pelo browser                                                                  | parcial    |
-| P03  | Jobs, leases, política de ferramentas      | Kill do executor, lease expirado, segundo executor (P11)                                                                     | verificado |
-| P04  | Catálogo agentes/skills → Copilot          | Testes; compilação e uso real em QA                                                                                          | verificado |
-| P05  | Encaminhamento semântico e esclarecimentos | Conjunto rotulado; cenário A com ZO-22/23/24                                                                                 | verificado |
-| P06  | Chat de construção com diagrama            | Validado no browser em QA                                                                                                    | verificado |
-| P07  | Simulador partilhado                       | Runtime e API testados; UI do simulador não validada em QA (sessão 401)                                                      | parcial    |
-| P08  | Workspace Git, desenvolvimento, review     | B/C com ZO-25/26 e ZO-37 (Copilot real); provider de PR interno, sem GitHub                                                  | parcial    |
-| P09  | Pipeline, integração, Health pelo fluxo    | Fila/locks/review/callbacks testados; fornecedor de pipeline falso; relay 1.2.0 não instalado; intervenções Health simuladas | parcial    |
-| P10  | Capacidades e rollout                      | Copilot, operador, drenagem e deploy reais (ZO-30); repositório/PR locais                                                    | verificado |
-| P11  | Autoridade única e adoção                  | `FLOW_MANAGED` em QA; adoção: dry-run em QA, apply só em testes automáticos                                                  | verificado |
-| P11  | Métricas e correlação                      | Página «Operação» e métricas de T em QA                                                                                      | verificado |
-| P11  | Retenção                                   | Dry-run 0 em dados reais; apply sintético                                                                                    | verificado |
-| P11  | Recuperação e concorrência                 | Kill/lease/segundo executor; medições c=1..3                                                                                 | verificado |
-| P11  | Cenários A–E (§17)                         | A (P05), C (P08) e E (P10) reaproveitados; B repetido em P11; D com intervenção simulada                                     | parcial    |
+| Fase    | Requisito                                  | Implementação / evidência                                                                                                    | Estado     |
+| ------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| P00     | Baseline, SDK/CLI, ADRs                    | SDK real verificado em QA; ADRs e inventário de mutação em `compatibilidade-…-p00.md`                                        | verificado |
+| P00     | MySQL 5.7                                  | Só MariaDB 10.3 (QA) ensaiado                                                                                                | parcial    |
+| P00     | Browser local                              | Edge local bloqueado por políticas; browser validado em QA (P06)                                                             | parcial    |
+| P01     | Permissões delegáveis e revogação imediata | Testes de autorização; QA em P01 e de novo em P11 (isolamento, revogação)                                                    | verificado |
+| P02     | Fluxos V2, versões e ativação explícita    | Testes; ativação em QA por serviço/script, não pelo browser                                                                  | parcial    |
+| P03     | Jobs, leases, política de ferramentas      | Kill do executor, lease expirado, segundo executor (P11)                                                                     | verificado |
+| P04     | Catálogo agentes/skills → Copilot          | Testes; compilação e uso real em QA                                                                                          | verificado |
+| P05     | Encaminhamento semântico e esclarecimentos | Conjunto rotulado; cenário A com ZO-22/23/24                                                                                 | verificado |
+| P06     | Chat de construção com diagrama            | Validado no browser em QA                                                                                                    | verificado |
+| P07     | Simulador partilhado                       | Runtime e API testados; browser voltou a autenticar, mas a UI do simulador ainda não foi exercitada                           | parcial    |
+| P08     | Workspace Git, desenvolvimento, review     | B/C com ZO-25/26 e ZO-37 (Copilot real); provider de PR interno, sem GitHub                                                  | parcial    |
+| P09     | Pipeline, integração, Health pelo fluxo    | Fila/locks/review/callbacks testados; fornecedor de pipeline falso; relay 1.2.0 não instalado; intervenções Health simuladas | parcial    |
+| P10     | Capacidades e rollout                      | Copilot, operador, drenagem e deploy reais (ZO-30); repositório/PR locais                                                    | verificado |
+| P11     | Autoridade única e adoção                  | `FLOW_MANAGED` em QA; adoção: dry-run em QA, apply só em testes automáticos                                                  | verificado |
+| P11     | Métricas e correlação                      | Página «Operação» e métricas de T em QA                                                                                      | verificado |
+| P11     | Retenção                                   | Dry-run 0 em dados reais; apply sintético                                                                                    | verificado |
+| P11     | Recuperação e concorrência                 | Kill/lease/segundo executor; medições c=1..3                                                                                 | verificado |
+| P11     | Cenários A–E (§17)                         | A (P05), C (P08) e E (P10) reaproveitados; B repetido em P11; D com intervenção simulada                                     | parcial    |
+| P08     | Binding do projeto ao repositório do site  | Pizza Hut só tem Sandbox P08 e ZeroOps capacidades; não existe recurso Git para `Deloitte-Portugal/pizzahut`                 | bloqueado  |
+| P08     | Sem fallback de repositório                | Nó `develop` sem `repositoryId` não cria workspace Git nem PR; confirmado no fluxo e executor                                | verificado |
+| P08     | Desenvolvimento real na aplicação do site  | Nenhum ticket alterou ou publicou o site; branches em sandboxes sem endereço público                                         | bloqueado  |
+| P09     | PR GitHub e pipeline reais do site         | Provider GitHub existe no executor; sem credencial do projeto. Pipelines são webhook; Fake CI está arquivada                 | bloqueado  |
+| P07/P02 | Simulador e ativação no browser            | Browser autenticado após recarregar e navegação confirmada; simulador e ativação explícita ainda não exercitados             | parcial    |
+| P09     | Relay 1.2.0 e intervenção Health real      | Fonte 1.2.0; runtime/metadata QA 1.0.0, sem relay no projeto de teste nem alvo descartável autorizado; instalador partilha caminho do executável entre instâncias | bloqueado |
 
 ### Limitações e pendências
 
@@ -2320,3 +2326,129 @@ Estados: **verificado** (código + teste + evidência real em QA),
 - A proposta de concorrência não foi aplicada.
 - **O projeto não está integralmente concluído** (critérios parciais
   acima) e os resultados de QA não demonstram prontidão para Produção.
+
+## Seguimento do percurso real — 2026-11-15
+
+### Auditoria dos tickets de desenvolvimento
+
+Os campos abaixo vêm de `development_workspaces`, `development_test_runs`,
+`development_publications` e `delivery_runs` em QA. `PR interno` significa
+uma entrada do ZeroOps, não um pull request do GitHub. `node test.js` e os
+testes Markdown foram executados no workspace indicado; commits em sandbox
+não são evidência de alteração a um site.
+
+| Ticket | Projeto / repositório                                        | Base → commit produzido     | Ficheiros                                                       | Teste final                                                                       | PR / pipeline / destino                                                                                                      |
+| ------ | ------------------------------------------------------------ | --------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| ZO-25  | Pizza Hut / Sandbox P08 (`p08-sandbox.git`)                  | `7c5ab73a` → `9f285dc3`     | `app.js`, `test.js`                                             | `node test.js`, exit 0, testado em `9f285dc3`                                     | PR interno #1; sem publicação/site                                                                                           |
+| ZO-26  | Pizza Hut / Sandbox P08                                      | `7c5ab73a` → `88ace17e`     | `app.js`, `test.js`                                             | `node test.js`, exit 0, testado em `88ace17e`                                     | PR interno #2; sem publicação/site; ticket continua `waiting`                                                                |
+| ZO-27  | Pizza Hut / Sandbox P08                                      | `7c5ab73a` → `306df1f7`     | `app.js`, `test.js`                                             | `node test.js`, exit 0, testado em `306df1f7`                                     | PR interno #3; Fake CI publicou na branch `main` da sandbox; sem endereço de site                                            |
+| ZO-28  | Pizza Hut / Sandbox P08                                      | `7c5ab73a` → `0e1cf1e5`     | `texto.js`                                                      | `node test.js`, exit 0, testado em `0e1cf1e5`                                     | PR interno #4; Fake CI integrou `6105094c`, revalidado; só sandbox                                                           |
+| ZO-29  | Pizza Hut / Sandbox P08                                      | `6105094c` → `db435b68`     | `numeros.js`                                                    | `node test.js`, exit 0, testado em `db435b68`                                     | PR interno #5; Fake CI publicou na branch `main` da sandbox; sem endereço de site                                            |
+| ZO-30  | Pizza Hut / ZeroOps capacidades (`zeroops-capabilities.git`) | `45d6699a` → `50fcebfaae62` | `MarkdownEditor.tsx`, `markdown-format.ts`, `markdown.test.mjs` | `node --test apps/web/tests/markdown.test.mjs`, exit 0, testado em `50fcebfaae62` | PR interno #6; operador `Rollout ZeroOps QA`; commit do próprio ZeroOps, destino `tickets.pizzahut.pt`, não o site Pizza Hut |
+| ZO-36  | Teste P11 Operação / Sandbox P11 (`p08-sandbox.git`)         | `db435b68` → sem commit     | sem ficheiros versionados                                       | teste do agente passou; execução final falhou (`agent_failed`)                    | sem PR/pipeline                                                                                                              |
+| ZO-37  | Teste P11 Operação / Sandbox P11                             | `db435b68` → `741bcb45dfd0` | `app.js`, `test.js`                                             | `node test.js`, exit 0, testado em `741bcb45dfd0`                                 | PR interno #1; sem pipeline/publicação                                                                                       |
+
+Não há linhas em `deployment_runs` para estes tickets. Após a publicação
+desta atualização, o QA do ZeroOps está em
+`8306003a6d604cea0da40c5055b0a60687`; `/api/health` devolveu `ready`.
+O browser voltou a autenticar depois de recarregar e já apresenta o
+workspace, incluindo a administração do projeto de teste. Abrir a
+administração de «Teste P11 Operação» não muda o projeto ativo da sessão:
+o projeto ativo continua a ser Pizza Hut; o simulador e a ativação explícita
+ainda não foram validados pelo browser.
+
+O título de ZO-30 e as mensagens dos seus commits estão mal codificados
+(`AÃ§Ã£o...`). A auditoria encontrou o texto já corrompido no script de
+ensaio que criou o ticket; esse script local foi corrigido. O histórico
+existente foi preservado, sem reescrever commits nem o ticket.
+
+### Binding e preparação do teste no site
+
+- Projeto Pizza Hut (`00000000-0000-4000-8000-000000000001`): os únicos
+  repositórios ativos são Sandbox P08 e ZeroOps capacidades. Não existe
+  binding para `https://github.com/Deloitte-Portugal/pizzahut.git`; o
+  ZeroOps não usa outro repositório como fallback. Não há CI no repositório
+  do site.
+- O Fake CI QA P09 está arquivado; «Rollout ZeroOps QA» publica apenas o
+  próprio ZeroOps. Não existe ainda operador de publicação do webroot.
+- O utilizador confirmou o teste proposto: projeto Pizza Hut, ficheiro
+  estático `zeroops-check.txt`, branch `qa`, QA `dev.pizzahut.pt`, incluindo
+  os três commits pendentes até `2c38b0f5`. Nenhuma alteração ao site foi
+  feita.
+- No host `uqphorders24-dev`, o webroot está em `17ba17b6b768`. Há 31
+  caminhos não versionados. Os 118 caminhos dos três commits pendentes não
+  colidem com esses caminhos, mas o deploy continua dependente de backup,
+  operador específico e credenciais acessíveis.
+- `git ls-remote` como `pizzahut` no host QA falhou por falta de
+  autenticação; não foi encontrado helper/ficheiro de credenciais nos homes
+  de `root` ou `pizzahut`. Não se leu nem se registou qualquer segredo. A
+  ligação do projeto no ZeroOps também não tem credencial Git configurada.
+- `dev.pizzahut.pt` respondeu 200 depois do redirect para `/pt/` quando a
+  verificação TLS foi explicitamente ignorada para diagnóstico; a validação
+  TLS normal deste cliente falhou. Isto prova apenas disponibilidade HTTP,
+  não publicação da alteração de teste.
+- «Publicação» na administração de integrações continua sem conector.
+  Configuração Git é um recurso separado em Administração → Repositórios
+  Git do projeto; não foi preenchido nem testado. A credencial do conector
+  Copilot não autentica operações Git. A ligação do executor é configurada
+  no recurso Git do projeto e não foi encontrada credencial Git utilizável
+  no servidor QA para o utilizador `pizzahut`.
+
+### Validação desta atualização
+
+- Web: 21 ficheiros / 136 testes passaram com `--maxWorkers=1`. Na execução
+  paralela anterior, 4 testes falharam sob carga; os quatro ficheiros
+  passaram isoladamente. Não foi reproduzida uma regressão nos testes
+  relevantes.
+- Build web, lint do dashboard e Prettier dos dois ficheiros alterados:
+  passaram.
+- A atualização visual remove as cinco etapas fixas do dashboard e explica
+  que cada pedido segue o fluxo associado; não altera fluxos, aprovações ou
+  políticas.
+- Deploy confirmado pelo agente de Qualidade: host QA `uqphorders24-dev`,
+  `/api/health` `ready`, commit `8306003a6d604cea0da40c5055b0a60687`;
+  backup criado em
+  `/var/backups/zeroops/zeroops-20261115T071551-g8306003a6d60.sql.gz`.
+  Após a drenagem, os contentores estavam ativos e o inventário manteve
+  Pizza Hut 12/12 tickets/execuções, Teste P11 7/7, 26 versões de fluxo e
+  zero jobs ativos.
+- O browser autenticado abriu a administração de «Teste P11 Operação»; a
+  vista confirmou que esta administração não troca o projeto ativo. A
+  navegação autenticada está recuperada, mas não constitui evidência de
+  simulador nem de ativação.
+- A fonte `deploy/production-relay/zeroops-relay.php` passa `php -l` e
+  declara 1.2.0. QA não tem serviço/instalação do relay nem registo de relay
+  para o projeto de teste. O instalador coloca o executável de todas as
+  instâncias em `/opt/zeroops-relay/zeroops-relay.php`, pelo que a opção
+  `--instance` não isola o binário; não foi executado.
+- O browser autenticado confirmou que «Investigação assistida»,
+  «Execução técnica» e «Publicação automática» apareciam como bloqueadas,
+  apesar de Copilot/base de dados/métricas verificadas e relay de Produção
+  ligado. A causa foi confirmada no código: `/api/capabilities` devolve
+  sempre `unconfiguredCapabilities()` com os três gates falsos. A interface
+  foi clarificada para distinguir gates globais da disponibilidade da conta;
+  os gates continuam fail-closed e não foram alterados para `true`.
+- A descrição de publicação já não impõe as quatro aprovações fixas; remete
+  para o pipeline e as aprovações configurados no fluxo associado. O estado
+  dinâmico dos gates por projeto continua por implementar.
+
+### Próximos passos e bloqueios
+
+1. Configurar/verificar, no projeto Pizza Hut, o recurso GitHub com
+   permissões de escrita necessárias ao executor. O recurso não foi
+   criado nem testado; não introduzir token no chat.
+2. Implementar e testar um operador próprio para o webroot QA, com backup,
+   commit-alvo explícito, preservação dos 31 caminhos locais, lock,
+   idempotência e verificação funcional. Não usar «Rollout ZeroOps QA».
+3. Só depois de binding, credencial e operador verificados, executar o
+   teste `zeroops-check.txt`, PR e publicação em `dev.pizzahut.pt`.
+4. Obter autorização para um host descartável e uma unidade/serviço de teste;
+   corrigir e testar o isolamento do caminho do executável do instalador
+   antes de instalar o relay 1.2.0. Depois, validar Health real nesse alvo e
+   repetir os cenários A–E na versão final. Não instalar no host partilhado
+   com o instalador atual.
+
+O percurso real de desenvolvimento no site, a validação autenticada do
+browser, o relay 1.2.0 e a intervenção Health real continuam bloqueados.
+P11 permanece parcial; não declarar o produto concluído nem pronto para
+Produção.
