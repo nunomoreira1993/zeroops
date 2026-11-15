@@ -38,6 +38,8 @@ done
 install -m 0644 "$SRC_DIR/site-qa-operator.service" /etc/systemd/system/site-qa-operator.service
 if [ ! -f "$STATE/repo.git/HEAD" ]; then
   git init --bare --quiet "$STATE/repo.git"
+fi
+if ! git --git-dir="$STATE/repo.git" rev-parse --verify --quiet 'refs/heads/qa^{commit}' >/dev/null; then
   git --git-dir="$STATE/repo.git" fetch --no-tags --quiet "$GIT_DIR" refs/heads/qa:refs/heads/qa
 fi
 if [ ! -f "$ENV_FILE" ]; then

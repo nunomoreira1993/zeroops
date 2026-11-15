@@ -2826,7 +2826,19 @@ Produção.
   original não é apresentada como aprovada.
 - Operadores Python P10/site: 23/23, com Git/filesystem reais e PHP, HTTP,
   callbacks e processo publicador simulados. A nova regressão do binding do
-  publicador foi acrescentada depois e está em validação separada.
+  publicador foi acrescentada depois: reproduziu a publicação indevida antes
+  da correção; a ronda Linux final passou **25/25**.
+- Smoke Linux em diretórios temporários: Git, PHP nativo, troca para UID 1001,
+  processo publicador separado, flock, backup, journal e preservação do ficheiro
+  local reais passaram. Só o health HTTPS foi simulado; não houve publicação no
+  site nem teste de reinício do servidor HTTP durante uma troca ativa.
+- O host tem Git 2.25.1: não aceita `git init -b` nem `GIT_CONFIG_COUNT` (ambos
+  demonstrados em execução). As fixtures usam `symbolic-ref`; o operador usa
+  opções `-c` sem segredos e helper por processo, limitado ao URL exato. O token
+  só existe no ambiente privado desse Git/helper; `store`/`erase` não persistem
+  credenciais. A regressão do helper também passou no Windows.
+- Fornecedor de credencial Node: 2/2; Prettier nos 7 TS/MJS executáveis alterados:
+  passou. A suite raiz não foi repetida, pois o TS/dependências não mudaram.
 - `format:check` global mantém dívida em 35 ficheiros. Não foi feita reformatação
   geral. Não se declara a validação global aprovada.
 - Não são necessárias migrations novas; a 048 já está aplicada em QA.
@@ -2861,8 +2873,12 @@ Produção.
 - ZO-38 mantém a versão original, sem pipeline e sem revisor distinto elegível;
   não se muda a versão nem se contorna a proibição de autoaprovação. Um novo
   fluxo/ticket precisa de revisor independente validado antes do arranque.
-- Faltam commit/push, publicação do novo SHA do ZeroOps e smoke no runtime
-  publicado; instalação/configuração auditada da pipeline do site; review
+- Correção central publicada no remoto interno: commit
+  `2ab3e0d501edb02eb558c3c2d59022a22f02d2a6`, confirmado por `ls-remote`.
+  O hook respondeu «recebida sem deploy»; a versão ativa não foi alterada por
+  esse push. O operador do site segue num commit separado, depois dos seus testes.
+- Faltam publicação do novo SHA do ZeroOps e smoke no runtime publicado;
+  instalação/configuração auditada da pipeline do site; review
   humana legítima; integração/publicação governadas e validação autenticada no
   browser; remoção rastreável dos temporários. O teste atual que exige o marcador
   terá de ser ajustado explicitamente para a entrega de limpeza.

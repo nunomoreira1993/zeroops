@@ -1,13 +1,16 @@
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 MODULE = Path(__file__).parents[1] / "deploy" / "qa" / "site-qa-operator.py"
 SPEC = importlib.util.spec_from_file_location("site_operator", MODULE)
@@ -82,7 +85,8 @@ class SiteQaTests(unittest.TestCase):
         self.git_dir = root / "site-git"
         git("init", "--bare", "-q", str(self.source))
         git("init", "--bare", "-q", str(self.target))
-        git("init", "-q", "-b", "qa", str(self.seed))
+        git("init", "-q", str(self.seed))
+        git("symbolic-ref", "HEAD", "refs/heads/qa", cwd=self.seed)
         git("config", "user.name", "Fixture", cwd=self.seed)
         git("config", "user.email", "fixture@example.invalid", cwd=self.seed)
         (self.seed / "adm").mkdir()
@@ -286,6 +290,30 @@ class SiteQaTests(unittest.TestCase):
         (self.webroot / "adm" / "zeroops-server-check.php").write_bytes(b"tampered\n")
         self.assertEqual(self.host.identity(), self.sha)
         self.assertEqual(self.host.runtime(), (self.sha, False))
+
+
+class GitCredentialTests(unittest.TestCase):
+    def test_only_answers_for_the_exact_git_url_and_never_stores_credentials(self):
+        env = {"ZEROOPS_SITE_GIT_URL": "https://github.com/example/site.git",
+               "ZEROOPS_SITE_GIT_TOKEN": "fixture-only-token"}
+        request = "protocol=https\nhost=github.com\npath=example/site.git\n\n"
+        with patch.dict(os.environ, env), patch.object(sys, "argv", ["operator", "--git-credential", "get"]):
+            output = io.StringIO()
+            with patch.object(sys, "stdin", io.StringIO(request)), patch.object(sys, "stdout", output):
+                self.assertEqual(site.git_credential(), 0)
+            self.assertEqual(output.getvalue(), "username=x-access-token\npassword=fixture-only-token\n\n")
+            for other in (request.replace("site.git", "other.git"), request.replace("https", "http")):
+                output = io.StringIO()
+                with patch.object(sys, "stdin", io.StringIO(other)), patch.object(sys, "stdout", output):
+                    with self.assertRaisesRegex(ValueError, "binding"):
+                        site.git_credential()
+                self.assertEqual(output.getvalue(), "")
+        for action in ("store", "erase"):
+            output = io.StringIO()
+            with patch.object(sys, "argv", ["operator", "--git-credential", action]), \
+                    patch.object(sys, "stdout", output):
+                self.assertEqual(site.git_credential(), 0)
+            self.assertEqual(output.getvalue(), "")
 
 
 if __name__ == "__main__":

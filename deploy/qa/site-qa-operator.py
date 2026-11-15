@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import socket
 import ssl
 import subprocess
@@ -43,6 +44,23 @@ def file_digest(path):
         for chunk in iter(lambda: file.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+def git_credential():
+    action = sys.argv[2] if len(sys.argv) == 3 else ""
+    if action in ("store", "erase"):
+        return 0
+    if action != "get":
+        raise ValueError("Operacao de credencial Git invalida.")
+    fields = dict(line.rstrip("\n").split("=", 1) for line in sys.stdin if "=" in line)
+    target = rollout.urllib.parse.urlsplit(os.environ["ZEROOPS_SITE_GIT_URL"])
+    if (fields.get("protocol"), fields.get("host"), fields.get("path")) != \
+            (target.scheme, target.netloc, target.path.lstrip("/")):
+        raise ValueError("Pedido de credencial fora do binding Git QA.")
+    token = os.environ.get("ZEROOPS_SITE_GIT_TOKEN", "")
+    if not token or len(token) > 500 or any(ord(char) < 33 or ord(char) > 126 for char in token):
+        raise ValueError("Credencial Git QA indisponivel.")
+    sys.stdout.write("username=x-access-token\npassword=" + token + "\n\n")
+    return 0
 
 
 class SiteConfig(rollout.Config):
@@ -93,17 +111,17 @@ class SiteHost(rollout.Host):
         env = {key: os.environ[key] for key in SAFE_ENV if key in os.environ}
         env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
                    GIT_CONFIG_GLOBAL=os.devnull)
-        config = [("core.hooksPath", os.devnull), ("core.fsmonitor", "false"),
-                  ("http.followRedirects", "false")]
         if token:
-            encoded = base64.b64encode(("x-access-token:" + token).encode()).decode()
-            config.append(("http.%s.extraHeader" % self.config.source_repo,
-                           "Authorization: Basic " + encoded))
-        env["GIT_CONFIG_COUNT"] = str(len(config))
-        for index, (key, value) in enumerate(config):
-            env["GIT_CONFIG_KEY_%d" % index] = key
-            env["GIT_CONFIG_VALUE_%d" % index] = value
+            env["ZEROOPS_SITE_GIT_TOKEN"] = token
+            env["ZEROOPS_SITE_GIT_URL"] = self.config.source_repo
         return env
+
+    def git_options(self):
+        helper = "!%s %s --git-credential" % (
+            shlex.quote(sys.executable), shlex.quote(os.path.abspath(__file__)))
+        return ["-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
+                "-c", "http.followRedirects=false", "-c", "credential.helper=",
+                "-c", "credential.useHttpPath=true", "-c", "credential.helper=" + helper]
 
     def command(self, args, check=True, token=None):
         options = {"pass_fds": (self.lock_fd,)} if self.lock_fd is not None else {}
@@ -138,10 +156,11 @@ class SiteHost(rollout.Host):
     def git(self, *args, check=True):
         token = self.credential() if "fetch" in args and self.config.source_repo in args and \
             self.config.source_repo.startswith("https://") else None
-        return self.command(["git", *args], check=check, token=token)
+        return self.command(["git", *self.git_options(), *args], check=check, token=token)
 
     def site_git(self, *args, check=True):
-        command = ["git", "--git-dir", self.config.git_dir, "--work-tree", self.config.webroot, *args]
+        command = ["git", *self.git_options(), "--git-dir", self.config.git_dir,
+                   "--work-tree", self.config.webroot, *args]
         if self.uid is not None and os.geteuid() != self.uid:
             command = ["setpriv", "--reuid=" + str(self.uid), "--regid=" + str(self.gid),
                        "--clear-groups", "--", *command]
@@ -149,7 +168,7 @@ class SiteHost(rollout.Host):
 
     def archive_digest(self, git_dir, sha):
         with tempfile.TemporaryFile() as output:
-            subprocess.run(["git", "--git-dir", git_dir, "archive", "--format=tar", sha],
+            subprocess.run(["git", *self.git_options(), "--git-dir", git_dir, "archive", "--format=tar", sha],
                            stdout=output, check=True, env=self.git_env(), timeout=120)
             output.seek(0)
             digest = hashlib.sha256()
@@ -244,15 +263,23 @@ class SiteHost(rollout.Host):
             os.fsync(file.fileno())
         os.replace(temporary, self.journal_path(key))
 
+    def accepted_publication(self, sha, key):
+        path = os.path.join(self.config.state_dir, "deliveries", key + ".json")
+        record = json.loads(Path(path).read_text(encoding="utf-8"))
+        if record.get("binding") != self.config.binding or record.get("sha") != sha or \
+                record.get("state") != "deploying":
+            raise RuntimeError("O binding, artefacto ou estado aceite mudou; publicacao recusada.")
+
     def publish(self, sha, key):
         cfg = self.config
+        self.accepted_publication(sha, key)
         previous, untracked = self.preflight(sha)
         if previous == sha:
             raise RuntimeError("SHA ja ativo fora desta publicacao; nao e prova de entrega automatica.")
         os.makedirs(cfg.backup_dir, mode=0o700, exist_ok=True)
         backup = os.path.join(cfg.backup_dir, key + ".tar")
         with open(backup, "xb") as file:
-            subprocess.run(["git", "--git-dir", cfg.target_repo, "archive", previous],
+            subprocess.run(["git", *self.git_options(), "--git-dir", cfg.target_repo, "archive", previous],
                            stdout=file, check=True, env=self.git_env(), timeout=120)
         backup_digest = file_digest(backup)
         record = {"sha": sha, "previous": previous, "binding": cfg.binding,
@@ -270,6 +297,7 @@ class SiteHost(rollout.Host):
             self.site_git("fetch", "--no-tags", "--quiet", bundle, ref + ":" + ref)
         if self.identity() != previous or self.untracked() != untracked:
             raise RuntimeError("O site mudou durante a preparacao; nada foi publicado.")
+        self.accepted_publication(sha, key)
         record["phase"] = "swapping"
         self.save_journal(key, record)
         self.site_git("merge", "--ff-only", "--no-edit", sha)
@@ -417,4 +445,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if len(sys.argv) > 1 and sys.argv[1] == "--git-credential":
+        if os.name != "posix" or os.geteuid() != 0:
+            raise RuntimeError("Credencial reservada ao processo Git autorizado do operador.")
+        sys.exit(git_credential())
+    else:
+        sys.exit(main())
