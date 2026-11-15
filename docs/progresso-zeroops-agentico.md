@@ -2788,3 +2788,83 @@ Produção.
 - Isto não equivale a prontidão para Produção.
 - Entregas seguintes: integração real Git/CI (pipeline do site), Health/relay e
   validação pelo browser.
+
+## Fecho P09 e preparação da pipeline do site (15/11/2026)
+
+### Causa demonstrada e correções
+
+- A entrega acordava o fluxo com `wake_at=NOW(3)`, mas `FlowEngine.tick()` decidia
+  a elegibilidade pelo relógio do Node. Em 200 amostras, 15 respostas da BD tinham
+  um timestamp 1 ms à frente do Node depois da resposta (intervalo de -2 a +1 ms).
+  Isto explica a falha intermitente no último `tick`, não uma falha do gate:
+  `rework`, motivo e ausência de push já estavam corretos.
+- A sequência original P09 foi reproduzida deterministicamente com o relógio da
+  aplicação 60 s atrasado: antes da correção, esperava `dev` e recebia `deliver`.
+  Duas regressões adicionais demonstraram despertar tardio e prematuro com
+  desvios de -60/+60 s. O motor usa agora `NOW(3)` para decisões temporais e
+  timestamps, pelo cliente transacional quando existe; clocks explicitamente
+  injetados continuam suportados. Não se alteraram leases, locks nem gates.
+- A outbox real continha eventos automáticos `ticket.changed` bloqueados como
+  `payload_invalid`: o produtor emite `actorId:null`, mas o consumidor rejeitava
+  null. O consumidor aceita agora ausência/null, mantendo UUIDs inválidos
+  bloqueados e as regras de destinatários. A regressão liga produtor, BD/outbox
+  reais e consumidor; apenas SMTP é simulado. Não se reenviaram eventos antigos.
+
+### Validação local concluída
+
+- Ronda integral única: 511 testes, **506 passaram, 3 falharam e 2 opt-in não
+  executados**, em 1364,9 s. As únicas falhas são as três de arquitetura.
+- Num worktree temporário do SHA publicado `55b4363`, reproduziram-se os mesmos
+  detalhes não vazios: 9 dependências fora da allowlist, 8 lacunas TSDoc e
+  3 ciclos. O worktree foi removido limpo. Não se alteraram expectativas,
+  allowlists, skips ou timeouts para obter verde.
+- `npm run typecheck`, `npm run lint` e `npm run build`: exit 0.
+- Web: os 13 testes Node nativos passaram; o Vitest passou 9 ficheiros/34 testes
+  mas falhou no arranque de outros 13 workers. Esses 13 ficheiros passaram depois
+  em execução serial, **103/103**, sem alterar testes ou timeouts. O conjunto
+  funcional web passou repartido pelas duas execuções; a execução paralela
+  original não é apresentada como aprovada.
+- Operadores Python P10/site: 23/23, com Git/filesystem reais e PHP, HTTP,
+  callbacks e processo publicador simulados. A nova regressão do binding do
+  publicador foi acrescentada depois e está em validação separada.
+- `format:check` global mantém dívida em 35 ficheiros. Não foi feita reformatação
+  geral. Não se declara a validação global aprovada.
+- Não são necessárias migrations novas; a 048 já está aplicada em QA.
+
+### Pipeline restrita do ensaio Pizza Hut
+
+- Novo operador de QA reutiliza o contrato HMAC, idempotência e reconciliação do
+  P10. O binding é explícito para o projeto/recurso Git, webroot e Git dir reais,
+  `qa`/`quality`; locks usam dispositivo/inode do webroot.
+- Só aceita os bytes revistos dos dois ficheiros de `numoreira/pizzahut#1`, ou a
+  remoção desses ficheiros. Não executa scripts do repositório, não publica
+  dumps integrais de `$_SERVER` e mantém a autenticação do backoffice.
+- A credencial cifrada do projeto é validada e obtida na API por pipe privado,
+  auditada e usada apenas no fetch autorizado. Não vai para agentes, workspaces
+  ou configuração Git global. A publicação Git/PHP usa o UID do site, não root.
+- Antes da troca há preflight, backup, journal e nova verificação do binding
+  aceite; publicador separado mantém lock também nos processos Git. A confirmação
+  exige SHA, bytes reais, HTTPS, backup íntegro e preservação dos não versionados.
+- O installer ainda não foi executado e o site ainda não foi publicado nesta
+  ronda. A pipeline é restrita ao ensaio, não certifica um publicador genérico.
+- Existe uma janela residual entre a última validação e cada efeito externo:
+  não se promete atomicidade distribuída entre BD, Git e o fornecedor.
+
+### Coordenação e pendências operacionais
+
+- O outro chat trata da UI numa worktree independente; não se incorporam os
+  seus commits nem se alteram os seus processos. Este checkout mantém a branch
+  `feat/entrega-a-integridade-execucao` e o remoto interno `qa`.
+- Pré-verificação do QA: host `uqphorders24-dev`, versão ativa `55b4363`, API
+  `ready`, 0 jobs e 0 locks ativos. O hook só publica `main`; push da feature
+  e deploy explícito são operações distintas.
+- ZO-38 mantém a versão original, sem pipeline e sem revisor distinto elegível;
+  não se muda a versão nem se contorna a proibição de autoaprovação. Um novo
+  fluxo/ticket precisa de revisor independente validado antes do arranque.
+- Faltam commit/push, publicação do novo SHA do ZeroOps e smoke no runtime
+  publicado; instalação/configuração auditada da pipeline do site; review
+  humana legítima; integração/publicação governadas e validação autenticada no
+  browser; remoção rastreável dos temporários. O teste atual que exige o marcador
+  terá de ser ajustado explicitamente para a entrega de limpeza.
+- Produção permanece fora do âmbito. Os intervalos de UID sobrepostos entre
+  executores continuam não certificados.

@@ -185,9 +185,8 @@ describe('FlowEngine', () => {
         environment: 'quality',
         priority: 'medium',
       });
-      const databaseNow = (
-        await fixture.db.query<{ now: Date }>('SELECT NOW(3) AS now')
-      ).rows[0]!.now;
+      const databaseNow = (await fixture.db.query<{ now: Date }>('SELECT NOW(3) AS now')).rows[0]!
+        .now;
       try {
         vi.useFakeTimers({ toFake: ['Date'] });
         vi.setSystemTime(new Date(databaseNow.getTime() + offset));
@@ -197,10 +196,9 @@ describe('FlowEngine', () => {
         );
         await engine.tick(100);
         expect(evaluations, 'uma etapa futura não pode correr cedo').toBe(1);
-        await fixture.db.query(
-          'UPDATE flow_executions SET wake_at=NOW(3) WHERE ticket_id=$1',
-          [ticket.id],
-        );
+        await fixture.db.query('UPDATE flow_executions SET wake_at=NOW(3) WHERE ticket_id=$1', [
+          ticket.id,
+        ]);
         await engine.tick(100);
         expect(evaluations, 'uma etapa acordada pela BD não pode ficar para outro tick').toBe(2);
         expect((await app.flows.ticketFlow(p.technical, ticket.id))!.execution.status).toBe(

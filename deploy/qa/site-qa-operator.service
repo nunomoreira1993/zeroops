@@ -1,0 +1,18 @@
+[Unit]
+Description=ZeroOps Pizza Hut QA validation pipeline
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+UMask=0077
+EnvironmentFile=/etc/zeroops/site-qa-operator.env
+ExecStart=/usr/bin/python3 /usr/local/lib/zeroops/site-qa-operator.py
+Restart=on-failure
+RestartSec=5
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

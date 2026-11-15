@@ -420,7 +420,7 @@ class Operator:
                                {"artefacto": "passed", "deploy": "skipped"}, previousVersion=previous):
                 self.confirm(record)
             return
-        log_path = os.path.join(self.config.state_dir, record["key"] + ".log")
+        log_path = self.deployment_log(record["key"])
         # Estado gravado antes de iniciar: um reinicio a meio nao repete o deploy.
         if not self.transition(record, "deploying", "Troca de versao em curso (drenagem, backup, migracoes, arranque).",
                                {"artefacto": "passed", "deploy": "running"}, previousVersion=previous,
@@ -439,6 +439,10 @@ class Operator:
             self.confirm(record)
             return
         self.after_failed_deploy(record, code, log_path)
+
+    def deployment_log(self, key: str) -> str:
+        """Destino do processo de publicacao; operadores especializados podem usar um ficheiro fixo."""
+        return os.path.join(self.config.state_dir, key + ".log")
 
     def after_failed_deploy(self, record: Dict[str, Any], code: Optional[int], log_path: str) -> None:
         version, executor = self.host.runtime()
