@@ -1,4 +1,5 @@
 import { isAbsolute } from 'node:path';
+import type { AgentIdentity } from './copilot-process.js';
 import type { AgentRunConversation } from './run-conversation.js';
 import type { CompiledCapabilities } from './capability-bundle.js';
 import {
@@ -22,6 +23,8 @@ export interface SandboxProcess {
     signal?: AbortSignal;
     /** Variáveis adicionais apenas para este run (ex.: token dos conectores). */
     env?: Record<string, string>;
+    /** F02: identidade exclusiva do job (sobrepõe a identidade fixa do processo). */
+    identity?: AgentIdentity;
   }): Promise<{ exitCode: number; interrupted: boolean }>;
 }
 
@@ -66,6 +69,8 @@ export interface CopilotExecuteInput {
    * do relatório é ignorada e o relatório não entra no commit.
    */
   gitWorkspace?: boolean;
+  /** F02: identidade exclusiva do job; sem ela usa a identidade fixa do adaptador. */
+  identity?: AgentIdentity;
 }
 
 /** Ferramenta própria registada na sessão Copilot. */
@@ -126,6 +131,7 @@ export class CopilotCliAdapter implements CopilotAgent {
       outputLimitBytes: input.outputLimitBytes,
       signal: input.signal,
       env: input.env,
+      ...(input.identity ? { identity: input.identity } : {}),
     });
     if (processResult.interrupted || processResult.exitCode !== 0)
       throw new Error('Copilot interrompido ou com falha; requer reconciliacao.');

@@ -101,14 +101,20 @@ services:
     cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE, FOWNER, KILL]
     tmpfs:
       - /tmp
-      - /work:uid=1000,gid=1000,mode=0755
+      # F02: /work e as homes dos jobs pertencem a root (0711): cada job so entra no seu diretorio.
+      - /work:mode=0711
       - /home/node:uid=1000,gid=1000,mode=0700
+      - /var/lib/zeroops/jobs:mode=0711
     environment:
       # P10: versao ativa (confirmacao de capacidades publicadas no runtime).
       ZEROOPS_VERSION: ${ZEROOPS_VERSION:-local}
       ZEROOPS_AGENT_UID: '1000'
       ZEROOPS_AGENT_HOME: /home/node
       ZEROOPS_AGENT_WORKSPACE: /work
+      # F02: pool de uids exclusivos (um por job, nunca partilhado em simultaneo).
+      ZEROOPS_JOB_UID_BASE: ${ZEROOPS_JOB_UID_BASE:-61000}
+      ZEROOPS_JOB_UID_COUNT: ${ZEROOPS_JOB_UID_COUNT:-64}
+      ZEROOPS_JOB_HOME_ROOT: /var/lib/zeroops/jobs
       ZEROOPS_CONNECTOR_URL: http://127.0.0.1:4312
       # Codigo de cada site em /sources/<site> (site do projeto); sem site, usa a Pizza Hut.
       ZEROOPS_AGENT_SITES_ROOT: /sources

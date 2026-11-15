@@ -15,6 +15,7 @@ BASE="${ZEROOPS_BASE:-/opt/zeroops}"
 LOG_FILE="${ZEROOPS_DEPLOY_LOG:-/var/log/zeroops/deploy.log}"
 BACKUP_DIR="${ZEROOPS_BACKUP_DIR:-/var/backups/zeroops}"
 DB_CNF="${ZEROOPS_DB_CNF:-/root/.zeroops/zeroops-mysql.cnf}"
+ENV_FILE="${ZEROOPS_ENV_FILE:-/etc/zeroops/zeroops.env}"
 KEEP_BACKUPS=10
 KEEP_IMAGES=3
 # P10: drenagem antes da troca (os executores deixam de reclamar jobs; espera pelos jobs com lease).
@@ -30,6 +31,7 @@ fail() {
 }
 
 [ "$(hostname)" = "$EXPECTED_HOST" ] || fail "host inesperado $(hostname)"
+[ -r "$ENV_FILE" ] || fail "ficheiro de ambiente inacessivel; nada foi alterado"
 exec 9>"${ZEROOPS_DEPLOY_LOCK:-/run/lock/zeroops-deploy.lock}"
 flock -n 9 || fail "outro deploy em curso"
 
@@ -42,7 +44,7 @@ echo "$SHA" >"$BASE/src.new/deploy/qa/VERSION"
 
 cd "$BASE/src.new/deploy/docker"
 log "Build api/executor"
-ZEROOPS_IMAGE_TAG="$TAG" docker compose build --quiet api executor 2>&1 | tee -a "$LOG_FILE" ||
+ZEROOPS_IMAGE_TAG="$TAG" docker compose --env-file "$ENV_FILE" build --quiet api executor 2>&1 | tee -a "$LOG_FILE" ||
   fail "build falhou; nada foi alterado"
 
 # Drenagem (sempre, antes de qualquer alteracao): pede aos executores que deixem de reclamar jobs, espera
@@ -51,7 +53,8 @@ ZEROOPS_IMAGE_TAG="$TAG" docker compose build --quiet api executor 2>&1 | tee -a
 # Esgotado o prazo nada e alterado (salvo ZEROOPS_DRAIN_FORCE=1): perguntas pendentes e runs longos ficam
 # intactos e o executor anterior volta a arrancar se o deploy parar antes da troca.
 sql() { mysql --defaults-file="$DB_CNF" -N -B -e "$1"; }
-compose_current() { (cd "$BASE/src/deploy/docker" && docker compose "$@"); }
+compose() { docker compose --env-file "$ENV_FILE" "$@"; }
+compose_current() { (cd "$BASE/src/deploy/docker" && compose "$@"); }
 drain_id=""
 executor_stopped=0
 swapped=0
@@ -66,7 +69,7 @@ on_exit() {
   if [ "$executor_stopped" = 1 ] && [ "$swapped" = 0 ]; then
     log "Deploy interrompido antes da troca: a reativar o executor anterior"
     compose_current start executor 2>&1 | tee -a "$LOG_FILE" ||
-      log "AVISO: executor anterior nao arrancou; arrancar com 'docker compose start executor'"
+      log "AVISO: executor anterior nao arrancou; iniciar com 'docker compose --env-file $ENV_FILE start executor'"
   fi
   release_drain
 }
@@ -161,7 +164,7 @@ rollback() {
   done
   previous_version=$(cat "$BASE/src/deploy/qa/VERSION" 2>/dev/null || echo local)
   (cd "$BASE/src/deploy/docker" && ZEROOPS_VERSION="$previous_version" ZEROOPS_IMAGE_TAG=latest \
-    docker compose up -d api worker connectors executor) 2>&1 |
+    compose up -d api worker connectors executor) 2>&1 |
     tee -a "$LOG_FILE" || true
   fail "$1 (codigo e imagens repostos; BD com backup em $backup)"
 }
@@ -177,11 +180,11 @@ docker tag "zeroops:$TAG" zeroops:latest || rollback "tag da imagem falhou"
 docker tag "zeroops-executor:$TAG" zeroops-executor:latest || rollback "tag da imagem falhou"
 
 log "Migracoes"
-ZEROOPS_IMAGE_TAG=latest docker compose run --rm -T migrate </dev/null 2>&1 | tee -a "$LOG_FILE" ||
+ZEROOPS_IMAGE_TAG=latest compose run --rm -T migrate </dev/null 2>&1 | tee -a "$LOG_FILE" ||
   rollback "migracao falhou"
 
 log "Arranque"
-ZEROOPS_VERSION="$SHA" ZEROOPS_IMAGE_TAG=latest docker compose up -d api worker connectors executor 2>&1 |
+ZEROOPS_VERSION="$SHA" ZEROOPS_IMAGE_TAG=latest compose up -d api worker connectors executor 2>&1 |
   tee -a "$LOG_FILE" || rollback "arranque falhou"
 
 healthy=0
@@ -207,7 +210,7 @@ install -d -m 0755 "$OBSERVABILITY_ETC/projects"
 log "Observabilidade: $observability"
 # Recriados sempre: os ficheiros de configuracao montados vivem em $BASE/src, que e trocado em cada deploy.
 # shellcheck disable=SC2086
-docker compose up -d --force-recreate $observability 2>&1 | tee -a "$LOG_FILE" ||
+compose up -d --force-recreate $observability 2>&1 | tee -a "$LOG_FILE" ||
   log "AVISO: observabilidade nao arrancou"
 
 # Mantem as imagens das ultimas versoes publicadas e limpa camadas orfas.

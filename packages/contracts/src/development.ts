@@ -95,6 +95,10 @@ export const gitRepositoryArchiveSchema = z.strictObject({
   expectedVersion: z.number().int().nonnegative(),
 });
 
+export const gitRepositoryCredentialRevokeSchema = z.strictObject({
+  expectedVersion: z.number().int().nonnegative(),
+});
+
 export interface GitRepositoryView {
   id: string;
   projectId: string;
@@ -106,6 +110,8 @@ export interface GitRepositoryView {
   testCommands: DevelopmentCommand[];
   prProvider: 'zeroops' | 'github';
   hasCredential: boolean;
+  credentialProvider: 'token' | 'github_cli';
+  credentialIdentity: string | null;
   version: number;
   archived: boolean;
   verifiedAt: string | null;

@@ -134,6 +134,14 @@ function PipelineCard({
         <dd>
           {pipeline.provider} · <code>{pipeline.endpointUrl}</code>
         </dd>
+        <dt>{t('Recurso real', 'Real resource')}</dt>
+        <dd>
+          {pipeline.targetKey ? (
+            <code>{pipeline.targetKey}</code>
+          ) : (
+            t('identificado pelo endpoint e ambiente', 'identified by endpoint and environment')
+          )}
+        </dd>
         <dt>Callback</dt>
         <dd>
           <code>{pipeline.callbackUrl}</code>
@@ -210,6 +218,7 @@ function PipelineForm({
   );
   const [environment, setEnvironment] = useState(pipeline?.environment ?? 'quality');
   const [endpointUrl, setEndpointUrl] = useState(pipeline?.endpointUrl ?? '');
+  const [targetKey, setTargetKey] = useState(pipeline?.targetKey ?? '');
   const [secret, setSecret] = useState('');
   const [allowIntegration, setAllowIntegration] = useState(pipeline?.allowIntegration ?? false);
   const [holdPolicy, setHoldPolicy] = useState(pipeline?.holdPolicy ?? 'until_published');
@@ -228,6 +237,7 @@ function PipelineForm({
               targetBranch,
               environment,
               endpointUrl,
+              targetKey: targetKey.trim() || null,
               allowIntegration,
               holdPolicy,
               ...(secret ? { secret } : {}),
@@ -285,6 +295,20 @@ function PipelineForm({
           value={endpointUrl}
           placeholder="https://ci.example.pt/zeroops"
           onChange={(event) => setEndpointUrl(event.target.value)}
+        />
+      </label>
+      <label>
+        <span>
+          {t(
+            'Identificador do recurso real (opcional; pipelines com o mesmo valor partilham o lock)',
+            'Real resource identifier (optional; pipelines with the same value share the lock)',
+          )}
+        </span>
+        <input
+          value={targetKey}
+          maxLength={200}
+          placeholder="qa.pizzahut.pt"
+          onChange={(event) => setTargetKey(event.target.value)}
         />
       </label>
       <label>

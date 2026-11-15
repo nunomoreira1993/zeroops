@@ -21,6 +21,7 @@ import { discoverAgentCommands } from './agent-commands.js';
 import { CopilotCliAdapter } from './copilot.adapter.js';
 import { CopilotSdkAdapter, sdkClientFactory } from './copilot-sdk.adapter.js';
 import { CopilotProcess, type AgentIdentity } from './copilot-process.js';
+import { jobIdentitiesFromEnv } from './job-sandbox.js';
 import { InvestigationRunner } from './investigation-runner.js';
 import { FlowAssistantRunner } from './flow-assistant-runner.js';
 import { ModelCatalogRefresher } from './model-catalog.js';
@@ -54,6 +55,8 @@ const identity: AgentIdentity | undefined = env.ZEROOPS_AGENT_UID
   : undefined;
 if (identity && (!Number.isInteger(identity.uid) || identity.uid < 1))
   throw new Error('ZEROOPS_AGENT_UID invalido.');
+/** F02: um uid exclusivo por job (ZEROOPS_JOB_UID_BASE); sem pool, a identidade partilhada. */
+const identities = jobIdentitiesFromEnv(env, identity);
 const connectorUrl = env.ZEROOPS_CONNECTOR_URL;
 
 const jobs = executorJobConfig(env);
@@ -91,6 +94,7 @@ const delivery =
           workerId: worker.workerId,
           allowedOrigins: allowedPipelineOrigins(env),
           publicUrl: env.ZEROOPS_PUBLIC_URL,
+          identities,
           log: (event) => console.info(JSON.stringify(event)),
         },
       )
@@ -163,6 +167,7 @@ const runner = new InvestigationRunner(runQueue, adapter, {
       }
     : {}),
   ...(identity ? { workspaceOwner: { uid: identity.uid, gid: identity.gid } } : {}),
+  identities,
   copilotCredentials,
   ...(development ? { development } : {}),
   conversation: (runId, lease) =>
@@ -206,6 +211,7 @@ const assistant = new FlowAssistantRunner(
     outputLimitBytes: Number(env.ZEROOPS_AGENT_OUTPUT_LIMIT ?? 5242880),
     copilotCredentials,
     ...(identity ? { workspaceOwner: { uid: identity.uid, gid: identity.gid } } : {}),
+    identities,
   },
 );
 
@@ -225,6 +231,7 @@ const routing = new FlowAssistantRunner(
     outputLimitBytes: Number(env.ZEROOPS_AGENT_OUTPUT_LIMIT ?? 5242880),
     copilotCredentials,
     ...(identity ? { workspaceOwner: { uid: identity.uid, gid: identity.gid } } : {}),
+    identities,
   },
 );
 
@@ -244,6 +251,7 @@ const simulation = new FlowAssistantRunner(
     outputLimitBytes: Number(env.ZEROOPS_AGENT_OUTPUT_LIMIT ?? 5242880),
     copilotCredentials,
     ...(identity ? { workspaceOwner: { uid: identity.uid, gid: identity.gid } } : {}),
+    identities,
   },
 );
 

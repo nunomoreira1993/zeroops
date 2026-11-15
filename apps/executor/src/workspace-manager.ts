@@ -1,7 +1,17 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chown, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
+import {
+  chmod,
+  lchown,
+  mkdir,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
+import { isAbsolute, join, resolve, sep } from 'node:path';
 import type {
   DevelopmentCommand,
   DevelopmentFileChange,
@@ -16,6 +26,8 @@ const TEST_OUTPUT_LIMIT = 200_000;
 export interface WorkspaceOwner {
   uid: number;
   gid: number;
+  /** Temporários privados da identidade do job (F02); sem isto usa os do sistema. */
+  tmpDir?: string;
 }
 
 export interface CommandResult {
@@ -23,6 +35,8 @@ export interface CommandResult {
   timedOut: boolean;
   log: string;
   durationMs: number;
+  /** F04: interrompido por perda de posse/cancelamento (o resultado não é conclusivo). */
+  aborted?: boolean;
 }
 
 /** Executa um comando configurado no checkout, como o utilizador do agente e sem segredos. */
@@ -31,52 +45,78 @@ export type CommandExecutor = (input: {
   cwd: string;
   timeoutMs: number;
   owner?: WorkspaceOwner;
+  signal?: AbortSignal;
 }) => Promise<CommandResult>;
 
 /** Ambiente mínimo dos comandos de teste: nunca herda tokens nem credenciais do executor. */
-function commandEnvironment(cwd: string): NodeJS.ProcessEnv {
+function commandEnvironment(cwd: string, owner?: WorkspaceOwner): NodeJS.ProcessEnv {
   const keep = ['PATH', 'LANG', 'TZ', 'SystemRoot', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP'];
   const env: NodeJS.ProcessEnv = { HOME: cwd, CI: '1', GIT_TERMINAL_PROMPT: '0' };
   for (const key of keep) if (process.env[key]) env[key] = process.env[key];
+  if (owner?.tmpDir)
+    Object.assign(env, { TMPDIR: owner.tmpDir, TEMP: owner.tmpDir, TMP: owner.tmpDir });
   return env;
 }
 
-export const runCommand: CommandExecutor = ({ command, cwd, timeoutMs, owner }) =>
+export const runCommand: CommandExecutor = ({ command, cwd, timeoutMs, owner, signal }) =>
   new Promise((done) => {
     const started = Date.now();
     const posix = process.platform !== 'win32';
+    if (signal?.aborted)
+      return done({ exitCode: null, timedOut: false, log: '', durationMs: 0, aborted: true });
     const child = spawn(command, {
       cwd,
       shell: true,
-      env: commandEnvironment(cwd),
+      env: commandEnvironment(cwd, owner),
       detached: posix,
       windowsHide: true,
       ...(owner && posix ? { uid: owner.uid, gid: owner.gid } : {}),
     });
     let log = '';
     let timedOut = false;
+    let aborted = false;
     const append = (chunk: Buffer) => {
       log += chunk.toString('utf8');
       if (log.length > TEST_OUTPUT_LIMIT * 2) log = log.slice(-TEST_OUTPUT_LIMIT);
     };
     child.stdout?.on('data', append);
     child.stderr?.on('data', append);
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const kill = () => {
       try {
         if (posix && child.pid) process.kill(-child.pid, 'SIGKILL');
+        else if (child.pid)
+          // Windows: o shell não propaga a terminação aos filhos; termina a árvore inteira.
+          spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+            windowsHide: true,
+            stdio: 'ignore',
+          })
+            .on('error', () => child.kill('SIGKILL'))
+            .on('close', (code) => {
+              if (code !== 0) child.kill('SIGKILL');
+            });
         else child.kill('SIGKILL');
       } catch {
         // o processo já terminou
       }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
     }, timeoutMs);
+    const onAbort = () => {
+      aborted = true;
+      kill();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
     const finish = (exitCode: number | null) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       done({
-        exitCode: timedOut ? null : exitCode,
+        exitCode: timedOut || aborted ? null : exitCode,
         timedOut,
         log: log.length > TEST_OUTPUT_LIMIT ? log.slice(-TEST_OUTPUT_LIMIT) : log,
         durationMs: Date.now() - started,
+        ...(aborted ? { aborted } : {}),
       });
     };
     child.on('error', (error) => {
@@ -92,6 +132,20 @@ export interface AttemptCheckout {
   path: string;
   /** Commit em que o worktree foi criado (head anterior ou base). */
   startSha: string;
+  /** Identidade dona do worktree (F02: uid exclusivo do job). */
+  owner?: WorkspaceOwner;
+  /**
+   * Diretório administrativo do worktree (`repo.git/worktrees/<n>`), lido antes de o entregar ao
+   * agente: o executor nunca segue o ficheiro `.git` do worktree, que o agente pode alterar.
+   */
+  adminDir?: string;
+}
+
+const posixHost = process.platform !== 'win32';
+
+/** F02: diretórios atravessáveis mas não listáveis por outras identidades. */
+async function restrict(path: string, mode: number) {
+  if (posixHost) await chmod(path, mode);
 }
 
 /**
@@ -120,6 +174,7 @@ export class WorkspaceManager {
     url: string;
     baseBranch: string;
     credential: string | null;
+    signal?: AbortSignal;
   }) {
     const gitDir = join(this.directory(input.projectId, input.workspaceId), 'repo.git');
     const exists = await stat(join(gitDir, 'HEAD')).then(
@@ -130,6 +185,10 @@ export class WorkspaceManager {
       await mkdir(gitDir, { recursive: true });
       await runGit(['init', '--bare', '--quiet', gitDir]);
     }
+    const workspaceDir = join(gitDir, '..');
+    await restrict(join(workspaceDir, '..'), 0o711);
+    await restrict(workspaceDir, 0o711);
+    await restrict(gitDir, 0o700);
     await mkdir(join(gitDir, 'info'), { recursive: true });
     // O relatório do agente nunca entra no commit.
     await writeFile(join(gitDir, 'info', 'exclude'), `${REPORT_FILE}\n`);
@@ -143,7 +202,7 @@ export class WorkspaceManager {
         input.url,
         `+refs/heads/${input.baseBranch}:refs/remotes/origin/${input.baseBranch}`,
       ],
-      { credential: input.credential, timeoutMs: 300_000 },
+      { credential: input.credential, timeoutMs: 300_000, signal: input.signal },
     );
     const sha = (
       await runGit(['--git-dir', gitDir, 'rev-parse', `refs/remotes/origin/${input.baseBranch}`])
@@ -159,22 +218,44 @@ export class WorkspaceManager {
     );
   }
 
-  /** Cria o worktree da tentativa no commit indicado (destacado: só o executor move a branch). */
-  async checkout(gitDir: string, attempt: string, sha: string): Promise<AttemptCheckout> {
+  /**
+   * Cria o worktree da tentativa no commit indicado (destacado: só o executor move a branch).
+   * `owner` é a identidade do job que vai trabalhar no checkout (por omissão a do executor).
+   */
+  async checkout(
+    gitDir: string,
+    attempt: string,
+    sha: string,
+    owner: WorkspaceOwner | undefined = this.owner,
+  ): Promise<AttemptCheckout> {
     if (!/^[A-Za-z0-9-]{1,80}$/.test(attempt)) throw new Error('Tentativa inválida.');
     if (!GIT_SHA.test(sha)) throw new Error('SHA inválido.');
-    const path = join(gitDir, '..', 'attempts', attempt);
+    const attempts = join(gitDir, '..', 'attempts');
+    const path = join(attempts, attempt);
     await this.removeCheckout({ gitDir, path, startSha: sha });
-    await mkdir(join(gitDir, '..', 'attempts'), { recursive: true });
+    await mkdir(attempts, { recursive: true });
+    await restrict(attempts, 0o711);
     await runGit(['--git-dir', gitDir, 'worktree', 'add', '--detach', '--quiet', path, sha]);
-    if (this.owner) await chownTree(path, this.owner);
-    return { gitDir, path, startSha: sha };
+    const adminDir = await worktreeAdminDir(gitDir, path);
+    if (owner) {
+      await chownTree(path, owner);
+      await restrict(path, 0o700);
+    }
+    return { gitDir, path, startSha: sha, adminDir, ...(owner ? { owner } : {}) };
+  }
+
+  /** Git sobre o worktree com o diretório administrativo fixado pelo executor. */
+  private treeGit(checkout: AttemptCheckout, args: string[]) {
+    const pinned = checkout.adminDir
+      ? ['--git-dir', checkout.adminDir, '--work-tree', checkout.path]
+      : [];
+    return runGit([...pinned, ...args], { cwd: checkout.path });
   }
 
   /** Árvore atual do checkout (hash do conteúdo efetivamente testado, mesmo sem commit). */
   async workingTree(checkout: AttemptCheckout) {
-    await runGit(['add', '-A', '--', '.'], { cwd: checkout.path });
-    return (await runGit(['write-tree'], { cwd: checkout.path })).stdout.trim();
+    await this.treeGit(checkout, ['add', '-A', '--', '.']);
+    return (await this.treeGit(checkout, ['write-tree'])).stdout.trim();
   }
 
   /**
@@ -185,14 +266,22 @@ export class WorkspaceManager {
     await rm(join(checkout.path, REPORT_FILE), { force: true });
     const tree = await this.workingTree(checkout);
     const parentTree = (
-      await runGit(['rev-parse', `${parent}^{tree}`], { cwd: checkout.path })
+      await this.treeGit(checkout, ['rev-parse', `${parent}^{tree}`])
     ).stdout.trim();
     if (tree === parentTree) return parent;
     const sha = (
-      await runGit(['commit-tree', tree, '-p', parent, '-m', message], { cwd: checkout.path })
+      await this.treeGit(checkout, ['commit-tree', tree, '-p', parent, '-m', message])
     ).stdout.trim();
     if (!GIT_SHA.test(sha)) throw new Error('Commit inválido.');
     return sha;
+  }
+
+  /** Coloca o worktree (destacado) noutro commit. */
+  async detach(checkout: AttemptCheckout, sha: string) {
+    if (!GIT_SHA.test(sha)) throw new Error('SHA inválido.');
+    await this.treeGit(checkout, ['checkout', '--detach', '--quiet', sha]);
+    const owner = checkout.owner ?? this.owner;
+    if (owner) await chownTree(checkout.path, owner);
   }
 
   /** Move a branch local do workspace (CAS sobre o valor anterior). */
@@ -255,21 +344,22 @@ export class WorkspaceManager {
   ): Promise<{ ok: true; sha: string } | { ok: false; conflicts: string[] }> {
     if (!GIT_SHA.test(head)) throw new Error('SHA inválido.');
     try {
-      await runGit(['merge', '--no-ff', '--no-edit', '-m', message, head], { cwd: checkout.path });
+      await this.treeGit(checkout, ['merge', '--no-ff', '--no-edit', '-m', message, head]);
     } catch {
       const conflicts = (
-        await runGit(['diff', '--name-only', '--diff-filter=U'], { cwd: checkout.path }).catch(
-          () => ({ stdout: '' }),
-        )
+        await this.treeGit(checkout, ['diff', '--name-only', '--diff-filter=U']).catch(() => ({
+          stdout: '',
+        }))
       ).stdout
         .split('\n')
         .map((item) => item.trim())
         .filter(Boolean);
-      await runGit(['merge', '--abort'], { cwd: checkout.path }).catch(() => undefined);
+      await this.treeGit(checkout, ['merge', '--abort']).catch(() => undefined);
       return { ok: false, conflicts };
     }
-    if (this.owner) await chownTree(checkout.path, this.owner);
-    const sha = (await runGit(['rev-parse', 'HEAD'], { cwd: checkout.path })).stdout.trim();
+    const owner = checkout.owner ?? this.owner;
+    if (owner) await chownTree(checkout.path, owner);
+    const sha = (await this.treeGit(checkout, ['rev-parse', 'HEAD'])).stdout.trim();
     if (!GIT_SHA.test(sha)) throw new Error('Merge sem commit válido.');
     return { ok: true, sha };
   }
@@ -318,12 +408,14 @@ export class WorkspaceManager {
   }
 
   /** Executa um comando configurado (setup ou teste) no checkout da tentativa. */
-  runConfigured(checkout: AttemptCheckout, command: DevelopmentCommand) {
+  runConfigured(checkout: AttemptCheckout, command: DevelopmentCommand, signal?: AbortSignal) {
+    const owner = checkout.owner ?? this.owner;
     return this.execute({
       command: command.command,
       cwd: checkout.path,
       timeoutMs: command.timeoutSeconds * 1000,
-      ...(this.owner ? { owner: this.owner } : {}),
+      ...(owner ? { owner } : {}),
+      ...(signal ? { signal } : {}),
     });
   }
 
@@ -364,11 +456,27 @@ export function parseNameStatus(raw: string): DevelopmentFileChange[] {
   return files;
 }
 
+/** Lê `<worktree>/.git` (ainda escrito pelo executor) e confirma que aponta para dentro do bare. */
+export async function worktreeAdminDir(gitDir: string, path: string) {
+  const raw = (await readFile(join(path, '.git'), 'utf8')).trim();
+  const match = /^gitdir:\s*(.+)$/.exec(raw);
+  if (!match) throw new Error('Worktree sem diretório administrativo.');
+  // Caminhos reais: o Git escreve o caminho longo e o chamador pode usar nomes curtos (8.3).
+  const target = await realpath(resolve(isAbsolute(match[1]!) ? match[1]! : join(path, match[1]!)));
+  const base = (await realpath(resolve(gitDir, 'worktrees'))) + sep;
+  const inside = posixHost
+    ? target.startsWith(base)
+    : target.toLowerCase().startsWith(base.toLowerCase());
+  if (!inside) throw new Error('Diretório administrativo do worktree inesperado.');
+  return target;
+}
+
+/** Entrega a árvore à identidade do job sem seguir symlinks criados pelo conteúdo. */
 async function chownTree(path: string, owner: WorkspaceOwner) {
-  await chown(path, owner.uid, owner.gid);
+  await lchown(path, owner.uid, owner.gid);
   for (const entry of await readdir(path, { withFileTypes: true })) {
     const child = `${path}${sep}${entry.name}`;
     if (entry.isDirectory()) await chownTree(child, owner);
-    else await chown(child, owner.uid, owner.gid).catch(() => undefined);
+    else await lchown(child, owner.uid, owner.gid).catch(() => undefined);
   }
 }

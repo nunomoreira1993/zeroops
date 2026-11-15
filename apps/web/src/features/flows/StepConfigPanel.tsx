@@ -20,7 +20,7 @@ import {
 import { ticketLabels } from '../../lib/format';
 import { useIdentityLocale } from '../../lib/identity';
 import { useProjectPermission } from '../../lib/project-admin';
-import { portKey, roleLabels, ticketStatusOptions } from './flow-labels';
+import { roleLabels, ticketStatusOptions } from './flow-labels';
 import { TechLogo, TechLogos, nodeTechs, techTitles } from './tech-logos';
 import { AgentProfileStepConfig } from './AgentProfileStepConfig';
 import { ConditionConfig, newConditionConfig } from './ConditionConfig';

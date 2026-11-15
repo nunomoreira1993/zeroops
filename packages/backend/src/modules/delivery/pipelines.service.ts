@@ -29,6 +29,8 @@ export interface PipelineRow {
   secret_ciphertext: string;
   allow_integration: boolean;
   hold_policy: 'until_published' | 'until_flow_end';
+  /** F03: identificador explícito do ambiente real (pipelines com o mesmo valor partilham o lock). */
+  target_key: string | null;
   version: number;
   archived: boolean;
   updated_at: Date;
@@ -148,8 +150,9 @@ export class PipelinesService {
       const id = randomUUID();
       await client.query(
         `INSERT INTO project_pipelines(id,project_id,name,provider,repository_id,target_branch,
-           environment,endpoint_url,secret_ciphertext,allow_integration,hold_policy,created_by,updated_by)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)`,
+           environment,endpoint_url,secret_ciphertext,allow_integration,hold_policy,created_by,updated_by,
+           target_key)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,$13)`,
         [
           id,
           projectId,
@@ -163,6 +166,7 @@ export class PipelinesService {
           input.allowIntegration,
           input.holdPolicy,
           context.actor.id,
+          input.targetKey ?? null,
         ],
       );
       await this.audit(client, context.actor.id, 'pipeline.created', {
@@ -173,6 +177,7 @@ export class PipelinesService {
         environment: input.environment,
         endpointUrl: input.endpointUrl,
         allowIntegration: input.allowIntegration,
+        targetKey: input.targetKey ?? null,
       });
       return this.view(client, projectId, id);
     });
@@ -206,7 +211,7 @@ export class PipelinesService {
       await client.query(
         `UPDATE project_pipelines SET name=$3,repository_id=$4,target_branch=$5,environment=$6,
            endpoint_url=$7,secret_ciphertext=$8,allow_integration=$9,hold_policy=$10,
-           version=version+1,updated_by=$11,updated_at=NOW(3)
+           target_key=$12,version=version+1,updated_by=$11,updated_at=NOW(3)
          WHERE id=$1 AND project_id=$2`,
         [
           pipelineId,
@@ -222,6 +227,7 @@ export class PipelinesService {
           input.allowIntegration,
           input.holdPolicy,
           context.actor.id,
+          input.targetKey ?? null,
         ],
       );
       await this.audit(client, context.actor.id, 'pipeline.updated', {
@@ -231,6 +237,7 @@ export class PipelinesService {
         environment: input.environment,
         endpointUrl: input.endpointUrl,
         allowIntegration: input.allowIntegration,
+        targetKey: input.targetKey ?? null,
         secretChanged: Boolean(input.secret),
       });
       return this.view(client, projectId, pipelineId);
@@ -318,6 +325,7 @@ export class PipelinesService {
       callbackUrl: pipelineCallbackUrl(this.options.publicUrl, row.id),
       allowIntegration: Boolean(row.allow_integration),
       holdPolicy: row.hold_policy,
+      targetKey: row.target_key ?? null,
       version: Number(row.version),
       archived: Boolean(row.archived),
       updatedAt: new Date(row.updated_at).toISOString(),

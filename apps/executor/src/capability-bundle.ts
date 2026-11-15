@@ -101,7 +101,8 @@ async function walk(path: string, visit: (path: string, directory: boolean) => P
 async function makeReadOnly(base: string, owner?: { uid: number; gid: number }) {
   const apply = async (path: string, directory: boolean) => {
     if (owner) await chown(path, owner.uid, owner.gid);
-    await chmod(path, directory ? 0o555 : 0o444);
+    // F02: com dono próprio, as skills ficam ilegíveis para os uids de outros jobs.
+    await chmod(path, owner ? (directory ? 0o500 : 0o400) : directory ? 0o555 : 0o444);
   };
   await walk(base, apply);
   await apply(base, true);

@@ -10,6 +10,12 @@ import type {
   JobLease,
 } from '../../../packages/backend/src/modules/agents/job-leases.js';
 import type { AgentTool, CopilotAgent } from './copilot.adapter.js';
+import {
+  JobIdentityExhausted,
+  ownerOf,
+  type JobIdentity,
+  type JobIdentitySource,
+} from './job-sandbox.js';
 
 /** Fila do assistente de fluxos (permite testar sem base de dados). */
 export interface FlowAssistantQueuePort {
@@ -32,6 +38,8 @@ export interface FlowAssistantRunnerOptions {
   outputLimitBytes: number;
   copilotCredentials?: (projectId: string) => Promise<{ token: string; model?: string } | null>;
   workspaceOwner?: { uid: number; gid: number };
+  /** F02: identidade exclusiva por pedido (pool de uids); sem pool usa `workspaceOwner`. */
+  identities?: JobIdentitySource;
   /** Intervalo do heartbeat do lease (por omissão, um quarto da duração do lease). */
   heartbeatMs?: number;
 }
@@ -131,8 +139,22 @@ export class FlowAssistantRunner {
    */
   async runOnce(shutdown?: AbortSignal): Promise<boolean> {
     if (shutdown?.aborted) return false;
-    const request = await this.queue.claimNext();
-    if (!request) return false;
+    let identity: JobIdentity | null;
+    try {
+      identity = (await this.options.identities?.acquire()) ?? null;
+    } catch (error) {
+      if (error instanceof JobIdentityExhausted) return false;
+      throw error;
+    }
+    const request = await this.queue.claimNext().catch(async (error: unknown) => {
+      await identity?.release();
+      throw error;
+    });
+    if (!request) {
+      await identity?.release();
+      return false;
+    }
+    const owner = identity ? ownerOf(identity) : this.options.workspaceOwner;
     const { lease } = request;
     const workspace = await mkdtemp(join(this.options.workspaceRoot, 'assistant-'));
     const abort = new AbortController();
@@ -172,8 +194,7 @@ export class FlowAssistantRunner {
           ...(credentials.model ? { COPILOT_MODEL: credentials.model } : {}),
         };
       }
-      if (this.options.workspaceOwner)
-        await chown(workspace, this.options.workspaceOwner.uid, this.options.workspaceOwner.gid);
+      if (owner) await chown(workspace, owner.uid, owner.gid);
       const tools = request.authoring
         ? this.authoringTools(lease, () => {
             leaseLost = true;
@@ -189,6 +210,7 @@ export class FlowAssistantRunner {
         readOnlyDirectories: [],
         signal: abort.signal,
         isActive: () => !abort.signal.aborted,
+        ...(identity ? { identity } : {}),
         ...(env ? { env } : {}),
         ...(tools ? { tools } : {}),
       });
@@ -217,6 +239,13 @@ export class FlowAssistantRunner {
       if (timer) clearInterval(timer);
       shutdown?.removeEventListener('abort', onShutdown);
       await rm(workspace, { recursive: true, force: true });
+      await identity?.release().catch((error: unknown) =>
+        this.log({
+          event: 'flow_assistant.identity_release_failed',
+          requestId: request.id,
+          message: error instanceof Error ? error.message.slice(0, 300) : undefined,
+        }),
+      );
     }
     return true;
   }

@@ -39,9 +39,12 @@ Valores por omissão no `compose.yml` (só alterar no `.env` se necessário):
 | `ZEROOPS_DEV_WORKSPACES` (executor)    | `/var/lib/zeroops/workspaces` |
 | `ZEROOPS_DEV_WORKSPACE_RETENTION_DAYS` | `14`                          |
 
-Sem raízes autorizadas nenhum repositório é aceite. Repositórios GitHub
-exigem acrescentar `https://github.com/<org>/` às raízes e uma credencial
-(token só de escrita) guardada no repositório; não usar em QA.
+Sem raízes autorizadas nenhum repositório é aceite. A instância QA permite
+explicitamente `https://github.com/Deloitte-Portugal/` para esta validação;
+isto autoriza URLs, mas não concede credenciais nem acesso GitHub. Cada recurso
+continua a exigir a credencial e as permissões adequadas. O hook de deploy lê
+`/etc/zeroops/zeroops.env` também para a interpolação do Compose, preservando
+esta allowlist nas publicações seguintes.
 
 ## Migration
 

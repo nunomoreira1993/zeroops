@@ -37,7 +37,14 @@ import { TicketsService } from '../../../packages/backend/src/modules/tickets/ti
 import { WorkflowService } from '../../../packages/backend/src/modules/workflow/workflow.service.js';
 import { DeliveryRunner, type PipelineTransport } from './delivery-runner.js';
 import { DevelopmentRunner } from './development-runner.js';
-import { WorkspaceManager } from './workspace-manager.js';
+import { WorkspaceManager, type AttemptCheckout, type CommandResult } from './workspace-manager.js';
+import type { DevelopmentCommand } from '../../../packages/contracts/src/index.js';
+import {
+  canonicalEnvironmentKey,
+  canonicalIntegrationKey,
+  normalizeResourceUrl,
+  renewResourceLock,
+} from '../../../packages/backend/src/database/resource-locks.js';
 
 /**
  * P09 de ponta a ponta: Git real (origens `file://`), BD de teste, motor de fluxos, stores e
@@ -646,5 +653,305 @@ describe('P09 — entrega por pipeline controlada pelo fluxo', { timeout: 180_00
     provider.advance(dE.idempotency_key, 'succeeded');
     await drive(3);
     expect((await deliveryOf(e.id))!.state).toBe('published');
+  });
+});
+
+type CommandHook = (
+  checkout: AttemptCheckout,
+  command: DevelopmentCommand,
+  signal: AbortSignal | undefined,
+  run: (command: DevelopmentCommand) => Promise<CommandResult>,
+) => Promise<CommandResult>;
+
+/** Gestor real com um ponto de interceção nos comandos configurados (testes da combinação). */
+class HookedManager extends WorkspaceManager {
+  hook: CommandHook | null = null;
+
+  override runConfigured(
+    checkout: AttemptCheckout,
+    command: DevelopmentCommand,
+    signal?: AbortSignal,
+  ) {
+    const run = (next: DevelopmentCommand) => super.runConfigured(checkout, next, signal);
+    return this.hook ? this.hook(checkout, command, signal, run) : run(command);
+  }
+}
+
+const sleepCommand = (ms: number): DevelopmentCommand => ({
+  name: 'sleep',
+  command: `node -e "setTimeout(() => {}, ${ms})"`,
+  timeoutSeconds: 120,
+});
+
+/** Termina a publicação em curso de um ticket (liberta o ambiente partilhado). */
+async function finishPublishing(ticketId: string) {
+  const current = (await deliveryOf(ticketId))!;
+  if (current.state !== 'publishing') return;
+  provider.advance(current.idempotency_key, 'succeeded');
+  await drive(2);
+  expect((await deliveryOf(ticketId))!.state).toBe('published');
+}
+
+const runnerEvents = async (deliveryId: string) =>
+  (
+    await fixture.db.query<{ status: string; payload: unknown }>(
+      "SELECT status,payload FROM delivery_events WHERE delivery_id=$1 AND source='runner' ORDER BY received_at",
+      [deliveryId],
+    )
+  ).rows;
+
+describe('Entrega A — integridade da execução', { timeout: 240_000 }, () => {
+  it('F03: chaves canónicas identificam o recurso real, seja qual for a configuração', () => {
+    expect(normalizeResourceUrl('HTTPS://user:pw@GitHub.com/org/Repo.git/')).toBe(
+      'https://github.com/org/Repo',
+    );
+    expect(canonicalIntegrationKey('https://github.com/org/repo.git', 'main')).toBe(
+      canonicalIntegrationKey('https://GITHUB.com/org/repo/', 'main'),
+    );
+    expect(canonicalIntegrationKey('https://github.com/org/repo', 'main')).not.toBe(
+      canonicalIntegrationKey('https://github.com/org/repo', 'qa'),
+    );
+    const endpoint = { endpointUrl: 'https://ci.test/hooks', environment: 'quality' };
+    expect(canonicalEnvironmentKey(endpoint)).toBe(
+      canonicalEnvironmentKey({ ...endpoint, endpointUrl: 'https://CI.test/hooks/' }),
+    );
+    expect(canonicalEnvironmentKey(endpoint)).toBe(
+      canonicalEnvironmentKey({ ...endpoint, environment: ' QUALITY ' }),
+    );
+    expect(canonicalEnvironmentKey(endpoint)).not.toBe(
+      canonicalEnvironmentKey({ ...endpoint, environment: 'production' }),
+    );
+    // Um alvo explícito comum une pipelines com endpoints diferentes.
+    expect(canonicalEnvironmentKey({ ...endpoint, targetKey: 'QA.pizzahut.pt' })).toBe(
+      canonicalEnvironmentKey({
+        endpointUrl: 'https://outro.test/x',
+        environment: 'production',
+        targetKey: 'qa.pizzahut.pt',
+      }),
+    );
+  });
+
+  it('F03 + F01: projetos diferentes no mesmo ambiente real esperam; a revogação durante a espera impede o pedido', async () => {
+    const p1 = await project();
+    const p2 = await project();
+    const a = await ticket(p1.client, 'Projeto 1');
+    const b = await ticket(p2.client, 'Projeto 2');
+    const headA = await develop(a.id, (dir) => writeFile(join(dir, 'p1.txt'), '1\n'));
+    const headB = await develop(b.id, (dir) => writeFile(join(dir, 'p2.txt'), '2\n'));
+    await approve(p1.qa, a.id, headA);
+    await approve(p2.qa, b.id, headB);
+    await drive();
+    const dA = (await deliveryOf(a.id))!;
+    const dB = (await deliveryOf(b.id))!;
+    expect(dA.state).toBe('publishing');
+    // Pipelines distintas (projetos distintos) com o mesmo endpoint: o ambiente real é um só.
+    expect(dB.state).toBe('starting');
+    expect(dB.state_reason).toMatch(/À espera do ambiente quality/);
+    expect(provider.posts.filter((post) => post.deliveryId === dB.id)).toEqual([]);
+    const envKey = canonicalEnvironmentKey({
+      endpointUrl: `${PIPELINE_ORIGIN}/hooks`,
+      environment: 'quality',
+    });
+    const holder = await fixture.db.query<{ holder_id: string }>(
+      'SELECT holder_id FROM resource_locks WHERE lock_key=$1',
+      [envKey],
+    );
+    expect(holder.rows[0]?.holder_id).toBe(dA.id);
+
+    // O revisor de B é desativado enquanto B espera: com o ambiente livre, nada é pedido.
+    await fixture.db.query('UPDATE users SET disabled=1 WHERE id=$1', [p2.qa.id]);
+    await finishPublishing(a.id);
+    await drive();
+    const blocked = (await deliveryOf(b.id))!;
+    expect(blocked.state).toBe('blocked');
+    expect(blocked.state_reason).toMatch(/Faltam aprovações válidas/);
+    expect(provider.posts.filter((post) => post.deliveryId === dB.id)).toEqual([]);
+    expect(
+      (await runnerEvents(dB.id)).filter((event) => event.status === 'effect_blocked'),
+    ).toHaveLength(1);
+    const left = await fixture.db.query('SELECT 1 FROM resource_locks WHERE holder_id=$1', [dB.id]);
+    expect(left.rows).toEqual([]);
+  });
+
+  it('F01: o retry depois de 404 (estado incerto) volta a validar os gates antes do novo pedido', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'Retry incerto');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'retry.txt'), 'R\n'));
+    await approve(p.qa, t.id, head);
+    provider.loseNextRequest = true;
+    await drive(1);
+    const uncertain = (await deliveryOf(t.id))!;
+    expect(uncertain.state).toBe('uncertain');
+    await fixture.db.query('UPDATE users SET disabled=1 WHERE id=$1', [p.qa.id]);
+    await drive(1);
+    const blocked = (await deliveryOf(t.id))!;
+    expect(blocked.state).toBe('blocked');
+    expect(provider.posts.filter((post) => post.deliveryId === blocked.id)).toEqual([]);
+    const statuses = (await runnerEvents(blocked.id)).map((event) => event.status);
+    expect(statuses).toEqual(expect.arrayContaining(['start_retry', 'effect_blocked']));
+    expect(statuses.filter((status) => status === 'start_sent')).toHaveLength(1);
+  });
+
+  it('F01: revogação durante os testes da combinação impede o push', async () => {
+    const p = await project();
+    const a = await ticket(p.client, 'Base A');
+    const b = await ticket(p.client, 'Combinação B');
+    const headA = await develop(a.id, (dir) => writeFile(join(dir, 'a1.txt'), 'A\n'));
+    const headB = await develop(b.id, (dir) => writeFile(join(dir, 'b1.txt'), 'B\n'));
+    await approve(p.qa, a.id, headA);
+    await approve(p.qa2, b.id, headB);
+    const manager = new HookedManager(join(root, 'workspaces'));
+    let revoked = false;
+    // Só B corre os testes (merge sobre A); a revogação acontece durante esses testes.
+    manager.hook = async (_checkout, command, _signal, run) => {
+      if (!revoked) {
+        revoked = true;
+        await fixture.db.query('UPDATE users SET disabled=1 WHERE id=$1', [p.qa2.id]);
+      }
+      return run(command);
+    };
+    const runner = new DeliveryRunner(app.deliveries, manager, {
+      workerId: 'executor-f01',
+      allowedOrigins: [PIPELINE_ORIGIN],
+      publicUrl: 'https://zeroops.test',
+      transport: provider.transport,
+      leaseSeconds: 60,
+    });
+    for (let round = 0; round < 3; round += 1) {
+      await fixture.db.query(
+        'UPDATE delivery_runs SET next_check_at=NULL WHERE finished_at IS NULL',
+      );
+      for (let index = 0; index < 20 && (await runner.runOnce()); index += 1);
+    }
+    expect(revoked).toBe(true);
+    const dB = (await deliveryOf(b.id))!;
+    expect(dB.state).toBe('blocked');
+    expect(dB.state_reason).toMatch(/Faltam aprovações válidas/);
+    // A foi integrado (fast-forward, antes da revogação); a combinação com B nunca chegou ao remoto.
+    expect(await remoteBranchSha(p.origin.url, 'main')).toBe(headA);
+    const events = await runnerEvents(dB.id);
+    expect(events.map((event) => event.status)).not.toContain('pushed');
+    expect(events.find((event) => event.status === 'effect_blocked')?.payload).toMatchObject({
+      effect: 'push',
+    });
+    await finishPublishing(a.id);
+  });
+
+  it('F04: o heartbeat mantém lease e lock durante comandos longos; perder o lock aborta sem push', async () => {
+    const p = await project();
+    const a = await ticket(p.client, 'Base F04');
+    const b = await ticket(p.client, 'Longa F04');
+    const headA = await develop(a.id, (dir) => writeFile(join(dir, 'a2.txt'), 'A\n'));
+    const headB = await develop(b.id, (dir) => writeFile(join(dir, 'b2.txt'), 'B\n'));
+    await approve(p.qa, a.id, headA);
+    await approve(p.qa2, b.id, headB);
+    const dB = (await deliveryOf(b.id))!;
+    const integrationKey = canonicalIntegrationKey(p.origin.url, 'main');
+    const lockState = async () =>
+      (
+        await fixture.db.query<{ expires_at: Date; epoch: number }>(
+          "SELECT expires_at,epoch FROM resource_locks WHERE lock_key=$1 AND holder_kind='delivery' AND holder_id=$2",
+          [integrationKey, dB.id],
+        )
+      ).rows[0];
+    const leaseUntil = async () =>
+      new Date(
+        (
+          await fixture.db.query<{ lease_until: Date }>(
+            'SELECT lease_until FROM delivery_runs WHERE id=$1',
+            [dB.id],
+          )
+        ).rows[0]!.lease_until,
+      ).getTime();
+
+    const manager = new HookedManager(join(root, 'workspaces'));
+    let renewed = false;
+    let renewAfterSteal: boolean | null = null;
+    let aborted: CommandResult | null = null;
+    let abortedIn = Number.POSITIVE_INFINITY;
+    let sawSignal = false;
+    manager.hook = async (_checkout, command, signal, run) => {
+      if (aborted) return run(command);
+      const lockBefore = (await lockState())!;
+      const leaseBefore = await leaseUntil();
+      await run(sleepCommand(2500));
+      const lockAfter = (await lockState())!;
+      renewed =
+        new Date(lockAfter.expires_at).getTime() > new Date(lockBefore.expires_at).getTime() &&
+        (await leaseUntil()) > leaseBefore;
+      // Outro executor toma o lock (expirado do seu ponto de vista): esta tentativa tem de parar.
+      await fixture.db.query(
+        "UPDATE resource_locks SET holder_id=$2,epoch=epoch+1 WHERE lock_key=$1 AND holder_kind='delivery'",
+        [integrationKey, randomUUID()],
+      );
+      renewAfterSteal = await renewResourceLock(
+        fixture.db,
+        integrationKey,
+        { kind: 'delivery', id: dB.id },
+        lockAfter.epoch,
+        60,
+      );
+      const started = Date.now();
+      aborted = await run(sleepCommand(60_000));
+      abortedIn = Date.now() - started;
+      sawSignal = signal?.aborted === true;
+      return aborted;
+    };
+    const runner = new DeliveryRunner(app.deliveries, manager, {
+      workerId: 'executor-f04',
+      allowedOrigins: [PIPELINE_ORIGIN],
+      publicUrl: 'https://zeroops.test',
+      transport: provider.transport,
+      leaseSeconds: 60,
+      heartbeatMs: 100,
+    });
+    for (let round = 0; round < 2; round += 1) {
+      await fixture.db.query(
+        'UPDATE delivery_runs SET next_check_at=NULL WHERE finished_at IS NULL',
+      );
+      for (let index = 0; index < 20 && !aborted && (await runner.runOnce()); index += 1);
+    }
+    expect(renewed).toBe(true);
+    expect(renewAfterSteal).toBe(false);
+    expect(aborted).toMatchObject({ aborted: true });
+    expect(sawSignal).toBe(true);
+    expect(abortedIn).toBeLessThan(20_000);
+    // Só A (fast-forward) chegou ao remoto; a tentativa que perdeu o lock não fez push.
+    expect(await remoteBranchSha(p.origin.url, 'main')).toBe(headA);
+    expect((await deliveryOf(b.id))!.state).toBe('integrating');
+    expect((await runnerEvents(dB.id)).map((event) => event.status)).not.toContain('pushed');
+
+    // O lock alheio expira; a entrega retoma noutro executor e integra a combinação.
+    await fixture.db.query('DELETE FROM resource_locks WHERE lock_key=$1', [integrationKey]);
+    await fixture.db.query(
+      'UPDATE delivery_runs SET lease_until=TIMESTAMPADD(SECOND,-1,NOW(3)) WHERE id=$1',
+      [dB.id],
+    );
+    await finishPublishing(a.id);
+    await drive();
+    const resumed = (await deliveryOf(b.id))!;
+    expect(resumed.state).toBe('publishing');
+    expect(await isAncestor(p.origin.dir, headA, resumed.integrated_sha!)).toBe(true);
+    expect(await isAncestor(p.origin.dir, headB, resumed.integrated_sha!)).toBe(true);
+    await finishPublishing(b.id);
+  });
+  it('F03: mudar o URL do repositório depois de criada a entrega bloqueia a integração', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'URL alterado');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'url.txt'), 'U\n'));
+    await approve(p.qa, t.id, head);
+    const queued = (await deliveryOf(t.id))!;
+    expect(queued.integration_key).toBe(canonicalIntegrationKey(p.origin.url, 'main'));
+    const other = await createOrigin();
+    await fixture.db.query('UPDATE project_git_repositories SET url=$2 WHERE id=$1', [
+      p.repository.id,
+      other.url,
+    ]);
+    const mainBefore = await remoteBranchSha(other.url, 'main');
+    await drive();
+    const blocked = (await deliveryOf(t.id))!;
+    expect(blocked.state).toBe('blocked');
+    expect(blocked.state_reason).toMatch(/repositório de destino da entrega mudou/);
+    expect(await remoteBranchSha(other.url, 'main')).toBe(mainBefore);
   });
 });

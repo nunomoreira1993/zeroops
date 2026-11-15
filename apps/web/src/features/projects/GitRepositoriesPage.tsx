@@ -138,7 +138,13 @@ function RepositoryCard({
           {repository.prProvider === 'github' ? 'GitHub' : t('Interno ZeroOps', 'ZeroOps internal')}
         </dd>
         <dt>{t('Credencial', 'Credential')}</dt>
-        <dd>{repository.hasCredential ? t('Configurada', 'Configured') : t('Nenhuma', 'None')}</dd>
+        <dd>
+          {!repository.hasCredential
+            ? t('Nenhuma', 'None')
+            : repository.credentialProvider === 'github_cli'
+              ? `GitHub CLI${repository.credentialIdentity ? ` · ${repository.credentialIdentity}` : ''}`
+              : t('Token configurado', 'Token configured')}
+        </dd>
       </dl>
       {repository.verificationError && <Notice>{repository.verificationError}</Notice>}
       {mutation.error && <Notice>{mutation.error}</Notice>}
@@ -159,6 +165,32 @@ function RepositoryCard({
           <button className="button button-secondary" onClick={() => setEditing(true)}>
             {t('Editar', 'Edit')}
           </button>
+          {repository.hasCredential && (
+            <button
+              className="button button-secondary"
+              disabled={mutation.busy}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    t(
+                      'Remover a credencial armazenada no ZeroOps? Isto não revoga a sessão no GitHub.',
+                      'Remove the credential stored in ZeroOps? This does not revoke the GitHub session.',
+                    ),
+                  )
+                )
+                  return;
+                void mutation.run(async () => {
+                  await request(`${item}/credential/revoke`, {
+                    method: 'POST',
+                    body: { expectedVersion: repository.version },
+                  });
+                  onChanged();
+                });
+              }}
+            >
+              {t('Remover credencial', 'Remove credential')}
+            </button>
+          )}
           <button
             className="button button-secondary"
             disabled={mutation.busy}

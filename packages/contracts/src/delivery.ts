@@ -74,6 +74,17 @@ export const projectPipelineInputSchema = z.strictObject({
   /** Política explícita: o ZeroOps pode integrar (push sem force) na branch de destino. */
   allowIntegration: z.boolean().default(false),
   holdPolicy: z.enum(pipelineHoldPolicies).default('until_published'),
+  /**
+   * F03: identificador do ambiente real servido pela pipeline. Pipelines com o mesmo valor (em
+   * qualquer projeto) nunca publicam em simultâneo. Vazio: usa o endpoint e o ambiente.
+   */
+  targetKey: z
+    .string()
+    .trim()
+    .max(200)
+    .regex(/^[A-Za-z0-9._:/@-]*$/, 'Use apenas letras, números e . _ : / @ -')
+    .nullish()
+    .transform((value) => value || null),
   expectedVersion: z.number().int().nonnegative().optional(),
 });
 export type ProjectPipelineInput = z.infer<typeof projectPipelineInputSchema>;
@@ -90,6 +101,7 @@ export interface ProjectPipelineView {
   callbackUrl: string;
   allowIntegration: boolean;
   holdPolicy: (typeof pipelineHoldPolicies)[number];
+  targetKey: string | null;
   version: number;
   archived: boolean;
   updatedAt: string;

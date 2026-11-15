@@ -29,10 +29,11 @@ import { activePipeline, pipelineSecretContext, type PipelineRow } from './pipel
 import { capabilityPublishGate } from '../development/capability-gates.js';
 import {
   acquireResourceLock,
-  environmentLockKey,
-  integrationLockKey,
+  canonicalEnvironmentKey,
+  canonicalIntegrationKey,
   releaseLocksOf,
   releaseResourceLock,
+  renewResourceLock,
   type LockAttempt,
 } from '../../database/resource-locks.js';
 
@@ -49,6 +50,8 @@ export interface DeliveryRow {
   review_step_id: string | null;
   environment: string;
   target_branch: string;
+  /** F03: chave canónica do repositório real + branch (NULL em entregas anteriores à 047). */
+  integration_key: string | null;
   candidate_base_sha: string;
   candidate_head_sha: string;
   candidate_scope_hash: string;
@@ -223,11 +226,16 @@ export async function createDelivery(
 ) {
   const id = randomUUID();
   const { gates } = input;
+  const repository = (
+    await client.query<{ url: string }>('SELECT url FROM project_git_repositories WHERE id=$1', [
+      gates.pipeline.repository_id,
+    ])
+  ).rows[0];
   await client.query(
     `INSERT INTO delivery_runs(id,project_id,ticket_id,execution_id,step_id,node_id,pipeline_id,
        repository_id,workspace_id,review_step_id,environment,target_branch,candidate_base_sha,
-       candidate_head_sha,candidate_scope_hash,approvals,idempotency_key,state)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'queued')`,
+       candidate_head_sha,candidate_scope_hash,approvals,idempotency_key,state,integration_key)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'queued',$18)`,
     [
       id,
       input.projectId,
@@ -246,6 +254,7 @@ export async function createDelivery(
       gates.scopeHash,
       JSON.stringify({ required: gates.required, actors: gates.approvals }),
       randomUUID(),
+      repository ? canonicalIntegrationKey(repository.url, gates.pipeline.target_branch) : null,
     ],
   );
   return id;
@@ -289,6 +298,11 @@ export interface DeliveryJob {
     testCommands: DevelopmentCommand[];
   } | null;
   workspace: { branch: string };
+  /**
+   * F03: locks canónicos dos recursos reais, calculados a partir da configuração atual (URL do
+   * repositório + branch; alvo explícito ou endpoint + ambiente).
+   */
+  locks: { integration: string | null; environment: string };
 }
 
 export type DeliveryWrite = 'accepted' | 'stale';
@@ -316,8 +330,9 @@ export class DeliveryStore {
         WHERE d.finished_at IS NULL AND (d.lease_until IS NULL OR d.lease_until<NOW(3))
           AND (d.next_check_at IS NULL OR d.next_check_at<=NOW(3) OR d.cancel_requested)
           AND (d.state<>'queued' OR NOT EXISTS(
-                SELECT 1 FROM delivery_runs o WHERE o.repository_id=d.repository_id
-                  AND o.target_branch=d.target_branch AND o.finished_at IS NULL
+                SELECT 1 FROM delivery_runs o WHERE (o.integration_key=d.integration_key
+                    OR (o.repository_id=d.repository_id AND o.target_branch=d.target_branch))
+                  AND o.finished_at IS NULL
                   AND o.state IN ('queued','integrating')
                   AND (o.created_at<d.created_at OR (o.created_at=d.created_at AND o.id<d.id))))
           AND NOT EXISTS(SELECT 1 FROM ticket_purge_maintenance p WHERE p.project_id=d.project_id AND p.lease_until>NOW(3))
@@ -463,6 +478,18 @@ export class DeliveryStore {
     await releaseResourceLock(this.db, key, { kind: 'delivery', id: deliveryId });
   }
 
+  /** F04: renova um lock detido (mesma época) durante operações longas; `false` = perdido. */
+  async renewLock(
+    lease: DeliveryLease,
+    key: string,
+    epoch: number,
+    ttlSeconds: number,
+  ): Promise<boolean | 'stale'> {
+    return this.fenced(lease, null, (client, row) =>
+      renewResourceLock(client, key, { kind: 'delivery', id: row.id }, epoch, ttlSeconds),
+    );
+  }
+
   /** Termina o processamento: liberta o lease e agenda a próxima verificação. */
   async release(lease: DeliveryLease, nextCheckSeconds: number | null) {
     await this.db.query(
@@ -567,8 +594,9 @@ export class DeliveryStore {
     >(
       `SELECT d.*,p.name AS pipeline_name,
               CASE WHEN d.finished_at IS NULL AND d.state IN ('queued','integrating') THEN
-                (SELECT COUNT(*) FROM delivery_runs o WHERE o.repository_id=d.repository_id
-                   AND o.target_branch=d.target_branch AND o.finished_at IS NULL
+                (SELECT COUNT(*) FROM delivery_runs o WHERE (o.integration_key=d.integration_key
+                     OR (o.repository_id=d.repository_id AND o.target_branch=d.target_branch))
+                   AND o.finished_at IS NULL
                    AND o.state IN ('queued','integrating')
                    AND (o.created_at<d.created_at OR (o.created_at=d.created_at AND o.id<=d.id)))
               END AS queue_position
@@ -731,24 +759,28 @@ export class DeliveryStore {
          lease_until=NULL,next_check_at=NULL,updated_at=NOW(3) WHERE id=$1`,
       [row.id, state, reason?.slice(0, 1000) ?? null],
     );
-    await releaseResourceLock(client, integrationLockKey(row.repository_id, row.target_branch), {
-      kind: 'delivery',
-      id: row.id,
-    });
     const hold = (
       await client.query<{ hold_policy: string }>(
         'SELECT hold_policy FROM project_pipelines WHERE id=$1',
         [row.pipeline_id],
       )
     ).rows[0]?.hold_policy;
-    const envKey = environmentLockKey(row.pipeline_id, row.environment);
+    const holder = { kind: 'delivery' as const, id: row.id };
     // O ambiente fica retido enquanto o resultado é incerto ou o fluxo o exige (QA partilhado).
-    if (state === 'uncertain' || (state === 'published' && hold === 'until_flow_end'))
+    // Locks de ambiente: chave canónica (F03) e chave legada anterior à 047.
+    const environmentKeys = "(lock_key LIKE 'target:%' OR lock_key LIKE 'env:%')";
+    if (state === 'uncertain' || (state === 'published' && hold === 'until_flow_end')) {
       await client.query(
-        "UPDATE resource_locks SET expires_at=TIMESTAMPADD(DAY,7,NOW(3)) WHERE lock_key=$1 AND holder_kind='delivery' AND holder_id=$2",
-        [envKey, row.id],
+        `UPDATE resource_locks SET expires_at=TIMESTAMPADD(DAY,7,NOW(3))
+          WHERE holder_kind='delivery' AND holder_id=$1 AND ${environmentKeys}`,
+        [row.id],
       );
-    else await releaseResourceLock(client, envKey, { kind: 'delivery', id: row.id });
+      await client.query(
+        `DELETE FROM resource_locks WHERE holder_kind='delivery' AND holder_id=$1
+            AND NOT ${environmentKeys}`,
+        [row.id],
+      );
+    } else await releaseLocksOf(client, holder);
     await client.query(
       `UPDATE flow_executions SET wake_at=NOW(3) WHERE id=$1 AND status IN ${ACTIVE_FLOW}`,
       [row.execution_id],
@@ -812,6 +844,14 @@ export class DeliveryStore {
     ).rows[0];
     if (!pipeline || !this.cipher) return null;
     const repository = await activeRepository(this.db, row.project_id, row.repository_id);
+    if (repository && row.integration_key === null) {
+      // F03: entregas anteriores à 047 recebem a chave canónica na primeira posse.
+      row.integration_key = canonicalIntegrationKey(repository.url, row.target_branch);
+      await this.db.query(
+        'UPDATE delivery_runs SET integration_key=$2 WHERE id=$1 AND integration_key IS NULL',
+        [row.id, row.integration_key],
+      );
+    }
     return {
       lease: { deliveryId: row.id, workerId, epoch: Number(row.lease_epoch) },
       delivery: row,
@@ -841,6 +881,14 @@ export class DeliveryStore {
           }
         : null,
       workspace: { branch: row.branch },
+      locks: {
+        integration: repository ? canonicalIntegrationKey(repository.url, row.target_branch) : null,
+        environment: canonicalEnvironmentKey({
+          targetKey: pipeline.target_key,
+          endpointUrl: pipeline.endpoint_url,
+          environment: row.environment,
+        }),
+      },
     };
   }
 }

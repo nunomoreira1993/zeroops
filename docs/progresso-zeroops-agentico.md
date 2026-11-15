@@ -2308,7 +2308,7 @@ Estados: **verificado** (código + teste + evidência real em QA),
 | P08     | Desenvolvimento real na aplicação do site  | Nenhum ticket alterou ou publicou o site; branches em sandboxes sem endereço público                                         | bloqueado  |
 | P09     | PR GitHub e pipeline reais do site         | Provider GitHub existe no executor; sem credencial do projeto. Pipelines são webhook; Fake CI está arquivada                 | bloqueado  |
 | P07/P02 | Simulador e ativação no browser            | Browser autenticado após recarregar e navegação confirmada; simulador e ativação explícita ainda não exercitados             | parcial    |
-| P09     | Relay 1.2.0 e intervenção Health real      | Fonte 1.2.0; runtime/metadata QA 1.0.0, sem relay no projeto de teste nem alvo descartável autorizado; instalador partilha caminho do executável entre instâncias | bloqueado |
+| P09     | Relay 1.2.0 e intervenção Health real      | Fonte 1.2.0; registo do relay de Produção mostra 1.0.0; sem relay no projeto de teste nem alvo autorizado; instalador partilha caminho do executável | bloqueado |
 
 ### Limitações e pendências
 
@@ -2348,8 +2348,8 @@ não são evidência de alteração a um site.
 | ZO-36  | Teste P11 Operação / Sandbox P11 (`p08-sandbox.git`)         | `db435b68` → sem commit     | sem ficheiros versionados                                       | teste do agente passou; execução final falhou (`agent_failed`)                    | sem PR/pipeline                                                                                                              |
 | ZO-37  | Teste P11 Operação / Sandbox P11                             | `db435b68` → `741bcb45dfd0` | `app.js`, `test.js`                                             | `node test.js`, exit 0, testado em `741bcb45dfd0`                                 | PR interno #1; sem pipeline/publicação                                                                                       |
 
-Não há linhas em `deployment_runs` para estes tickets. Após a publicação
-desta atualização, o QA do ZeroOps está em
+Não há linhas em `deployment_runs` para estes tickets. No deploy da
+atualização do dashboard, o QA do ZeroOps ficou em
 `8306003a6d604cea0da40c5055b0a60687`; `/api/health` devolveu `ready`.
 O browser voltou a autenticar depois de recarregar e já apresenta o
 workspace, incluindo a administração do projeto de teste. Abrir a
@@ -2396,6 +2396,12 @@ existente foi preservado, sem reescrever commits nem o ticket.
 
 ### Validação desta atualização
 
+- `npm run build`, ESLint, Prettier e `git diff --check` dos ficheiros desta
+  alteração passaram. Os testes direcionados de workflow passaram (9/9).
+- `npm test` completo não terminou: confirmou 3 falhas de arquitetura já
+  presentes no baseline e mostrou também uma falha no e2e P09 e outra no e2e
+  P10 antes de ser interrompido por duração prolongada. A suite completa
+  continua por validar; estas falhas não estão nos componentes alterados.
 - Web: 21 ficheiros / 136 testes passaram com `--maxWorkers=1`. Na execução
   paralela anterior, 4 testes falharam sob carga; os quatro ficheiros
   passaram isoladamente. Não foi reproduzida uma regressão nos testes
@@ -2453,3 +2459,153 @@ ativação no browser, o relay 1.2.0 e a intervenção Health real continuam
 bloqueados.
 P11 permanece parcial; não declarar o produto concluído nem pronto para
 Produção.
+
+## Credencial GitHub CLI para o repositório Pizza Hut — 2026-11-15
+
+### Diagnóstico read-only no QA
+
+- Host confirmado: `uqphorders24-dev`. A sessão dedicada do GitHub CLI foi
+  concluída como `root` em `/run/zeroops-gh-auth` (tmpfs).
+- `gh api user`: HTTP 200, conta `numoreira_deloitte`, tipo `User`,
+  identidade GitHub `220217643`.
+- `gh api repos/Deloitte-Portugal/pizzahut`: HTTP 200; `pull=true`,
+  `push=true`, `maintain=true`, `admin=true`. Isto confirma capacidade, não
+  uma operação de escrita.
+- Scopes reportados: `gist`, `read:org`, `repo`, `workflow`.
+- `git ls-remote` autenticado à branch `qa`: sucesso,
+  `2c38b0f581dfa7e9dc6b31b39219377b93b54b3f`, TLS/verificação de host ativos.
+- Não houve push ao GitHub, chamada HTTP de escrita, alteração de política ou
+  contacto com Produção durante o diagnóstico. A credencial cifrada anterior
+  do ZeroOps não tinha acesso ao repositório antigo.
+- O acesso efetivo Git/API está confirmado; a página administrativa OAuth da
+  organização continua sem acesso e a política global não foi inspecionada.
+  A autenticação aprovada para esta conta não prova que a política possa ser
+  alterada.
+
+### Implementação e publicação no ZeroOps QA
+
+- Branch `feat/github-cli-credential-provider`, base `531494a`; commit de código
+  `8401110cc2122a10ce4c0c330a3a048e76d729f8`. A ref de feature foi enviada ao
+  remoto bare `qa`; o hook confirmou «recebida sem deploy (so main publica)».
+  `qa/main` não foi movida.
+- Migration aditiva `046_github_cli_credentials.sql` acrescenta origem e
+  identidade à credencial cifrada existente.
+- Importação auditada por `zeroops-ops github-cli-credential`: token apenas
+  por stdin; verifica `/user`, permissões/scopes do repositório e
+  `git ls-remote`; guarda-o cifrado, vinculado ao projeto/repositório.
+- UI identifica `GitHub CLI · login`, verifica 401/403/expiração e permite
+  remover a cópia cifrada do ZeroOps. A sessão OAuth local não é revogada por
+  essa remoção; a rotação exige nova autenticação/importação. `hosts.yml` não
+  será persistido.
+- Limitação: a conta é pessoal e tem scopes amplos, incluindo `repo` e
+  `workflow`; o binding restringe o recurso em que o ZeroOps usa a credencial,
+  mas não reduz os privilégios intrínsecos da conta. Renovação automática não
+  está implementada.
+
+### Migração do repositório Pizza Hut em QA
+
+- O primeiro deploy foi interrompido durante o build, antes da troca de código,
+  backup ou migrations; `VERSION` e serviços ficaram na versão anterior. A
+  repetição pelo script autorizado, com o SHA explícito, concluiu com sucesso.
+- `deploy/qa/VERSION` e `/api/health` confirmaram
+  `8401110cc2122a10ce4c0c330a3a048e76d729f8`; API pronta e executor
+  operacional. A migration 046 foi aplicada e o backup novo passou `gzip -t`.
+- Para resolver `Este repositório não está nas origens autorizadas`, foi
+  adicionada a raiz `https://github.com/numoreira/` a
+  `ZEROOPS_DEV_ALLOWED_REPO_ROOTS`, preservando restantes valores. A cópia
+  protegida do env ficou em `/etc/zeroops/zeroops.env.bak-20261115T100516Z`.
+  O mesmo SHA foi novamente publicado pelo script para carregar a configuração,
+  com drenagem e backup; health e migration confirmados.
+- No projeto Pizza Hut de QA, o cartão «Pizza Hut website» aponta agora para
+  `https://github.com/numoreira/pizzahut.git`, base `qa`, refs autorizadas
+  `qa`. O repositório e as refs públicas `qa`/`main` foram lidos; não houve
+  push ao GitHub. Produção e a sua configuração não foram tocadas.
+- A sessão CLI disponível é `numoreira_deloitte`; no novo repositório tem
+  `pull=true`, `push=false`, `admin=false`, pelo que não foi importada. A
+  verificação da UI já não acusa origem não autorizada, mas a credencial
+  cifrada anterior devolve `Repository not found` no novo URL. É necessário
+  substituí-la pela credencial da conta com escrita, inserida diretamente na
+  UI do ZeroOps; não enviar o token no chat.
+
+### Validação local
+
+- Typecheck e build (API + web): passaram; permanece o aviso preexistente de
+  bundle web acima de 500 kB.
+- Testes direcionados de desenvolvimento/entrega/capacidades/migrations:
+  19 passaram. Testes focados do provider/metadados/revogação: 9 passaram.
+- Suite web: 136 Vitest + 13 testes Node passaram.
+- ESLint direcionado aos ficheiros alterados: passou. ESLint global continua
+  com a falha preexistente `portKey` não usado em `StepConfigPanel.tsx`.
+- A criação/uso de PR com a nova credencial ainda não está validada; depende de
+  o administrador substituir a credencial antiga pela credencial com escrita
+  no cartão do repositório de QA.
+- Não houve alteração ao site Pizza Hut nem à Produção. A matriz P08/P09 e os
+  restantes critérios P11 permanecem parciais/bloqueados.
+
+## Entrega A — Integridade da execução
+
+### Implementação
+
+- **F01 — gates junto dos efeitos:** `DeliveryRunner` revalida o fluxo,
+  ticket, revisão, aprovações, candidato/testes e gate de publicação antes da
+  integração, antes do push e imediatamente antes de cada POST de publicação,
+  incluindo o retry após 404. Os bloqueios ficam registados como
+  `effect_blocked`. O gate e o efeito remoto continuam sujeitos a uma janela
+  TOCTOU curta; o endpoint e a origem Git são revalidados, mas não há transação
+  distribuída com o fornecedor.
+- **F02 — isolamento de jobs:** pool de UIDs exclusivos, home privada por job,
+  configuração e temporários separados, permissões por proprietário em
+  workspaces/worktrees, subprocessos sob UID próprio e limpeza antes de
+  reutilizar a identidade. Falhas de limpeza mantêm o UID reservado
+  (fail-closed). O pool em memória pressupõe um único executor e intervalos
+  UID não sobrepostos; a rede do host e `/sources` em leitura continuam
+  partilhados. O executor Docker/Linux e as permissões reais não foram
+  exercitados neste Windows.
+- **F03 — locks canónicos:** novas chaves derivadas do repositório + branch e
+  do recurso de publicação (`targetKey` explícito, ou endpoint + ambiente).
+  `targetKey` é configurável pela API/UI; a FIFO partilha a chave de integração
+  entre configurações distintas. Para migrar com segurança, não podem existir
+  entregas ativas detidas por versões anteriores que ainda usem chaves legadas.
+- **F04 — heartbeat/fencing:** a entrega renova lease e lock durante integração,
+  fetch e testes; erro de heartbeat ou perda de época aborta o processo e
+  impede efeitos seguintes. O `runCommand` termina também a árvore de processos
+  em Windows/Linux.
+- Acrescentados testes de regressão para revalidação/retry, isolamento entre
+  projetos no mesmo recurso, alteração do URL, concorrência/lock, perda de
+  lease e de lock, limpeza da identidade, cancelamento de processos e UI do
+  identificador de alvo.
+- Migration aditiva `sql/047_canonical_resource_locks.sql`: `integration_key`,
+  índice da fila e `target_key`; migrations anteriores não foram alteradas.
+
+### Validação local
+
+- Typecheck, ESLint e build: passaram; ESLint global deixou de ter o aviso
+  preexistente `portKey` não usado.
+- Testes já concluídos: entrega e sandbox 16/16; runners/workspaces adjacentes
+  34/34; UI de pipelines 1/1. Incluem MariaDB descartável e Git bare local;
+  o fornecedor de pipeline é simulado.
+- `npm run format:check` continua a falhar em 35 ficheiros, incluindo código e
+  documentação histórica que já estavam fora do formato. Os ficheiros
+  TypeScript/TSX de código desta entrega passaram `prettier --check`; o
+  histórico não foi reformatado para evitar alterações alheias. SQL não é
+  reconhecido pelo parser Prettier configurado.
+- Suite integral `npm test`: em execução; o resultado será atualizado antes da
+  conclusão. Build web mantém o aviso já existente de bundle acima de 500 kB.
+- Não validado: isolamento real em Linux/root/Docker, falhas sob filesystem
+  concorrente em QA, Copilot/CI reais, nem deploy desta versão. Não houve
+  migration ou alteração em QA/Produção nesta fase.
+
+### Próximos passos e limites de publicação
+
+1. Concluir a suite completa e repetir os testes focados depois dos ajustes
+   finais; rever todos os diffs e verificar a migration contra a base de testes.
+2. Criar uma branch própria a partir do histórico interno aprovado, versionar
+   só os ficheiros desta entrega e enviar uma ref explícita diferente de
+   `main`. Preservar os untracked preexistentes.
+3. Antes do deploy autorizado em QA, verificar que não existem entregas
+   ativas usando locks legados; aplicar a migration apenas no deploy controlado
+   e confirmar `VERSION`, health, executor e smoke. Produção fica fora do
+   âmbito.
+4. Documentar como limitações a janela TOCTOU, a rede ainda acessível aos jobs,
+   `/sources` partilhado em leitura, a suposição de um executor por intervalo
+   de UIDs e a ausência de validação Linux/QA desta entrega.

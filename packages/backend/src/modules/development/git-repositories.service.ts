@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import {
   gitRepositoryArchiveSchema,
+  gitRepositoryCredentialRevokeSchema,
   gitRepositoryInputSchema,
   type DevelopmentCommand,
   type GitRepositoryView,
@@ -16,6 +17,7 @@ import {
   projectPermissionContext,
   requireProjectPermission,
 } from '../identity/project-permissions.js';
+import { GitHubCliCredentialError, inspectGitHubCliCredential } from './github-cli-credential.js';
 import { GitCommandError, remoteBranchSha, repositoryUrlAllowed } from './git.js';
 
 export interface GitRepositoryRow {
@@ -29,6 +31,8 @@ export interface GitRepositoryRow {
   test_commands: unknown;
   pr_provider: 'zeroops' | 'github';
   credential_ciphertext: string | null;
+  credential_provider: 'token' | 'github_cli';
+  credential_identity: string | null;
   version: number;
   archived: boolean;
   verified_at: Date | null;
@@ -65,6 +69,8 @@ export function repositoryView(row: GitRepositoryRow): GitRepositoryView {
     testCommands: jsonValue<DevelopmentCommand[]>(row.test_commands, []),
     prProvider: row.pr_provider,
     hasCredential: Boolean(row.credential_ciphertext),
+    credentialProvider: row.credential_provider === 'github_cli' ? 'github_cli' : 'token',
+    credentialIdentity: row.credential_ciphertext ? row.credential_identity : null,
     version: Number(row.version),
     archived: Boolean(row.archived),
     verifiedAt: row.verified_at ? new Date(row.verified_at).toISOString() : null,
@@ -110,7 +116,8 @@ export interface GitRepositoriesOptions {
 
 /**
  * Recursos Git de desenvolvimento por projeto. Gerir exige `repositories.manage`; consultar basta
- * ter acesso aos fluxos (para escolher o repositório numa etapa). A credencial é só de escrita.
+ * ter acesso aos fluxos (para escolher o repositório numa etapa). A credencial fica vinculada ao
+ * repositório e só é usada por operações Git/API autorizadas.
  */
 export class GitRepositoriesService {
   constructor(
@@ -216,11 +223,16 @@ export class GitRepositoriesService {
                 input.credential,
                 repositoryCredentialContext(projectId, repositoryId),
               );
+      const credentialProvider =
+        input.credential === undefined ? current.credential_provider : 'token';
+      const credentialIdentity =
+        input.credential === undefined ? current.credential_identity : null;
       const changedTarget = current.url !== input.url || current.base_branch !== input.baseBranch;
       await client.query(
         `UPDATE project_git_repositories SET name=$3,url=$4,base_branch=$5,allowed_refs=$6,
            setup_commands=$7,test_commands=$8,pr_provider=$9,credential_ciphertext=$10,
-           version=version+1,updated_by=$11,updated_at=NOW(3)
+           credential_provider=$11,credential_identity=$12,
+           version=version+1,updated_by=$13,updated_at=NOW(3)
            ${changedTarget || input.credential !== undefined ? ',verified_at=NULL,verified_base_sha=NULL,verification_error=NULL' : ''}
          WHERE id=$1 AND project_id=$2`,
         [
@@ -234,6 +246,8 @@ export class GitRepositoriesService {
           JSON.stringify(input.testCommands),
           input.prProvider,
           credential,
+          credentialProvider,
+          credentialIdentity,
           context.actor.id,
         ],
       );
@@ -273,7 +287,39 @@ export class GitRepositoriesService {
     });
   }
 
-  /** Valida o acesso (ls-remote) e fixa o SHA atual da branch base. */
+  /** Remove a cópia cifrada da credencial sem revogar a sessão correspondente no GitHub. */
+  async revokeCredential(actor: User, projectId: string, repositoryId: string, raw: unknown) {
+    const input = parseInput(gitRepositoryCredentialRevokeSchema, raw);
+    return this.db.transaction(async (client) => {
+      const context = await requireProjectPermission(
+        client,
+        actor,
+        projectId,
+        'repositories.manage',
+        true,
+      );
+      const current = await this.locked(client, projectId, repositoryId);
+      if (input.expectedVersion !== Number(current.version))
+        throw new DomainError(
+          'VERSION_CONFLICT',
+          'O repositório foi alterado entretanto. Recarregue antes de remover a credencial.',
+          409,
+        );
+      await client.query(
+        `UPDATE project_git_repositories SET credential_ciphertext=NULL,credential_provider='token',
+           credential_identity=NULL,verified_at=NULL,verified_base_sha=NULL,verification_error=NULL,
+           version=version+1,updated_by=$3,updated_at=NOW(3) WHERE id=$1 AND project_id=$2`,
+        [repositoryId, projectId, context.actor.id],
+      );
+      await this.audit(client, context.actor.id, 'git_repository.credential_revoked', {
+        projectId,
+        repositoryId,
+      });
+      return this.view(client, projectId, repositoryId);
+    });
+  }
+
+  /** Valida a credencial e o acesso GitHub (quando aplicável) e fixa o SHA da branch base. */
   async verify(actor: User, projectId: string, repositoryId: string) {
     const row = await this.db.transaction(async (client) => {
       await requireProjectPermission(client, actor, projectId, 'repositories.manage');
@@ -282,28 +328,33 @@ export class GitRepositoriesService {
     this.assertAllowed(row.url);
     let sha: string | null = null;
     let error: string | null = null;
+    let credentialIdentity = row.credential_identity;
     try {
-      sha = await (this.options.probe ?? defaultProbe)(
-        row.url,
-        row.base_branch,
-        row.credential_ciphertext
-          ? this.cipher.decrypt(
-              row.credential_ciphertext,
-              repositoryCredentialContext(projectId, repositoryId),
-            )
-          : null,
-      );
+      const credential = row.credential_ciphertext
+        ? this.cipher.decrypt(
+            row.credential_ciphertext,
+            repositoryCredentialContext(projectId, repositoryId),
+          )
+        : null;
+      if (row.credential_provider === 'github_cli') {
+        if (!credential) throw new Error('GitHub CLI credential is missing; authenticate again.');
+        credentialIdentity = (await inspectGitHubCliCredential(row.url, credential)).login;
+      }
+      sha = await (this.options.probe ?? defaultProbe)(row.url, row.base_branch, credential);
       if (!sha) error = `A branch base ${row.base_branch} não existe no repositório.`;
     } catch (failure) {
       error =
         failure instanceof GitCommandError
           ? failure.message
-          : 'Não foi possível contactar o repositório.';
+          : failure instanceof GitHubCliCredentialError
+            ? failure.message
+            : 'Não foi possível contactar o repositório.';
     }
     await this.db.query(
       `UPDATE project_git_repositories SET verified_at=${sha ? 'NOW(3)' : 'NULL'},
-         verified_base_sha=$3,verification_error=$4 WHERE id=$1 AND project_id=$2`,
-      [repositoryId, projectId, sha, error ? error.slice(0, 500) : null],
+         verified_base_sha=$3,verification_error=$4,credential_identity=$5
+         WHERE id=$1 AND project_id=$2`,
+      [repositoryId, projectId, sha, error ? error.slice(0, 500) : null, credentialIdentity],
     );
     return this.view(this.db, projectId, repositoryId);
   }

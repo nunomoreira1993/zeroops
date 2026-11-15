@@ -30,6 +30,8 @@ export interface GitRunOptions {
   timeoutMs?: number;
   env?: Record<string, string>;
   maxBuffer?: number;
+  /** F04: aborta o processo Git (p.ex. posse da entrega perdida). */
+  signal?: AbortSignal;
 }
 
 const SAFE_ENV = ['PATH', 'HOME', 'LANG', 'TZ', 'SYSTEMROOT', 'TEMP', 'TMP'];
@@ -69,6 +71,9 @@ export function gitEnvironment(options: Pick<GitRunOptions, 'credential' | 'env'
     ['protocol.file.allow', 'always'],
     ['core.autocrlf', 'false'],
     ['commit.gpgsign', 'false'],
+    // F02: conteúdo do repositório/worktree nunca executa código no contexto do executor.
+    ['core.fsmonitor', 'false'],
+    ['core.hooksPath', '/dev/null'],
   ];
   if (options.credential)
     extra.push([
@@ -112,11 +117,13 @@ export function runGit(args: string[], options: GitRunOptions = {}): Promise<Git
         timeout: options.timeoutMs ?? 120_000,
         maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
         windowsHide: true,
+        ...(options.signal ? { signal: options.signal, killSignal: 'SIGKILL' as const } : {}),
       },
       (error, stdout, stderr) => {
         const err = redactGit(String(stderr), options.credential).slice(0, 4000);
         if (!error) return resolve({ stdout: String(stdout), stderr: err });
-        const killed = (error as { killed?: boolean }).killed === true;
+        const killed =
+          (error as { killed?: boolean }).killed === true || error.name === 'AbortError';
         const code = typeof error.code === 'number' ? error.code : null;
         reject(
           new GitCommandError(

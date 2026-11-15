@@ -14,6 +14,12 @@ import type { AgentCommand } from './agent-commands.js';
 import type { CopilotAgent } from './copilot.adapter.js';
 import type { AgentRunConversation } from './run-conversation.js';
 import { investigationPrompt } from './investigation-prompt.js';
+import {
+  JobIdentityExhausted,
+  ownerOf,
+  type JobIdentity,
+  type JobIdentitySource,
+} from './job-sandbox.js';
 import { FusionUnavailableError } from './copilot-sdk.adapter.js';
 import { unifiedDiff } from './unified-diff.js';
 import {
@@ -73,6 +79,8 @@ export interface InvestigationRunnerOptions {
   copilotCredentials?: (projectId: string) => Promise<{ token: string; model?: string } | null>;
   /** Dono do workspace quando o Copilot corre com outro uid. */
   workspaceOwner?: { uid: number; gid: number };
+  /** F02: identidade exclusiva por job (pool de uids); sem pool usa `workspaceOwner`. */
+  identities?: JobIdentitySource;
   /** Conversa ao vivo do run (streaming, perguntas e mensagens da equipa). */
   conversation?: (runId: string, lease: JobLease) => AgentRunConversation;
   /** P08: desenvolvimento em checkout Git isolado (runs com `developmentWorkspaceId`). */
@@ -94,8 +102,23 @@ export class InvestigationRunner {
    */
   async runOnce(shutdown?: AbortSignal): Promise<boolean> {
     if (shutdown?.aborted) return false;
-    const context = await this.queue.claimNext();
-    if (!context) return false;
+    // F02: a identidade é obtida antes de reclamar o run (sem uid livre o run fica na fila).
+    let identity: JobIdentity | null;
+    try {
+      identity = (await this.options.identities?.acquire()) ?? null;
+    } catch (error) {
+      if (error instanceof JobIdentityExhausted) return false;
+      throw error;
+    }
+    const context = await this.queue.claimNext().catch(async (error: unknown) => {
+      await identity?.release();
+      throw error;
+    });
+    if (!context) {
+      await identity?.release();
+      return false;
+    }
+    const owner = identity ? ownerOf(identity) : this.options.workspaceOwner;
     const { runId, lease } = context;
     const workspace = await mkdtemp(join(this.options.workspaceRoot, 'run-'));
     const abort = new AbortController();
@@ -145,8 +168,7 @@ export class InvestigationRunner {
         failureCode = 'copilot_not_configured';
         throw new Error('Integração Copilot não verificada para o projeto.');
       }
-      if (this.options.workspaceOwner)
-        await chown(workspace, this.options.workspaceOwner.uid, this.options.workspaceOwner.gid);
+      if (owner) await chown(workspace, owner.uid, owner.gid);
       const connectors = this.options.connectors;
       const discovered = connectors ? await connectors.discover(context.connectorToken) : [];
       const allowedTools = context.allowedTools;
@@ -179,13 +201,13 @@ export class InvestigationRunner {
           throw new Error('Executor sem workspaces Git configurados.');
         }
         await this.queue.reportProgress(lease, 'A preparar o checkout Git isolado');
-        development = await this.options.development.prepare(runId, lease);
+        development = await this.options.development.prepare(runId, lease, owner);
       }
       if (context.capabilities) {
         const materialized = await materializeCapabilities(
           this.options.workspaceRoot,
           context.capabilities,
-          this.options.workspaceOwner,
+          owner,
         ).catch((error: unknown) => {
           if (error instanceof CapabilityIntegrityError) failureCode = 'capability_integrity';
           throw error;
@@ -219,6 +241,7 @@ export class InvestigationRunner {
         ...(compiled ? { capabilities: compiled } : {}),
         signal: abort.signal,
         isActive,
+        ...(identity ? { identity } : {}),
         ...(development
           ? {
               gitWorkspace: true,
@@ -332,6 +355,14 @@ export class InvestigationRunner {
         ?.release(development, lease, developmentFailed)
         .catch(() => undefined);
       await rm(workspace, { recursive: true, force: true });
+      // Termina processos que o job tenha deixado e apaga a home/temporários do uid.
+      await identity?.release().catch((error: unknown) =>
+        this.log({
+          event: 'agent.identity_release_failed',
+          runId,
+          message: error instanceof Error ? error.message.slice(0, 300) : undefined,
+        }),
+      );
     }
     return true;
   }

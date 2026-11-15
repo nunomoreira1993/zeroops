@@ -229,13 +229,14 @@ export class CopilotSdkAdapter implements CopilotAgent {
     }));
     const runEnv = input.env ?? {};
     const redact = createRedactor(Object.values(runEnv));
-    const identityEnv: Record<string, string> = this.options.identity
+    const identity = input.identity ?? this.options.identity;
+    const identityEnv: Record<string, string> = identity
       ? {
-          ZEROOPS_AGENT_UID: String(this.options.identity.uid),
-          ZEROOPS_AGENT_GID: String(this.options.identity.gid),
+          ZEROOPS_AGENT_UID: String(identity.uid),
+          ZEROOPS_AGENT_GID: String(identity.gid),
         }
       : {};
-    const env = agentEnvironment(this.options.baseEnv ?? process.env, this.options.identity, {
+    const env = agentEnvironment(this.options.baseEnv ?? process.env, identity, {
       ...runEnv,
       ...identityEnv,
     });

@@ -51,6 +51,8 @@ BD: `mysql --defaults-file=/root/.zeroops/zeroops-mysql.cnf zeroops`. A tabela d
 4. **Repositórios Git** (`repositories.manage`): URL dentro de `ZEROOPS_DEV_ALLOWED_REPO_ROOTS`,
    branch base, refs autorizadas, comandos de teste e «Verificar». Um URL fora das raízes devolve
    `INVALID_INPUT`. — _Ensaiado em QA_ (sandbox).
+   Para importar uma sessão GitHub CLI sem copiar o token, ver
+   [Credenciais GitHub CLI](github-cli-credentials.md).
 5. **Pipelines de entrega** (`repositories.manage`): endpoint dentro de
    `ZEROOPS_PIPELINE_ALLOWED_ORIGINS`, repositório, branch, ambiente e segredo de assinatura. O
    segredo não volta a ser mostrado. — _Ensaiado em QA_ com o fornecedor falso e o operador de

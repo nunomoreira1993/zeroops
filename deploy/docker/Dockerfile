@@ -21,9 +21,9 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/apps/web/dist ./apps/web/dist
 COPY --from=build /app/sql ./sql
-# P08: git para verificar repositorios (API) e para os workspaces de desenvolvimento (executor).
+# P08: Git remoto (API/workspaces) com certificados CA para validação TLS.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git \
+  && apt-get install -y --no-install-recommends git ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 # Fila em disco dos alertas (volume nomeado herda o dono node na primeira montagem).
 RUN mkdir -p /var/lib/zeroops/alert-spool /var/lib/zeroops/prometheus-rules \
@@ -43,10 +43,7 @@ ARG COPILOT_CLI_VERSION=1.0.108
 # O pacote do Copilot e extraido no build: o tmpfs e noexec e nao deve gastar RAM com ~260 MB.
 ENV COPILOT_CACHE_HOME=/opt/copilot-cache
 ENV ZEROOPS_COPILOT_CLI_PATH=/usr/local/bin/zo-copilot-agent
-# O runtime nativo do Copilot valida TLS pela trust store do sistema (a imagem slim nao a traz).
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+# O runtime nativo do Copilot usa a trust store instalada na imagem runtime.
 RUN npm install -g --no-audit --no-fund "@github/copilot@${COPILOT_CLI_VERSION}" \
   && npm cache clean --force \
   && HOME=/tmp copilot --version \

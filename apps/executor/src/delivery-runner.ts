@@ -16,10 +16,6 @@ import {
   pipelineCallbackUrl,
   pipelineEndpointAllowed,
 } from '../../../packages/backend/src/modules/delivery/pipelines.service.js';
-import {
-  environmentLockKey,
-  integrationLockKey,
-} from '../../../packages/backend/src/database/resource-locks.js';
 import { jsonValue } from '../../../packages/backend/src/modules/development/git-repositories.service.js';
 import {
   GitCommandError,
@@ -27,6 +23,7 @@ import {
   runGit,
 } from '../../../packages/backend/src/modules/development/git.js';
 import type { AttemptCheckout, WorkspaceManager } from './workspace-manager.js';
+import { ownerOf, type JobIdentitySource } from './job-sandbox.js';
 
 /** Resposta HTTP do fornecedor (corpo já lido). `null` = sem resposta (rede/timeout). */
 export interface PipelineResponse {
@@ -81,6 +78,10 @@ export interface DeliveryRunnerOptions {
   maxReconcileAttempts?: number;
   integrationLockSeconds?: number;
   environmentLockSeconds?: number;
+  /** F04: intervalo de renovação do lease/locks durante operações longas (omissão: lease/4). */
+  heartbeatMs?: number;
+  /** F02: uid exclusivo para os comandos do repositório na revalidação da combinação. */
+  identities?: JobIdentitySource;
   log?: (event: Record<string, unknown>) => void;
 }
 
@@ -116,6 +117,7 @@ export class DeliveryRunner {
   private readonly maxReconcileAttempts: number;
   private readonly integrationLockSeconds: number;
   private readonly environmentLockSeconds: number;
+  private readonly heartbeatMs: number;
 
   constructor(
     private readonly store: DeliveryStore,
@@ -129,6 +131,7 @@ export class DeliveryRunner {
     this.maxReconcileAttempts = options.maxReconcileAttempts ?? 120;
     this.integrationLockSeconds = options.integrationLockSeconds ?? 1800;
     this.environmentLockSeconds = options.environmentLockSeconds ?? 6 * 3600;
+    this.heartbeatMs = options.heartbeatMs ?? Math.max(1000, (this.leaseSeconds * 1000) / 4);
   }
 
   /** Processa uma entrega elegível; devolve `false` quando a fila está vazia. */
@@ -192,32 +195,114 @@ export class DeliveryRunner {
     return null;
   }
 
+  /**
+   * F01: todos os gates (etapa ativa, ticket, review, aprovações, candidato, testes, autorização
+   * de publicação de capacidade) são reavaliados imediatamente antes de cada efeito externo.
+   * Devolve `undefined` quando o efeito pode prosseguir; caso contrário termina a entrega.
+   */
+  private async effectGate(
+    job: DeliveryJob,
+    from: DeliveryState[],
+    effect: string,
+  ): Promise<null | undefined> {
+    const gates = await this.store.revalidate(job.lease);
+    accepted(gates);
+    if (gates === 'stale') return null;
+    if (gates.ok) return undefined;
+    await this.store.recordRunnerEvent(job.lease, 'effect_blocked', {
+      effect,
+      reason: gates.reason,
+    });
+    return this.block(
+      job,
+      from,
+      'cancelled' in gates ? 'cancelled' : gates.rework ? 'rework' : 'blocked',
+      gates.reason,
+    );
+  }
+
   private async integrate(job: DeliveryJob): Promise<number | null> {
     const { delivery, lease } = job;
     const from: DeliveryState[] = ['queued', 'integrating'];
     if (!job.repository || job.pipeline.archived)
       return this.block(job, from, 'blocked', 'O repositório ou a pipeline foram arquivados.');
-    const gates = await this.store.revalidate(lease);
-    accepted(gates);
-    if (gates === 'stale') return null;
-    if (!gates.ok)
+    const initial = await this.effectGate(job, from, 'integrate');
+    if (initial !== undefined) return initial;
+    const integrationKey = job.locks.integration!;
+    // F03: a configuração do repositório passou a apontar para outro recurso real.
+    if (delivery.integration_key && delivery.integration_key !== integrationKey)
       return this.block(
         job,
         from,
-        'cancelled' in gates ? 'cancelled' : gates.rework ? 'rework' : 'blocked',
-        gates.reason,
+        'blocked',
+        'O repositório de destino da entrega mudou depois de a entrega ser criada.',
       );
-    const lock = await this.store.acquireLock(
-      lease,
-      integrationLockKey(delivery.repository_id, delivery.target_branch),
-      this.integrationLockSeconds,
-    );
+    const lock = await this.store.acquireLock(lease, integrationKey, this.integrationLockSeconds);
     accepted(lock);
     if (lock === 'stale') return null;
     if (!lock.acquired) return 15;
+    return this.guarded(
+      job,
+      [{ key: integrationKey, epoch: lock.epoch, ttl: this.integrationLockSeconds }],
+      (signal) => this.integrateLocked(job, integrationKey, signal),
+    );
+  }
+
+  /**
+   * F04: mantém o lease e os locks vivos durante operações longas. Se a posse ou um lock forem
+   * perdidos, aborta os processos em curso e a tentativa termina sem novos efeitos.
+   */
+  private async guarded<T>(
+    job: DeliveryJob,
+    locks: { key: string; epoch: number; ttl: number }[],
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    let beating: Promise<void> | null = null;
+    const beat = async () => {
+      try {
+        if ((await this.store.heartbeat(job.lease, this.leaseSeconds)) === 'stale')
+          return controller.abort();
+        for (const lock of locks)
+          if ((await this.store.renewLock(job.lease, lock.key, lock.epoch, lock.ttl)) !== true)
+            return controller.abort();
+      } catch (error) {
+        this.options.log?.({
+          event: 'delivery.heartbeat_failed',
+          deliveryId: job.delivery.id,
+          message: message(error).slice(0, 300),
+        });
+        controller.abort();
+      }
+    };
+    const timer = setInterval(() => {
+      beating ??= beat().finally(() => {
+        beating = null;
+      });
+    }, this.heartbeatMs);
+    try {
+      const result = await operation(controller.signal);
+      if (controller.signal.aborted) throw new DeliveryStale();
+      return result;
+    } catch (error) {
+      if (controller.signal.aborted) throw new DeliveryStale();
+      throw error;
+    } finally {
+      clearInterval(timer);
+      await beating;
+    }
+  }
+
+  private async integrateLocked(
+    job: DeliveryJob,
+    integrationKey: string,
+    signal: AbortSignal,
+  ): Promise<number | null> {
+    const { delivery, lease } = job;
+    const from: DeliveryState[] = ['queued', 'integrating'];
     accepted(await this.store.update(lease, from, { state: 'integrating', state_reason: null }));
-    const { url, credential } = job.repository;
-    const options = { credential };
+    const { url, credential } = job.repository!;
+    const options = { credential, signal };
 
     // Intenção anterior (push com resultado incerto): o remoto decide se já foi integrado.
     if (delivery.integrated_sha) {
@@ -229,8 +314,9 @@ export class DeliveryRunner {
           url,
           baseBranch: delivery.target_branch,
           credential,
+          signal,
         });
-        return this.integrated(job, gitDir, delivery.integrated_sha);
+        return this.integrated(job, gitDir, delivery.integrated_sha, integrationKey);
       }
       accepted(
         await this.store.update(lease, ['integrating'], {
@@ -254,6 +340,7 @@ export class DeliveryRunner {
         url,
         baseBranch: delivery.target_branch,
         credential,
+        signal,
       });
       gitDir = fetched.gitDir;
       top = fetched.remoteBaseSha;
@@ -264,6 +351,7 @@ export class DeliveryRunner {
           url,
           baseBranch: job.workspace.branch,
           credential,
+          signal,
         });
     } catch (error) {
       if (error instanceof GitCommandError && error.uncertain) return 60;
@@ -295,11 +383,21 @@ export class DeliveryRunner {
     let integrated = head;
     let evidence: Record<string, unknown> = { targetSha: top, mode: 'fast-forward' };
     if (!fastForward) {
-      const checkout = await this.manager.checkout(
-        gitDir,
-        `deliver-${delivery.id.slice(0, 8)}-${lease.epoch}`,
-        top,
-      );
+      // F02: os comandos do repositório correm com um uid exclusivo desta entrega.
+      const identity = (await this.options.identities?.acquire()) ?? null;
+      const owner = ownerOf(identity);
+      let checkout: AttemptCheckout;
+      try {
+        checkout = await this.manager.checkout(
+          gitDir,
+          `deliver-${delivery.id.slice(0, 8)}-${lease.epoch}`,
+          top,
+          ...(owner ? [owner] : []),
+        );
+      } catch (error) {
+        await identity?.release();
+        throw error;
+      }
       try {
         if (alreadyIn) {
           integrated = top;
@@ -336,12 +434,13 @@ export class DeliveryRunner {
           evidence = { targetSha: top, mode: 'merge', mergeSha: merged.sha };
         }
         // Checks isolados não comprovam a combinação: os testes voltam a correr sobre ela.
-        const revalidation = await this.revalidateCombination(job, checkout, integrated);
+        const revalidation = await this.revalidateCombination(job, checkout, integrated, signal);
         if (!revalidation.ok)
           return this.block(job, ['integrating'], revalidation.state, revalidation.reason);
         evidence = { ...evidence, revalidation: revalidation.evidence };
       } finally {
         await this.manager.removeCheckout(checkout);
+        await identity?.release();
       }
     }
 
@@ -356,7 +455,9 @@ export class DeliveryRunner {
     );
     if (integrated !== top) {
       accepted(await this.store.heartbeat(lease, this.leaseSeconds));
-      const pushed = await this.push(job, gitDir, top, integrated);
+      const beforePush = await this.effectGate(job, ['integrating'], 'push');
+      if (beforePush !== undefined) return beforePush;
+      const pushed = await this.push(job, gitDir, top, integrated, signal);
       if (pushed === 'moved') {
         accepted(
           await this.store.update(lease, ['integrating'], {
@@ -367,18 +468,20 @@ export class DeliveryRunner {
             revalidated: false,
           }),
         );
-        await this.store.releaseLock(
-          delivery.id,
-          integrationLockKey(delivery.repository_id, delivery.target_branch),
-        );
+        await this.store.releaseLock(delivery.id, integrationKey);
         return 0;
       }
       if (pushed === 'uncertain') return 60;
     }
-    return this.integrated(job, gitDir, integrated);
+    return this.integrated(job, gitDir, integrated, integrationKey);
   }
 
-  private async integrated(job: DeliveryJob, gitDir: string, integrated: string) {
+  private async integrated(
+    job: DeliveryJob,
+    gitDir: string,
+    integrated: string,
+    integrationKey: string,
+  ) {
     const { delivery, lease } = job;
     const digest = await this.manager.archiveDigest(gitDir, integrated);
     accepted(
@@ -389,10 +492,7 @@ export class DeliveryRunner {
         artifact_digest: digest,
       }),
     );
-    await this.store.releaseLock(
-      delivery.id,
-      integrationLockKey(delivery.repository_id, delivery.target_branch),
-    );
+    await this.store.releaseLock(delivery.id, integrationKey);
     this.options.log?.({ event: 'delivery.integrated', deliveryId: delivery.id, sha: integrated });
     return 0;
   }
@@ -401,6 +501,7 @@ export class DeliveryRunner {
     job: DeliveryJob,
     checkout: AttemptCheckout,
     sha: string,
+    signal: AbortSignal,
   ): Promise<
     | { ok: true; evidence: Record<string, unknown> }
     | { ok: false; state: DeliveryState; reason: string }
@@ -412,8 +513,7 @@ export class DeliveryRunner {
         state: 'blocked',
         reason: 'O repositório não tem comandos de teste: a combinação não pode ser revalidada.',
       };
-    if (sha !== checkout.startSha)
-      await runGit(['checkout', '--detach', '--quiet', sha], { cwd: checkout.path });
+    if (sha !== checkout.startSha) await this.manager.detach(checkout, sha);
     const commands: Record<string, unknown>[] = [];
     for (const [kind, list] of [
       ['setup', repository.setupCommands],
@@ -421,7 +521,8 @@ export class DeliveryRunner {
     ] as const) {
       for (const command of list) {
         accepted(await this.store.heartbeat(job.lease, this.leaseSeconds));
-        const result = await this.manager.runConfigured(checkout, command);
+        const result = await this.manager.runConfigured(checkout, command, signal);
+        if (result.aborted || signal.aborted) throw new DeliveryStale();
         commands.push({
           kind,
           name: command.name,
@@ -450,15 +551,18 @@ export class DeliveryRunner {
     gitDir: string,
     top: string,
     integrated: string,
+    signal: AbortSignal,
   ): Promise<'pushed' | 'moved' | 'uncertain'> {
     const { url, credential } = job.repository!;
     const branch = job.delivery.target_branch;
+    if (signal.aborted) throw new DeliveryStale();
     try {
       await runGit(
         ['--git-dir', gitDir, 'push', '--quiet', url, `${integrated}:refs/heads/${branch}`],
         {
           credential,
           timeoutMs: 300_000,
+          signal,
         },
       );
       await this.store.recordRunnerEvent(job.lease, 'pushed', { sha: integrated, branch });
@@ -515,7 +619,7 @@ export class DeliveryRunner {
       return this.block(job, from, 'failed', 'Entrega sem SHA/artefacto integrado.');
     const lock = await this.store.acquireLock(
       lease,
-      environmentLockKey(delivery.pipeline_id, delivery.environment),
+      job.locks.environment,
       this.environmentLockSeconds,
     );
     accepted(lock);
@@ -529,12 +633,9 @@ export class DeliveryRunner {
       return 30;
     }
     accepted(await this.store.heartbeat(lease, this.leaseSeconds));
-    if (delivery.state === 'starting') {
-      const publish = await this.store.publishGate(lease);
-      accepted(publish);
-      if (publish !== 'stale' && !publish.ok)
-        return this.block(job, from, 'blocked', publish.reason);
-    }
+    // F01: também no retry após 404 (estado `uncertain`) — cada POST é um novo efeito externo.
+    const beforeStart = await this.effectGate(job, from, 'start');
+    if (beforeStart !== undefined) return beforeStart;
     const response = await this.call(job, 'POST', '/deliveries', {
       deliveryId: delivery.id,
       idempotencyKey: delivery.idempotency_key,

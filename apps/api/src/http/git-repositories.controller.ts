@@ -44,6 +44,16 @@ export class GitRepositoriesController {
     return this.repositories.archive(req.identity, projectId, id, raw);
   }
 
+  @Post(':id/credential/revoke')
+  revokeCredential(
+    @Req() req: AuthenticatedRequest,
+    @Param('projectId') projectId: string,
+    @Param('id') id: string,
+    @Body() raw: unknown,
+  ) {
+    return this.repositories.revokeCredential(req.identity, projectId, id, raw);
+  }
+
   @Post(':id/verify')
   verify(
     @Req() req: AuthenticatedRequest,

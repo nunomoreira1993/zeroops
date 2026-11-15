@@ -1,5 +1,8 @@
 import { spawn } from 'node:child_process';
+import { posix } from 'node:path';
 import type { SandboxProcess } from './copilot.adapter.js';
+
+const { join } = posix;
 
 /** Variáveis herdadas pelo Copilot; tudo o resto (incl. credenciais da BD ZeroOps) fica de fora. */
 const INHERITED_ENV = [
@@ -26,6 +29,11 @@ export interface AgentIdentity {
   uid: number;
   gid: number;
   home: string;
+  /**
+   * F02: home exclusiva do job. O estado do Copilot, a configuração e os temporários ficam dentro
+   * dela em vez dos diretórios partilhados herdados do executor.
+   */
+  private?: boolean;
 }
 
 /** Ambiente do processo do agente: só a allowlist herdada, o HOME do agente e as variáveis do run. */
@@ -39,6 +47,13 @@ export function agentEnvironment(
       INHERITED_ENV.flatMap((name) => (baseEnv[name] ? [[name, baseEnv[name]]] : [])),
     ),
     ...(identity ? { HOME: identity.home } : {}),
+    ...(identity?.private
+      ? {
+          COPILOT_HOME: join(identity.home, '.copilot'),
+          XDG_CONFIG_HOME: join(identity.home, '.config'),
+          TMPDIR: join(identity.home, 'tmp'),
+        }
+      : {}),
     ...extra,
   };
 }
@@ -56,14 +71,15 @@ export class CopilotProcess implements SandboxProcess {
   ) {}
 
   run(input: Parameters<SandboxProcess['run']>[0]) {
-    const env = agentEnvironment(this.baseEnv, this.identity, input.env);
+    const identity = input.identity ?? this.identity;
+    const env = agentEnvironment(this.baseEnv, identity, input.env);
     return new Promise<{ exitCode: number; interrupted: boolean }>((done, reject) => {
       const child = spawn(this.command, input.arguments, {
         cwd: input.workspace,
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
-        ...(this.identity ? { uid: this.identity.uid, gid: this.identity.gid } : {}),
+        ...(identity ? { uid: identity.uid, gid: identity.gid } : {}),
       });
       let bytes = 0;
       let interrupted = false;

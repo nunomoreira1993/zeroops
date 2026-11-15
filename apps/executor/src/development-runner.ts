@@ -19,7 +19,12 @@ import {
 } from '../../../packages/contracts/src/index.js';
 import type { AgentTool } from './copilot.adapter.js';
 import { PullRequestError, type PullRequestProvider } from './pr-providers.js';
-import type { AttemptCheckout, CommandResult, WorkspaceManager } from './workspace-manager.js';
+import type {
+  AttemptCheckout,
+  CommandResult,
+  WorkspaceManager,
+  WorkspaceOwner,
+} from './workspace-manager.js';
 
 /** Operações persistentes do desenvolvimento usadas pelo executor (fencing no backend). */
 export interface DevelopmentPort {
@@ -96,7 +101,11 @@ export class DevelopmentRunner {
     } = {},
   ) {}
 
-  async prepare(runId: string, lease: JobLease): Promise<PreparedDevelopment> {
+  async prepare(
+    runId: string,
+    lease: JobLease,
+    owner?: WorkspaceOwner,
+  ): Promise<PreparedDevelopment> {
     const context = await this.store.claimWorkspace(lease);
     if (context === 'stale') throw new DevelopmentStale();
     if (context === 'unavailable')
@@ -131,6 +140,7 @@ export class DevelopmentRunner {
       fetched.gitDir,
       `${runId.slice(0, 8)}-${lease.epoch}`,
       previousHead ?? baseSha,
+      ...(owner ? [owner] : []),
     );
     for (const command of repository.setupCommands) {
       const result = await this.manager.runConfigured(checkout, command);
@@ -220,8 +230,9 @@ export class DevelopmentRunner {
     if (headSha === baseSha)
       throw new DevelopmentFailure('development_no_changes', 'O desenvolvimento não alterou nada.');
     if (!isActive()) throw new DevelopmentStale();
-    const tree = (await runGit(['--git-dir', checkout.gitDir, 'rev-parse', `${headSha}^{tree}`]))
-      .stdout.trim();
+    const tree = (
+      await runGit(['--git-dir', checkout.gitDir, 'rev-parse', `${headSha}^{tree}`])
+    ).stdout.trim();
     const tests: { command: string; exitCode: number; evidenceHash: string; testedSha: string }[] =
       [];
     let testsPassed = true;
@@ -410,7 +421,14 @@ export class DevelopmentRunner {
     }
     try {
       await runGit(
-        ['--git-dir', gitDir, 'push', '--quiet', repository.url, `${headSha}:refs/heads/${workspace.branch}`],
+        [
+          '--git-dir',
+          gitDir,
+          'push',
+          '--quiet',
+          repository.url,
+          `${headSha}:refs/heads/${workspace.branch}`,
+        ],
         { ...options, timeoutMs: 300_000 },
       );
       return { state: 'published' };
