@@ -2884,3 +2884,115 @@ Produção.
   terá de ser ajustado explicitamente para a entrega de limpeza.
 - Produção permanece fora do âmbito. Os intervalos de UID sobrepostos entre
   executores continuam não certificados.
+
+### Publicação e smoke do runtime confirmados
+
+- Commits enviados para o remoto interno `qa`, branch
+  `feat/entrega-a-integridade-execucao`: correção central `2ab3e0d` e pipeline
+  restrita `843a56116425f9dcc9efe15ece41f6da97e8c227`. Ambos os pushes foram
+  confirmados por `ls-remote`; o hook recebeu a feature sem publicar.
+- Deploy único do SHA `843a561…` em `uqphorders24-dev:/opt/zeroops/src`, pelo
+  `deploy-from-git.sh` desse commit. A exportação anterior foi comparada com o
+  archive Git antes da troca. Drenagem com 0 jobs; `DEPLOY_EXIT=0`.
+- Backup BD:
+  `/var/backups/zeroops/zeroops-20261115T182530-g843a56116425.sql.gz`,
+  `gzip -t` passou, SHA-256
+  `4dece04066b9ea536e4c1f19cfcbef0491916b7212fb383dc7a9fcb713244dce`.
+  A configuração privada anterior ficou em
+  `/var/backups/zeroops/zeroops-env-before-site-20261115T182239Z`, root/0600.
+  Só se acrescentou a origem loopback `http://127.0.0.1:4321` à allowlist.
+- `VERSION` e `/api/health` confirmam `843a561…`, API `ready`. A última migration
+  continua `048_delivery_config_fingerprint.sql`; não houve migration nova.
+  Executor mantém UIDs 61000–61063.
+- Smoke pela imagem exata publicada, com limites de CPU/memória, MariaDB real e
+  BD descartável `zeroops_test_p09_24040aa7`: com o Node -60/+60 s, uma etapa
+  futura não corre cedo e uma etapa acordada por `NOW(3)` termina no mesmo tick.
+  Outbox automática com ator null foi aceite; ator inválido bloqueado. Só SMTP
+  foi simulado. A BD e os dois utilizadores temporários foram removidos.
+  Nenhum ticket do cliente, Git remoto ou publicação real foi exercitado nesse
+  smoke.
+- F01–F04 mantêm as evidências anteriores; o bloqueio P09 está corrigido e
+  demonstrado no runtime publicado. A suite global continua com a dívida
+  arquitetural/formatação explicitada acima: não se declara `npm run validate`
+  global aprovado nem prontidão para Produção.
+
+### Pipeline instalada; bloqueio humano comprovado
+
+- Serviço independente `site-qa-operator.service` instalado e ativo, só em
+  `127.0.0.1:4321`; health `ok`, fila 0; POST sem assinatura → **401**.
+  Segredo HMAC e CA específica root/0600. A confiança TLS foi limitada ao
+  certificado cujo fingerprint foi verificado por SSH; não se desativou TLS nem
+  se instalou uma CA global no desktop.
+- A primeira seed falhou legitimamente com `detected dubious ownership`.
+  Corrigiu-se o installer: o utilizador do site cria um bundle, que é importado
+  pelo bare privado. Não se adicionou `safe.directory` global nem se leu
+  configuração de outro utilizador como root. `git -C` fixa um cwd acessível ao
+  UID do site; o ensaio confirmou zero avisos de atributos.
+- A correção do installer fica versionada separadamente; não altera o código TS
+  ou os módulos Python ativos de `843a561`, pelo que não exige outro rollout da
+  API. A sua sintaxe e a seed/importação reais foram verificadas.
+- Leitura real do GitHub pelo fornecedor instalado passou, usando a credencial
+  cifrada do binding através da API/pipe privado e helper restrito ao URL exato.
+  `qa` remoto e webroot continuam em
+  `2c38b0f581dfa7e9dc6b31b39219377b93b54b3f`. Não se fez push Git do site,
+  merge do PR nem teste novo de escrita na API de PRs.
+- Pipeline criada pelos serviços/auditoria existentes:
+  `235302c4-99d2-40e2-b307-ea6af448bc8d`, «Pizza Hut QA validacao restrita»,
+  repositório `7bbf20fa…` (`numoreira/pizzahut`), `qa`/`quality`,
+  `allowIntegration:true`, `holdPolicy:until_flow_end`,
+  `targetKey:site:uqphorders24-dev:64768:2359308`.
+- Rascunho novo `a446cb39-cbfb-4543-8643-de65142fa72f`, versão 3, preparado com
+  desenvolvimento/testes → review independente → entrega → mensagem → fim;
+  falhas encaminham para intervenção. Não foi ativado, não alterou encaminhamento
+  em serviço e não foi criado ticket novo.
+- **Bloqueio comprovado:** «Revisor P08 (teste)» (`c405e6db…`) é ativo e tem
+  papel QA distinto do autor, mas possui `unusable-test-hash` e não tem MFA.
+  Não é uma conta com a qual um humano consiga autenticar-se. Não se fabricou
+  uma sessão/review, nem se redefiniram credenciais para aparentar aprovação.
+- ZO-38 mantém exatamente `flow_id`, `version_id`, `status` e `current_step_id`
+  anteriores. A versão original continua sem pipeline e só com o autor como
+  revisor: não pode ser aprovada legitimamente.
+
+### Próximo passo estritamente necessário
+
+1. Um administrador indica/convida um revisor humano independente, com conta
+   ativa e acesso próprio ao projeto. O próprio revisor completa login/MFA.
+2. Trocar a referência proposta no novo rascunho por essa conta e validar a
+   elegibilidade antes de ativar/criar o novo ticket. Manter a regra menos
+   prioritária do que a original e usar encaminhamento explícito, para não
+   desviar pedidos normais.
+3. Executar desenvolvimento/testes e review real; só depois integração e
+   publicação automática pela pipeline. Não apresentar merge/pull manual como
+   prova de automação. ZO-38 e a sua versão ficam intactos.
+4. Confirmar SHA integrado, SHA e bytes servidos, página autenticada de
+   backoffice, notificações e encerramento. A outbox é assíncrona: a inserção de
+   uma mensagem não comprova receção de email antes do fim do fluxo.
+5. Remover os dois temporários por alteração rastreável sujeita aos mesmos
+   gates, ajustando explicitamente o teste que atualmente exige o marcador.
+
+A publicação do site, a validação autenticada no browser e a limpeza funcional
+continuam **não demonstradas** por dependerem dessa review legítima. Health/relay
+e certificação global de Produção continuam fora desta entrega.
+
+### Verificação final dos componentes e do PR
+
+- Fix do installer e evidências: commit interno
+  `6f3865e3c9b3a87c82aa50812a506625362882b8`, push confirmado. O installer
+  corrigido foi disponibilizado em `/usr/local/lib/zeroops`; os quatro ficheiros
+  instalados foram comparados byte a byte com esse commit. A referência fica em
+  `/var/lib/zeroops-site-qa/code-version`. Os módulos executados são os mesmos de
+  `843a561`; não se repetiu o rollout da API para alterar só o installer.
+- Versões distintas e verificadas: **API ZeroOps `843a561…`**; **pacote do
+  operador/installer `6f3865e…`**. O HEAD posterior de documentação não equivale
+  a uma nova versão executável da API.
+- API GitHub real, com a credencial do projeto: repositório privado
+  `numoreira/pizzahut`, `fork:false`; capacidade `push:true` reportada pela API,
+  **sem teste de escrita**. PR `numoreira/pizzahut#1` aberto, não integrado,
+  head `c7bfd0064511543a5ed91d1ca2c636378dc8bd6b`, base `qa`; os dois conteúdos
+  atuais continuam com os hashes aprovados. Não se alterou o PR.
+- Inventário final de contas ativas da equipa: só o autor/admin possui hash de
+  login configurado. «Revisor P08 (teste)» e «Delegado P10 (teste)» não possuem
+  login utilizável nem MFA. O bloqueio não é uma mera falta de clique:
+  é necessária uma conta real controlada por outra pessoa.
+- Verificação final: API `ready`, operador `ok`, fila 0, jobs 0, locks 0; site
+  continua em `2c38b0f5…`. Produção não foi acedida.

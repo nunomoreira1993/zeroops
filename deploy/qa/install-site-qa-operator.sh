@@ -14,8 +14,8 @@ FINGERPRINT=B9455909783F44D46E3F4A44832043FE92BEC2AF2B7E7638A5977F146EAF4CC5
 [ "$(id -u)" = 0 ] && [ "$(hostname)" = uqphorders24-dev ] || {
   echo "Host QA/root obrigatorios." >&2; exit 1;
 }
-[ "$(runuser -u pizzahut -- git --git-dir="$GIT_DIR" --work-tree="$WEBROOT" config --get remote.origin.url)" = "$SOURCE" ]
-[ "$(runuser -u pizzahut -- git --git-dir="$GIT_DIR" --work-tree="$WEBROOT" symbolic-ref --short HEAD)" = qa ]
+[ "$(runuser -u pizzahut -- git -C "$WEBROOT" --git-dir="$GIT_DIR" --work-tree="$WEBROOT" config --get remote.origin.url)" = "$SOURCE" ]
+[ "$(runuser -u pizzahut -- git -C "$WEBROOT" --git-dir="$GIT_DIR" --work-tree="$WEBROOT" symbolic-ref --short HEAD)" = qa ]
 python3 -c 'import sys; assert sys.version_info >= (3, 8)'
 command -v setpriv >/dev/null
 umask 077
@@ -24,7 +24,8 @@ install -d -m 0755 /usr/local/lib/zeroops
 install -d -m 0750 /etc/zeroops /var/log/zeroops
 
 certificate=$(mktemp)
-trap 'rm -f "$certificate"' EXIT
+seed=""
+trap 'rm -f "$certificate"; if [ -n "$seed" ]; then rm -f "$seed"; fi' EXIT
 openssl s_client -connect 127.0.0.1:443 -servername dev.pizzahut.pt </dev/null 2>/dev/null |
   openssl x509 -out "$certificate"
 actual=$(openssl x509 -in "$certificate" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d :)
@@ -40,7 +41,12 @@ if [ ! -f "$STATE/repo.git/HEAD" ]; then
   git init --bare --quiet "$STATE/repo.git"
 fi
 if ! git --git-dir="$STATE/repo.git" rev-parse --verify --quiet 'refs/heads/qa^{commit}' >/dev/null; then
-  git --git-dir="$STATE/repo.git" fetch --no-tags --quiet "$GIT_DIR" refs/heads/qa:refs/heads/qa
+  seed=$(mktemp "$STATE/site-seed.XXXXXX.bundle")
+  runuser -u pizzahut -- git -C "$WEBROOT" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    --git-dir="$GIT_DIR" --work-tree="$WEBROOT" bundle create - refs/heads/qa >"$seed"
+  git --git-dir="$STATE/repo.git" fetch --no-tags --quiet "$seed" refs/heads/qa:refs/heads/qa
+  rm -f "$seed"
+  seed=""
 fi
 if [ ! -f "$ENV_FILE" ]; then
   cat >"$ENV_FILE" <<EOF
