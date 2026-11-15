@@ -16,6 +16,7 @@ import type { Database } from '../../database/database.js';
 import { DomainError } from '../../errors.js';
 import { requireMember, type Queryable } from '../identity/membership.js';
 import { findTicket, validateTicketId } from '../tickets/tickets.queries.js';
+import { OWNED_BY, type JobLease } from './job-leases.js';
 
 export type { AgentRunEvent, AgentRunEventPayload, AgentRunInput };
 
@@ -128,9 +129,13 @@ export async function runUsage(
 export class AgentRunEventsService {
   constructor(private readonly db: Database) {}
 
-  /** Publica eventos do executor por ordem. Os payloads devem já vir limitados e sem segredos. */
-  async append(runId: string, events: AgentRunEventPayload[]) {
-    if (!events.length) return;
+  /**
+   * Publica eventos do executor por ordem. Os payloads devem já vir limitados e sem segredos. Com
+   * `lease`, só a tentativa que detém a posse escreve (devolve `false` a uma tentativa antiga).
+   */
+  async append(runId: string, events: AgentRunEventPayload[], lease?: JobLease) {
+    if (!events.length) return true;
+    if (lease && !(await this.owns(runId, lease))) return false;
     const values: unknown[] = [];
     const rows = events.map((event, index) => {
       const { type, ...payload } = event;
@@ -152,6 +157,17 @@ export class AgentRunEventsService {
         "UPDATE agent_runs SET effective_model=$2 WHERE id=$1 AND status='running'",
         [runId, observedModels.at(-1)!.slice(0, 100)],
       );
+    return true;
+  }
+
+  private async owns(runId: string, lease: JobLease) {
+    if (lease.jobId !== runId) return false;
+    const owned = await this.db.query(`SELECT id FROM agent_runs WHERE ${OWNED_BY()}`, [
+      lease.jobId,
+      lease.workerId,
+      lease.epoch,
+    ]);
+    return Boolean(owned.rowCount);
   }
 
   /** Eventos posteriores a `afterId`, apenas para a equipa do projeto do ticket. */
@@ -224,7 +240,8 @@ export class AgentRunEventsService {
   }
 
   /** Entrega ao executor as entradas ainda não consumidas e marca-as como consumidas. */
-  async claimInputs(runId: string): Promise<ClaimedInput[]> {
+  async claimInputs(runId: string, lease?: JobLease): Promise<ClaimedInput[]> {
+    if (lease && !(await this.owns(runId, lease))) return [];
     return this.db.transaction(async (client) => {
       const result = await client.query<{
         id: string;

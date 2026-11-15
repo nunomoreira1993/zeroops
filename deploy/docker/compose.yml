@@ -39,7 +39,11 @@ services:
       ZEROOPS_PROMETHEUS_URL: http://127.0.0.1:9090
       # Raizes tecnicas read-only para descoberta limitada de instrucoes/agentes/skills do projeto.
       ZEROOPS_AGENT_SITES_ROOT: /sources
+      # P08: repositorios Git aceites (verificacao ls-remote). Sem raizes, nenhum repositorio e aceite.
+      ZEROOPS_DEV_ALLOWED_REPO_ROOTS: ${ZEROOPS_DEV_ALLOWED_REPO_ROOTS:-file:///srv/zeroops-git/}
     volumes:
+      # Repositorios de teste do P08 (so leitura na API: apenas ls-remote).
+      - ${ZEROOPS_DEV_TEST_REPOS:-/opt/zeroops/test-repos}:/srv/zeroops-git:ro
       # A API so le caminhos tecnicos allowlisted; credenciais do site ficam mascaradas.
       - ${ZEROOPS_SITE_SOURCES:-/var/www/vhosts/pizzahut.pt/httpdocs}:/sources/pizzahut:ro
       - /dev/null:/sources/pizzahut/lib/db.config.credentials.php:ro
@@ -90,6 +94,8 @@ services:
     image: zeroops-executor:${ZEROOPS_IMAGE_TAG:-latest}
     command: ['node', 'dist/apps/executor/src/main.js']
     user: root
+    # Paragem ordenada: o executor drena os jobs (ZEROOPS_EXECUTOR_DRAIN_MS) e devolve-os a fila.
+    stop_grace_period: 45s
     mem_limit: 640m
     cap_drop: [ALL]
     cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE, FOWNER, KILL]
@@ -98,6 +104,8 @@ services:
       - /work:uid=1000,gid=1000,mode=0755
       - /home/node:uid=1000,gid=1000,mode=0700
     environment:
+      # P10: versao ativa (confirmacao de capacidades publicadas no runtime).
+      ZEROOPS_VERSION: ${ZEROOPS_VERSION:-local}
       ZEROOPS_AGENT_UID: '1000'
       ZEROOPS_AGENT_HOME: /home/node
       ZEROOPS_AGENT_WORKSPACE: /work
@@ -110,11 +118,24 @@ services:
       ZEROOPS_COPILOT_TRANSPORT: ${ZEROOPS_COPILOT_TRANSPORT:-sdk}
       ZEROOPS_AGENT_QUESTION_TIMEOUT_MS: ${ZEROOPS_AGENT_QUESTION_TIMEOUT_MS:-600000}
       ZEROOPS_AGENT_FOLLOWUP_MS: ${ZEROOPS_AGENT_FOLLOWUP_MS:-120000}
+      # Jobs: lease/heartbeat, pools separados (assistente vs. runs) e limite por projeto.
+      ZEROOPS_JOB_LEASE_SECONDS: ${ZEROOPS_JOB_LEASE_SECONDS:-90}
+      ZEROOPS_EXECUTOR_RUN_CONCURRENCY: ${ZEROOPS_EXECUTOR_RUN_CONCURRENCY:-1}
+      ZEROOPS_EXECUTOR_ASSISTANT_CONCURRENCY: ${ZEROOPS_EXECUTOR_ASSISTANT_CONCURRENCY:-1}
+      ZEROOPS_JOB_PROJECT_RUN_LIMIT: ${ZEROOPS_JOB_PROJECT_RUN_LIMIT:-2}
+      ZEROOPS_EXECUTOR_DRAIN_MS: ${ZEROOPS_EXECUTOR_DRAIN_MS:-20000}
       COPILOT_HOME: /home/node/.copilot
       COPILOT_CACHE_HOME: /opt/copilot-cache
       COPILOT_AUTO_UPDATE: 'false'
       USE_TGREP: 'false'
+      # P08: workspaces Git persistentes (bare + worktree por tentativa) e repositorios aceites.
+      ZEROOPS_DEV_WORKSPACES: /var/lib/zeroops/workspaces
+      ZEROOPS_DEV_ALLOWED_REPO_ROOTS: ${ZEROOPS_DEV_ALLOWED_REPO_ROOTS:-file:///srv/zeroops-git/}
+      ZEROOPS_DEV_WORKSPACE_RETENTION_DAYS: ${ZEROOPS_DEV_WORKSPACE_RETENTION_DAYS:-14}
     volumes:
+      - dev-workspaces:/var/lib/zeroops/workspaces
+      # Repositorios Git de teste (push das branches de trabalho; nunca o codigo publicado).
+      - ${ZEROOPS_DEV_TEST_REPOS:-/opt/zeroops/test-repos}:/srv/zeroops-git
       # Ficheiros com segredos ficam vazios para o agente: o acesso a dados passa so pelos conectores.
       # Cada mascara tem de existir no site (bind :ro nao cria pontos de montagem).
       - ${ZEROOPS_SITE_SOURCES:-/var/www/vhosts/pizzahut.pt/httpdocs}:/sources/pizzahut:ro
@@ -213,6 +234,7 @@ services:
     mem_limit: 48m
 
 volumes:
+  dev-workspaces:
   prometheus-data:
   alertmanager-data:
   alert-spool:

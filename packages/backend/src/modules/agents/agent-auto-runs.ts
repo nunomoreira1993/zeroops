@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import type { AgentRunTrigger } from '../../../../contracts/src/index.js';
+import type { AgentRunTrigger, CapabilityRunManifest } from '../../../../contracts/src/index.js';
+import { capabilityManifestHash } from './capability-catalog.js';
 import type {
   AgentProfileRunSnapshot,
   RepositoryResourceSnapshot,
@@ -43,6 +44,10 @@ export async function queueAgentRun(
     repositorySnapshotHash?: string | null;
     repositoryResources?: RepositoryResourceSnapshot[];
     allowedTools?: string[];
+    /** Skills e especialistas fixados para o run (P04). */
+    capabilityManifest?: CapabilityRunManifest;
+    /** Workspace Git persistente da etapa de desenvolvimento (P08). */
+    developmentWorkspaceId?: string;
     /** Modelo pedido pela etapa (já validado); ausente = modelo da integração. */
     model?: {
       model: string | null;
@@ -61,8 +66,8 @@ export async function queueAgentRun(
   if (active.rowCount) return null;
   const runId = randomUUID();
   await client.query(
-    `INSERT INTO agent_runs(id,ticket_id,project_id,requested_by,instructions,ticket_version,run_trigger,mode,flow_step_id,client_questions_allowed,model,reasoning_effort,execution_mode,fusion_tier,agent_profile_id,agent_profile_version,agent_profile_snapshot,repository_snapshot_hash,repository_resources,allowed_tools)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+    `INSERT INTO agent_runs(id,ticket_id,project_id,requested_by,instructions,ticket_version,run_trigger,mode,flow_step_id,client_questions_allowed,model,reasoning_effort,execution_mode,fusion_tier,agent_profile_id,agent_profile_version,agent_profile_snapshot,repository_snapshot_hash,repository_resources,allowed_tools,capability_manifest,capability_manifest_hash,development_workspace_id)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
     [
       runId,
       input.ticketId,
@@ -82,8 +87,12 @@ export async function queueAgentRun(
       input.agentProfile?.version ?? null,
       input.agentProfile ?? null,
       input.repositorySnapshotHash ?? null,
-      input.repositoryResources ?? null,
-      input.allowedTools ?? null,
+      // Arrays seriam expandidos em listas SQL; as colunas JSON recebem texto serializado.
+      input.repositoryResources ? JSON.stringify(input.repositoryResources) : null,
+      input.allowedTools ? JSON.stringify(input.allowedTools) : null,
+      input.capabilityManifest ? JSON.stringify(input.capabilityManifest) : null,
+      input.capabilityManifest ? capabilityManifestHash(input.capabilityManifest) : null,
+      input.developmentWorkspaceId ?? null,
     ],
   );
   await client.query(

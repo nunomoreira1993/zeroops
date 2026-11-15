@@ -84,9 +84,14 @@ export function validateShell(shell?: AgentShell): AgentShell | null {
 }
 
 /** Instrução final do prompt que define o formato do relatório. */
-export function reportInstruction(mode: AgentMode, shell: AgentShell | null) {
-  const filesInstruction =
-    mode === 'implement'
+export function reportInstruction(
+  mode: AgentMode,
+  shell: AgentShell | null,
+  gitWorkspace = false,
+) {
+  const filesInstruction = gitWorkspace
+    ? 'files (lista vazia []: o ZeroOps obtem o diff completo do Git)'
+    : mode === 'implement'
       ? 'files ([{path: caminho relativo}] apenas dos ficheiros que alterou)'
       : 'files (lista vazia [], porque a investigacao nao altera ficheiros; cite no summary os ficheiros consultados)';
   const investigationFields =
@@ -96,7 +101,10 @@ export function reportInstruction(mode: AgentMode, shell: AgentShell | null) {
   const commandRule = shell
     ? `Nao execute comandos alem de ${shell.commands.join(', ')}`
     : 'Nao execute comandos';
-  return `\nRegiste apenas em ${REPORT_FILE} um JSON com summary (texto), ${filesInstruction}, proposedTests (lista de comandos sugeridos)${investigationFields}. ${FORMAT_RULE} ${commandRule} nem publique alteracoes. Nao inclua segredos. Este relatorio nao comprova que os testes passaram.`;
+  const testRule = gitWorkspace
+    ? ' Use a ferramenta zeroops_run_tests para executar os testes configurados; so contam os testes executados pelo ZeroOps.'
+    : ' Este relatorio nao comprova que os testes passaram.';
+  return `\nRegiste apenas em ${REPORT_FILE} um JSON com summary (texto), ${filesInstruction}, proposedTests (lista de comandos sugeridos)${investigationFields}. ${FORMAT_RULE} ${commandRule} nem publique alteracoes. Nao inclua segredos.${testRule}`;
 }
 
 /** Os textos são mostrados no chat do ticket, que interpreta Markdown (sem HTML). */
@@ -108,16 +116,25 @@ export async function readAgentReport(
   root: string,
   resultPath: string,
   mode: AgentMode,
+  options: { gitWorkspace?: boolean } = {},
 ): Promise<AgentReport> {
   const reportFile = await realpath(resultPath).catch(() => {
     throw new Error('Relatorio ausente, externo ou demasiado grande.');
   });
   if (reportFile !== resultPath || (await stat(reportFile)).size > 131072)
     throw new Error('Relatorio ausente, externo ou demasiado grande.');
-  const report = reportSchema.parse(JSON.parse(await readFile(reportFile, 'utf8')));
+  const raw: unknown = JSON.parse(await readFile(reportFile, 'utf8'));
+  // Fora da investigação estes campos não são pedidos; um valor espontâneo do modelo é ignorado
+  // em vez de invalidar um desenvolvimento já concluído.
+  if (mode !== 'investigate' && raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    delete (raw as Record<string, unknown>).evidence;
+    delete (raw as Record<string, unknown>).clientQuestions;
+  }
+  const report = reportSchema.parse(raw);
   const files: { path: string; sha256: string }[] = [];
   const seen = new Set<string>();
-  for (const item of report.files) {
+  // Num workspace Git os ficheiros vêm do diff (inclui eliminações); a lista do modelo é ignorada.
+  for (const item of options.gitWorkspace ? [] : report.files) {
     if (
       isAbsolute(item.path) ||
       item.path.includes('\\') ||

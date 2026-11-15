@@ -4,6 +4,9 @@ import {
   copilotToolKeys,
   type AgentProfile,
   type AgentProfileDefinition,
+  type CapabilityCatalogView,
+  type CapabilityDelegateRef,
+  type CapabilitySkillRef,
   type RepositoryResource,
   type RepositoryResourceCatalog,
   type RepositoryResourceReference,
@@ -11,7 +14,7 @@ import {
 import { Notice } from '../../components/ui';
 import { useMutation, useResource } from '../../lib/hooks';
 import { useIdentityLocale } from '../../lib/identity';
-import { useProjectSession } from '../../lib/project-admin';
+import { useProjectPermission, useProjectSession } from '../../lib/project-admin';
 import type { FlowNode } from '@zeroops/contracts';
 
 const blankProfile = (): AgentProfileDefinition => ({
@@ -52,6 +55,8 @@ export function AgentProfileStepConfig({
   const { locale, t } = useIdentityLocale();
   const en = locale === 'en';
   const { request } = useProjectSession();
+  const canEdit = useProjectPermission('flows.edit');
+  const canManage = useProjectPermission('agents.manage');
   const profiles = useResource<AgentProfile[]>('/agent-profiles');
   const resources = useResource<RepositoryResourceCatalog>('/agent-profiles/repository-resources');
   const mutation = useMutation();
@@ -94,12 +99,32 @@ export function AgentProfileStepConfig({
     setDraft(current ? structuredClone(current.definition) : null);
   }, [editing, profiles.data]);
 
+  // Skills e especialistas só são válidos com um perfil principal, que não pode ser delegado.
+  const setPrimary = (id: string | undefined, version: number | undefined) => {
+    if (!canEdit) return;
+    if (!id) {
+      setConfigValues({
+        agentProfileId: undefined,
+        agentProfileVersion: undefined,
+        skills: undefined,
+        delegates: undefined,
+        delegation: undefined,
+      });
+      return;
+    }
+    const delegates = refList<CapabilityDelegateRef>(node.config.delegates, 'profileId').filter(
+      (item) => item.profileId !== id,
+    );
+    setConfigValues({
+      agentProfileId: id,
+      agentProfileVersion: version,
+      delegates: delegates.length ? delegates : undefined,
+      ...(delegates.length ? {} : { delegation: undefined }),
+    });
+  };
   const chooseProfile = (id: string) => {
     const selected = profiles.data?.find((item) => item.id === id);
-    setConfigValues({
-      agentProfileId: selected?.id,
-      agentProfileVersion: selected?.currentVersion,
-    });
+    setPrimary(selected?.id, selected?.currentVersion);
   };
   const setResources = (next: RepositoryResourceReference[]) =>
     setConfigValues({ repositoryResources: next.length ? next : undefined });
@@ -128,10 +153,7 @@ export function AgentProfileStepConfig({
                 },
               },
             );
-      setConfigValues({
-        agentProfileId: saved.id,
-        agentProfileVersion: saved.currentVersion,
-      });
+      setPrimary(saved.id, saved.currentVersion);
       setEditing(null);
       setDraft(null);
       profiles.reload();
@@ -143,7 +165,7 @@ export function AgentProfileStepConfig({
       await request(`/agent-profiles/${encodeURIComponent(profile.id)}/archive`, {
         method: 'POST',
       });
-      setConfigValues({ agentProfileId: undefined, agentProfileVersion: undefined });
+      setPrimary(undefined, undefined);
       setEditing(null);
       profiles.reload();
     });
@@ -165,7 +187,11 @@ export function AgentProfileStepConfig({
         </p>
         <label>
           {t('Perfil de execução', 'Execution profile')}
-          <select value={profileId} onChange={(event) => chooseProfile(event.target.value)}>
+          <select
+            disabled={!canEdit}
+            value={profileId}
+            onChange={(event) => chooseProfile(event.target.value)}
+          >
             <option value="">
               {t('Legado — configuração existente', 'Legacy — existing configuration')}
             </option>
@@ -186,6 +212,7 @@ export function AgentProfileStepConfig({
               {t('Versão fixada no fluxo', 'Version pinned to this flow')}
               <select
                 value={profileVersion}
+                disabled={!canEdit}
                 onChange={(event) =>
                   setConfigValues({ agentProfileVersion: Number(event.target.value) })
                 }
@@ -219,7 +246,7 @@ export function AgentProfileStepConfig({
                 )}
               </div>
             )}
-            {!profile.archivedAt && (
+            {canManage && !profile.archivedAt && (
               <div className="flow-config-actions">
                 <button
                   type="button"
@@ -244,7 +271,7 @@ export function AgentProfileStepConfig({
           <p className="muted">{t('A carregar perfis…', 'Loading profiles…')}</p>
         )}
         {profiles.error && <Notice tone="warning">{profiles.error}</Notice>}
-        {!editing && (
+        {canManage && !editing && (
           <button
             type="button"
             className="button button-secondary align-start"
@@ -253,7 +280,7 @@ export function AgentProfileStepConfig({
             {t('Criar perfil', 'Create profile')}
           </button>
         )}
-        {editing && draft && (
+        {canManage && editing && draft && (
           <div className="stack">
             <label>
               {t('Nome', 'Name')}
@@ -416,7 +443,7 @@ export function AgentProfileStepConfig({
         )}
       </fieldset>
 
-      <fieldset className="flow-fieldset">
+      <fieldset className="flow-fieldset" disabled={!canEdit}>
         <legend>
           {t('Agentes técnicos e skills do repositório', 'Repository agents and skills')}
         </legend>
@@ -521,6 +548,254 @@ export function AgentProfileStepConfig({
           <p className="muted">{t('A descobrir recursos…', 'Discovering resources…')}</p>
         )}
       </fieldset>
+
+      {profileId && (
+        <StepCapabilities
+          node={node}
+          profiles={profiles.data ?? []}
+          mainProfileId={profileId}
+          canEdit={canEdit}
+          setConfigValues={setConfigValues}
+        />
+      )}
     </div>
+  );
+}
+
+function refList<T extends { version: number }>(raw: unknown, key: 'skillId' | 'profileId') {
+  return Array.isArray(raw)
+    ? (raw.filter(
+        (item) =>
+          typeof item === 'object' &&
+          item !== null &&
+          typeof (item as Record<string, unknown>)[key] === 'string' &&
+          typeof (item as { version?: unknown }).version === 'number',
+      ) as T[])
+    : [];
+}
+
+/** Skills nativas e especialistas delegáveis, sempre fixados por versão no manifesto da ativação. */
+function StepCapabilities({
+  node,
+  profiles,
+  mainProfileId,
+  canEdit,
+  setConfigValues,
+}: {
+  node: FlowNode;
+  profiles: AgentProfile[];
+  mainProfileId: string;
+  canEdit: boolean;
+  setConfigValues: (changes: Record<string, unknown>) => void;
+}) {
+  const { t } = useIdentityLocale();
+  const catalog = useResource<CapabilityCatalogView>('/skills');
+  const skills = refList<CapabilitySkillRef>(node.config.skills, 'skillId');
+  const delegates = refList<CapabilityDelegateRef>(node.config.delegates, 'profileId');
+  const delegation = node.config.delegation as { maxConcurrency?: number } | undefined;
+  const maxConcurrency = delegation?.maxConcurrency ?? 1;
+  const setSkills = (next: CapabilitySkillRef[]) =>
+    setConfigValues({ skills: next.length ? next : undefined });
+  const setDelegates = (next: CapabilityDelegateRef[]) =>
+    setConfigValues({
+      delegates: next.length ? next : undefined,
+      delegation: next.length ? { maxConcurrency } : undefined,
+    });
+  const available = (catalog.data?.skills ?? []).filter(
+    (skill) => !skill.archivedAt || skills.some((ref) => ref.skillId === skill.id),
+  );
+  const specialists = profiles.filter(
+    (item) =>
+      item.id !== mainProfileId &&
+      (!item.archivedAt || delegates.some((ref) => ref.profileId === item.id)),
+  );
+  return (
+    <fieldset className="flow-fieldset" disabled={!canEdit}>
+      <legend>{t('Skills e especialistas', 'Skills and specialists')}</legend>
+      <p className="muted">
+        {t(
+          'As skills são carregadas pelo Copilot por relevância, só dentro do conjunto escolhido. Os especialistas são subagentes de leitura que não delegam nem ampliam as ferramentas da etapa. Tudo fica fixado na versão indicada ao ativar o fluxo.',
+          'Skills are loaded by Copilot by relevance, only within the chosen set. Specialists are read-only subagents that cannot delegate or widen the step tools. Everything is pinned to the selected version when the flow is activated.',
+        )}{' '}
+        <a href="#capabilities">{t('Gerir catálogo', 'Manage catalog')}</a>
+      </p>
+      <h4>{t('Skills', 'Skills')}</h4>
+      {catalog.error && <Notice tone="warning">{catalog.error}</Notice>}
+      {available.length ? (
+        available.map((skill) => {
+          const ref = skills.find((item) => item.skillId === skill.id);
+          const version =
+            skill.versions.find(
+              (item) => item.version === (ref?.version ?? skill.currentVersion),
+            ) ?? null;
+          const missingTools = (version?.manifest.requires.tools ?? []).filter(
+            (tool) => !skill.boundTools.includes(tool),
+          );
+          return (
+            <div key={skill.id} className="flow-port-row">
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={Boolean(ref)}
+                  onChange={(event) =>
+                    setSkills(
+                      event.target.checked
+                        ? [...skills, { skillId: skill.id, version: skill.currentVersion }]
+                        : skills.filter((item) => item.skillId !== skill.id),
+                    )
+                  }
+                />
+                <span>
+                  <strong>{skill.name}</strong>
+                  {skill.archivedAt ? ` · ${t('arquivada', 'archived')}` : ''}
+                  <br />
+                  <span className="muted">{version?.description}</span>
+                  <br />
+                  <code>sha256 {version?.bundleHash.slice(0, 12)}</code>
+                  {version?.manifest.requires.tools.length
+                    ? ` · ${t('requer', 'requires')} ${version.manifest.requires.tools.join(', ')}`
+                    : ''}
+                  {missingTools.length ? (
+                    <>
+                      <br />
+                      <span role="alert">
+                        {t(
+                          `Ferramentas sem binding: ${missingTools.join(', ')}`,
+                          `Tools without binding: ${missingTools.join(', ')}`,
+                        )}
+                      </span>
+                    </>
+                  ) : null}
+                </span>
+              </label>
+              {ref && (
+                <label>
+                  {t('Versão', 'Version')}
+                  <select
+                    value={ref.version}
+                    onChange={(event) =>
+                      setSkills(
+                        skills.map((item) =>
+                          item.skillId === skill.id
+                            ? { ...item, version: Number(event.target.value) }
+                            : item,
+                        ),
+                      )
+                    }
+                  >
+                    {skill.versions.map((item) => (
+                      <option key={item.id} value={item.version}>
+                        v{item.version}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </div>
+          );
+        })
+      ) : (
+        <p className="muted">
+          {catalog.loading
+            ? t('A carregar skills…', 'Loading skills…')
+            : t('Ainda não há skills no projeto.', 'No skills in this project yet.')}
+        </p>
+      )}
+      {skills
+        .filter((ref) => !catalog.loading && !available.some((s) => s.id === ref.skillId))
+        .map((ref) => (
+          <div key={ref.skillId} className="flow-port-row">
+            <span role="alert">
+              {t('Skill inexistente', 'Missing skill')} · {ref.skillId}
+            </span>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={() => setSkills(skills.filter((item) => item.skillId !== ref.skillId))}
+            >
+              {t('Remover', 'Remove')}
+            </button>
+          </div>
+        ))}
+      <h4>{t('Especialistas delegáveis', 'Delegable specialists')}</h4>
+      {specialists.length ? (
+        specialists.map((profile) => {
+          const ref = delegates.find((item) => item.profileId === profile.id);
+          const version = profile.versions.find(
+            (item) => item.version === (ref?.version ?? profile.currentVersion),
+          );
+          return (
+            <div key={profile.id} className="flow-port-row">
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={Boolean(ref)}
+                  onChange={(event) =>
+                    setDelegates(
+                      event.target.checked
+                        ? [...delegates, { profileId: profile.id, version: profile.currentVersion }]
+                        : delegates.filter((item) => item.profileId !== profile.id),
+                    )
+                  }
+                />
+                <span>
+                  <strong>{version?.definition.name}</strong>
+                  {profile.archivedAt ? ` · ${t('arquivado', 'archived')}` : ''}
+                  <br />
+                  <span className="muted">{version?.definition.description}</span>
+                </span>
+              </label>
+              {ref && (
+                <label>
+                  {t('Versão', 'Version')}
+                  <select
+                    value={ref.version}
+                    onChange={(event) =>
+                      setDelegates(
+                        delegates.map((item) =>
+                          item.profileId === profile.id
+                            ? { ...item, version: Number(event.target.value) }
+                            : item,
+                        ),
+                      )
+                    }
+                  >
+                    {profile.versions.map((item) => (
+                      <option key={item.version} value={item.version}>
+                        v{item.version}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </div>
+          );
+        })
+      ) : (
+        <p className="muted">
+          {t(
+            'Crie ou importe outro perfil para o usar como especialista.',
+            'Create or import another profile to use it as a specialist.',
+          )}
+        </p>
+      )}
+      {delegates.length > 0 && (
+        <label>
+          {t('Especialistas em simultâneo', 'Concurrent specialists')}
+          <select
+            value={maxConcurrency}
+            onChange={(event) =>
+              setConfigValues({ delegation: { maxConcurrency: Number(event.target.value) } })
+            }
+          >
+            {[1, 2, 3].map((value) => (
+              <option key={value} value={value}>
+                {value}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+    </fieldset>
   );
 }

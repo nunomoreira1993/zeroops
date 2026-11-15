@@ -16,6 +16,10 @@ export { lockInTransaction } from './sql-client.js';
 export const JSON_COLUMNS = new Set([
   'flow_definition',
   'flow_match',
+  'active_flow_match',
+  'pending_alert_keys',
+  'routing',
+  'activation_details',
   'step_assignee',
   'step_input',
   'step_output',
@@ -44,6 +48,9 @@ export const JSON_COLUMNS = new Set([
   'allowed_tools',
   'effective_tools',
   'chart_context',
+  'provenance',
+  'capability_manifest',
+  'skill_manifest',
 ]);
 
 type TypeCastHandler = Exclude<mysql.PoolOptions['typeCast'], boolean | undefined>;

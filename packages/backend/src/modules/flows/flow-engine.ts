@@ -4,18 +4,26 @@ import {
   actionKey,
   copilotMode,
   copilotStepModel,
-  decisionOnlyWhen,
   decisionOptions,
   endOutcome,
-  FLOW_INTERNAL_RESULTS,
   FLOW_SUCCESS,
+  flowConditionPort,
+  flowCopilotBlock,
+  flowCopilotOutcome,
   flowDecisionInputSchema,
+  flowDecisionNotRequired,
+  developmentNodeConfig,
+  flowReviewConfig,
+  flowRuntimeSupported,
+  flowVisitLimitExceeded,
+  FLOW_STEP_BUDGET,
   maxVisits,
   portLabel,
-  resultPort,
+  resolveFlowTransition,
   type FlowAssignee,
   type FlowDefinition,
   type FlowNode,
+  type FlowReviewConfig,
   type FlowStepOutput,
   type TicketOrigin,
   type TicketStatus,
@@ -25,6 +33,7 @@ import type {
   AgentProfileRunSnapshot,
   RepositoryResourceSnapshot,
 } from '../../../../contracts/src/agent-profiles.js';
+import type { CapabilityRunManifest } from '../../../../contracts/src/capabilities.js';
 import type { Database } from '../../database/database.js';
 import { DomainError } from '../../errors.js';
 import {
@@ -36,6 +45,14 @@ import {
 import type { RunFinishedHook } from '../agents/agent-runs.service.js';
 import { AgentModelsService } from '../agents/agent-models.service.js';
 import { AgentProfilesService } from '../agents/agent-profiles.service.js';
+import {
+  eligibleReviewers,
+  ensureWorkspace,
+  requiredApprovals,
+  reviewArtifact,
+  reviewDecisionRight,
+  scopeHash,
+} from '../development/development.store.js';
 import { incidentInstructionContext } from '../incidents/incident-instructions.js';
 import { closeHealthIncident, type IncidentDelegate } from '../health/health-incident-lifecycle.js';
 import { parseInput } from '../identity/identity.validation.js';
@@ -44,21 +61,35 @@ import { appendAutomatedComment, appendHumanComment } from '../tickets/ticket-co
 import { recordTicketMove } from '../tickets/ticket-move.js';
 import { findTicket } from '../tickets/tickets.queries.js';
 import type { PublicCommentHook, TicketCreatedHook } from '../tickets/tickets.service.js';
-import { defaultFlowActions, type FlowActionRegistry } from './flow-actions.js';
+import {
+  databaseActionEffects,
+  defaultFlowActions,
+  type FlowActionRegistry,
+} from './flow-actions.js';
 import {
   ensureDefaultFlows,
   flowForTicket,
+  flowSelectionPlan,
   legacyTemplateFlows,
   binaryMigrationFlows,
   migrateFlowToBinary,
   parseDefinition,
+  pinnedFlow,
   upgradeTemplateFlow,
+  type PublishedFlow,
 } from './flow-store.js';
+import { acceptRoutingReply, beginRouting } from './ticket-routing.js';
+
+/** Fluxo e versão concretos onde o ticket entra (ativo agora ou fixado no encaminhamento). */
+export type StartableFlow = Pick<
+  PublishedFlow,
+  'id' | 'name' | 'versionId' | 'versionNumber' | 'definition'
+>;
 
 const INSTRUCTIONS_LIMIT = 4000;
 const PATCH_IN_REPORT_LIMIT = 1500;
 /** Etapas processadas numa única transação (protege contra ciclos sem espera). */
-const STEP_BUDGET = 60;
+const STEP_BUDGET = FLOW_STEP_BUDGET;
 /** Novo pedido ao Copilot quando já havia outro run ativo no ticket. */
 const RETRY_MS = 60_000;
 
@@ -95,6 +126,8 @@ export interface ExecutionRow {
 export interface FlowExecutionContext {
   agentInstructions?: string;
   agentProfiles?: Record<string, AgentProfileRunSnapshot>;
+  /** Skills e especialistas fixados por etapa no início da execução (P04). */
+  capabilitiesByNode?: Record<string, CapabilityRunManifest>;
   repositorySnapshotHash?: string | null;
   repositoryResources?: RepositoryResourceSnapshot[];
   repositoryResourcePathsByNode?: Record<string, string[]>;
@@ -131,7 +164,7 @@ interface Run {
   execution: ExecutionRow;
   definition: FlowDefinition;
   budget: number;
-  /** Retoma (backfill): a primeira etapa não altera o estado já existente do ticket. */
+  /** Adoção de ticket antigo: a primeira etapa não altera o estado já existente do ticket. */
   keepStatus?: boolean;
 }
 
@@ -180,16 +213,22 @@ export function ticketStatusFor(node: FlowNode): TicketStatus | null {
       return 'awaiting_technical';
     }
     case 'end':
+    case 'condition':
       return null;
   }
 }
 
-/** Quem pode decidir numa etapa: o responsável configurado ou um administrador do projeto. */
+/**
+ * Quem pode decidir numa etapa: o responsável configurado ou um administrador do projeto. Num
+ * review de desenvolvimento decidem só os revisores configurados (o admin apenas com override).
+ */
 export function canDecide(
   member: Pick<User, 'id' | 'role'>,
   node: FlowNode,
   ticket: Pick<TicketLock, 'created_by'>,
 ) {
+  const review = flowReviewConfig(node);
+  if (review) return reviewDecisionRight(member, review, ticket.created_by).allowed;
   if (member.role === 'admin') return true;
   const assignee: FlowAssignee = node.assignee ?? { kind: 'team' };
   switch (assignee.kind) {
@@ -217,15 +256,42 @@ export class FlowEngine {
     private readonly agentProfiles: AgentProfilesService = new AgentProfilesService(db),
   ) {}
 
-  /** Hook de criação: o ticket entra no fluxo selecionado pela origem, categoria, ambiente e prioridade. */
+  /**
+   * Hook de criação: associação explícita da Saúde ou regra estruturada inequívoca entram logo no
+   * fluxo; com políticas semânticas coincidentes, os candidatos ficam fixados e o ticket aguarda a
+   * classificação (P05) sem executar efeitos de nenhum fluxo candidato.
+   */
   readonly onTicketCreated: TicketCreatedHook = async (client, ticket, options) => {
     const locked = await lockFlowTicket(client, ticket.id);
-    if (locked)
-      await this.start(
-        client,
-        locked,
-        options.agentInstructions ? { agentInstructions: options.agentInstructions } : {},
-      );
+    if (!locked) return;
+    const context = options.agentInstructions
+      ? { agentInstructions: options.agentInstructions }
+      : {};
+    // P10: um processo interno (ex.: desenvolvimento de capacidade) escolhe o fluxo publicado
+    // explicitamente atribuído ao projeto, sem passar pelo encaminhamento dos tickets normais.
+    if (options.flowId) {
+      const published = (
+        await client.query<{ published_version_id: string | null }>(
+          'SELECT published_version_id FROM flows WHERE id=$1 AND project_id=$2',
+          [options.flowId, locked.project_id],
+        )
+      ).rows[0]?.published_version_id;
+      const flow = published
+        ? await pinnedFlow(client, locked.project_id, options.flowId, published)
+        : null;
+      if (!flow)
+        throw new DomainError(
+          'FLOW_NOT_PUBLISHED',
+          'O fluxo indicado não tem versão ativa neste projeto.',
+          409,
+        );
+      await this.startWith(client, locked, flow, context);
+      return;
+    }
+    await ensureDefaultFlows(client, locked.project_id);
+    const plan = await flowSelectionPlan(client, locked);
+    if (plan.kind === 'classify') await beginRouting(client, locked, plan, context);
+    else if (plan.flow) await this.startWith(client, locked, plan.flow, context);
   };
 
   /** Hook do fim de um run do Copilot pedido por uma etapa: guarda o resultado e avança. */
@@ -243,7 +309,17 @@ export class FlowEngine {
    * pergunta ao cliente, a resposta repete a análise com o comentário; numa decisão antiga
    * atribuída ao autor, segue pela opção «respondeu» (ou sucesso).
    */
-  readonly onPublicComment: PublicCommentHook = async (client, actor, ticketId) => {
+  readonly onPublicComment: PublicCommentHook = async (client, actor, ticketId, comment) => {
+    const routing = await client.query<{ status: string }>(
+      'SELECT status FROM ticket_routing WHERE ticket_id=$1',
+      [ticketId],
+    );
+    if (routing.rows[0]?.status === 'awaiting_reply') {
+      const ticket = await lockFlowTicket(client, ticketId);
+      if (ticket && !(await ticketWorkPaused(client, ticket.project_id)))
+        await acceptRoutingReply(client, actor, ticket, comment);
+      return;
+    }
     const loaded = await this.load(client, ticketId);
     if (!loaded || loaded.execution.status !== 'waiting' || loaded.execution.suspended_at) return;
     const step = await this.currentStep(loaded);
@@ -332,10 +408,29 @@ export class FlowEngine {
     await ensureDefaultFlows(client, ticket.project_id);
     const flow = await flowForTicket(client, ticket);
     if (!flow) return null;
+    return this.startWith(client, ticket, flow, context, startNode);
+  }
+
+  /**
+   * Entra numa versão concreta (ex.: a versão fixada pelo encaminhamento), mesmo que entretanto
+   * outra tenha sido ativada. Sem efeito se o ticket já tiver execução.
+   */
+  async startWith(
+    client: Queryable,
+    ticket: TicketLock,
+    flow: StartableFlow,
+    context: { agentInstructions?: string } = {},
+    startNode?: string,
+  ) {
+    const existing = await client.query('SELECT id FROM flow_executions WHERE ticket_id=$1', [
+      ticket.id,
+    ]);
+    if (existing.rowCount) return null;
     const resolved = await this.agentProfiles
       .snapshotForExecution(client, ticket.project_id, flow.definition, ticket.id)
       .catch((error: unknown) => ({
         agentProfiles: {},
+        capabilitiesByNode: {},
         repositorySnapshotHash: null,
         repositoryResources: [],
         repositoryResourcePathsByNode: {},
@@ -352,6 +447,9 @@ export class FlowEngine {
     const executionContext: FlowExecutionContext = {
       ...context,
       agentProfiles: resolved.agentProfiles,
+      ...(Object.keys(resolved.capabilitiesByNode).length
+        ? { capabilitiesByNode: resolved.capabilitiesByNode }
+        : {}),
       repositorySnapshotHash: resolved.repositorySnapshotHash,
       repositoryResources: resolved.repositoryResources,
       repositoryResourcePathsByNode: resolved.repositoryResourcePathsByNode,
@@ -440,6 +538,17 @@ export class FlowEngine {
           throw new DomainError('INVALID_INPUT', 'Chave de decisão reutilizada.', 400);
         return { applied: false };
       }
+      const previousReview = (
+        await client.query<{ step_id: string }>(
+          'SELECT step_id FROM development_review_decisions WHERE idempotency_key=$1',
+          [input.idempotencyKey],
+        )
+      ).rows[0];
+      if (previousReview) {
+        if (previousReview.step_id !== input.stepId)
+          throw new DomainError('INVALID_INPUT', 'Chave de decisão reutilizada.', 400);
+        return { applied: false };
+      }
       const step = (
         await client.query<StepRow>(
           'SELECT * FROM flow_execution_steps WHERE id=$1 AND execution_id=$2 FOR UPDATE',
@@ -463,14 +572,33 @@ export class FlowEngine {
       const comment = input.comment?.trim() || null;
       if (option.requiresComment && !comment)
         throw new DomainError('COMMENT_REQUIRED', 'Esta opção exige um comentário.', 400);
+      const visibility =
+        member.role === 'client' ? 'public' : (option.commentVisibility ?? 'internal');
+      const review = flowReviewConfig(node);
+      let reviewOutput: FlowStepOutput['review'];
+      if (review) {
+        const outcome = await this.recordReview(loaded, step, review, member, option.port, {
+          comment,
+          artifactSha: input.artifactSha,
+          idempotencyKey: input.idempotencyKey,
+        });
+        if (comment)
+          await appendHumanComment(
+            client,
+            member,
+            ticketId,
+            `**${node.label} — ${option.label}** (commit ${outcome.headSha.slice(0, 12)})\n\n${comment}`,
+            visibility,
+          );
+        if (!outcome.complete) return { applied: true };
+        reviewOutput = outcome.output;
+      }
       await client.query(
         `INSERT INTO flow_decisions(id,step_id,idempotency_key,actor_id,port,comment_body)
          VALUES($1,$2,$3,$4,$5,$6)`,
         [randomUUID(), step.id, input.idempotencyKey, member.id, option.port, comment],
       );
-      const visibility =
-        member.role === 'client' ? 'public' : (option.commentVisibility ?? 'internal');
-      if (comment)
+      if (comment && !review)
         await appendHumanComment(
           client,
           member,
@@ -482,12 +610,106 @@ export class FlowEngine {
         loaded,
         step,
         option.port,
-        { comment, commentVisibility: visibility },
+        {
+          comment,
+          commentVisibility: visibility,
+          ...(reviewOutput ? { review: reviewOutput } : {}),
+        },
         member.id,
         comment ? { comment, actor: member.displayName } : undefined,
       );
       return { applied: true };
     });
+  }
+
+  /**
+   * Decisão de review sobre o commit exato da etapa de desenvolvimento: tem de referir o head
+   * atual (um commit posterior invalida a página aberta), fica ligada ao âmbito (hash) e conta
+   * para a regra any/all/quórum. Uma rejeição devolve a etapa ao desenvolvimento de imediato.
+   */
+  private async recordReview(
+    run: Run,
+    step: StepRow,
+    review: FlowReviewConfig,
+    member: User,
+    port: string,
+    input: { comment: string | null; artifactSha?: string; idempotencyKey: string },
+  ): Promise<{ complete: boolean; headSha: string; output: FlowStepOutput['review'] }> {
+    const artifact = await reviewArtifact(run.client, run.ticket.id, review.sourceNode);
+    if (!artifact)
+      throw new DomainError(
+        'REVIEW_ARTIFACT_MISSING',
+        'Ainda não existe um commit desenvolvido para rever.',
+        409,
+      );
+    if (input.artifactSha !== artifact.headSha)
+      throw new DomainError(
+        'REVIEW_ARTIFACT_CHANGED',
+        'O commit em revisão mudou. Reveja a versão atual antes de decidir.',
+        409,
+      );
+    const right = reviewDecisionRight(member, review, run.ticket.created_by);
+    if (port === FLOW_SUCCESS && !artifact.workspace.tests_passed)
+      throw new DomainError(
+        'REVIEW_TESTS_FAILED',
+        'Os testes finais deste commit não passaram; não pode ser aprovado.',
+        409,
+      );
+    const repeated = await run.client.query(
+      `SELECT id FROM development_review_decisions
+        WHERE step_id=$1 AND actor_id=$2 AND head_sha=$3 AND invalidated_at IS NULL`,
+      [step.id, member.id, artifact.headSha],
+    );
+    if (repeated.rowCount)
+      throw new DomainError('REVIEW_ALREADY_DECIDED', 'Já decidiu sobre este commit.', 409);
+    await run.client.query(
+      `INSERT INTO development_review_decisions(id,ticket_id,step_id,workspace_id,head_sha,scope_hash,
+         actor_id,port,comment_body,idempotency_key,override_used)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [
+        randomUUID(),
+        run.ticket.id,
+        step.id,
+        artifact.workspace.id,
+        artifact.headSha,
+        artifact.scopeHash,
+        member.id,
+        port,
+        input.comment,
+        input.idempotencyKey,
+        right.override,
+      ],
+    );
+    const eligible = await eligibleReviewers(
+      run.client,
+      run.ticket.project_id,
+      review,
+      run.ticket.created_by,
+    );
+    const required = requiredApprovals(review, eligible.length);
+    const approvals = Number(
+      (
+        await run.client.query<{ total: number }>(
+          `SELECT COUNT(DISTINCT actor_id) AS total FROM development_review_decisions
+            WHERE step_id=$1 AND head_sha=$2 AND port=$3 AND invalidated_at IS NULL`,
+          [step.id, artifact.headSha, FLOW_SUCCESS],
+        )
+      ).rows[0]?.total ?? 0,
+    );
+    const output = { approvals, required, headSha: artifact.headSha };
+    await this.event(run, step.id, 'review_decision_recorded', member.id, {
+      port,
+      headSha: artifact.headSha,
+      scopeHash: artifact.scopeHash,
+      approvals,
+      required,
+      override: right.override,
+    });
+    return {
+      complete: port !== FLOW_SUCCESS || approvals >= required,
+      headSha: artifact.headSha,
+      output,
+    };
   }
 
   /**
@@ -537,33 +759,27 @@ export class FlowEngine {
   }
 
   /**
-   * Tickets em curso de antes dos fluxos (sem execução nem incidente aberto) entram no fluxo
-   * por omissão na decisão da equipa, sem repetir trabalho já feito.
+   * Adoção explícita (P11) de um ticket antigo sem execução: entra no fluxo ativo do projeto na
+   * decisão da equipa, sem repetir trabalho já feito. O chamador já bloqueou o ticket e audita.
+   * Devolve null quando não há fluxo ativo aplicável ou o projeto está em manutenção.
    */
-  async backfill(limit = 50) {
-    const pending = await this.db.query<{ id: string }>(
-      `SELECT t.id FROM tickets t
-        WHERE t.status NOT IN ('resolved','cancelled')
-          AND NOT EXISTS (SELECT 1 FROM flow_executions e WHERE e.ticket_id=t.id)
-          AND NOT EXISTS (SELECT 1 FROM health_incidents h WHERE h.ticket_id=t.id AND h.state<>'closed')
-          AND NOT EXISTS (SELECT 1 FROM agent_runs r WHERE r.ticket_id=t.id AND r.status IN ('queued','running'))
-        ORDER BY t.created_at LIMIT ${Math.max(1, Math.min(limit, 200))}`,
+  async adoptTicket(client: Queryable, ticket: TicketLock) {
+    if (await ticketWorkPaused(client, ticket.project_id)) return null;
+    await ensureDefaultFlows(client, ticket.project_id);
+    const flow = await flowForTicket(client, ticket);
+    if (!flow) return null;
+    const resumeAt = flow.definition.nodes.find(
+      (node) => node.op === 'human_decision' && (node.assignee?.kind ?? 'team') === 'team',
     );
-    let started = 0;
-    for (const { id } of pending.rows)
-      await this.db.transaction(async (client) => {
-        const ticket = await lockFlowTicket(client, id);
-        if (!ticket || ['resolved', 'cancelled'].includes(ticket.status)) return;
-        if (await ticketWorkPaused(client, ticket.project_id)) return;
-        await ensureDefaultFlows(client, ticket.project_id);
-        const flow = await flowForTicket(client, ticket);
-        if (!flow) return;
-        const resumeAt = flow.definition.nodes.find(
-          (node) => node.op === 'human_decision' && (node.assignee?.kind ?? 'team') === 'team',
-        );
-        if (await this.start(client, ticket, {}, resumeAt?.id)) started += 1;
-      });
-    return started;
+    if (!(await this.start(client, ticket, {}, resumeAt?.id))) return null;
+    return (
+      (
+        await client.query<{ id: string; flow_id: string; version_id: string }>(
+          'SELECT id,flow_id,version_id FROM flow_executions WHERE ticket_id=$1',
+          [ticket.id],
+        )
+      ).rows[0] ?? null
+    );
   }
 
   /** Atualiza fluxos de modelo não personalizados para o modelo atual (nova versão publicada). */
@@ -591,12 +807,13 @@ export class FlowEngine {
     ).rows[0];
     if (!execution) return null;
     const version = (
-      await client.query<{ flow_definition: unknown }>(
-        'SELECT flow_definition FROM flow_versions WHERE id=$1',
+      await client.query<{ flow_definition: unknown; runtime_contract_version: number | null }>(
+        'SELECT flow_definition,runtime_contract_version FROM flow_versions WHERE id=$1',
         [execution.version_id],
       )
     ).rows[0];
-    if (!version) return null;
+    if (!version || !flowRuntimeSupported(Number(version.runtime_contract_version ?? 1)))
+      return null;
     return {
       client,
       ticket,
@@ -731,7 +948,7 @@ export class FlowEngine {
           )
         ).rows[0]?.last ?? 0,
       ) + 1;
-    if (attempt > maxVisits(node))
+    if (flowVisitLimitExceeded(node, attempt))
       return this.fail(
         run,
         `«${node.label}» atingiu o limite de ${maxVisits(node)} passagens. A equipa tem de rever o pedido.`,
@@ -773,9 +990,7 @@ export class FlowEngine {
     if (status) await this.moveTicket(run, status, null);
     switch (node.op) {
       case 'human_decision': {
-        const onlyWhen = decisionOnlyWhen(node);
-        const previous = input.from?.result ?? input.from?.port;
-        if (onlyWhen.length && !(previous && onlyWhen.includes(previous)))
+        if (flowDecisionNotRequired(node, input.from))
           return this.complete(
             run,
             step,
@@ -793,7 +1008,26 @@ export class FlowEngine {
         return this.startCopilot(run, node, step, input);
       case 'action':
         return this.runAction(run, node, step);
+      case 'condition': {
+        // Avaliação declarativa (sem código): factos do ticket e resultado da etapa anterior.
+        const port = flowConditionPort(
+          node,
+          {
+            origin: run.ticket.origin,
+            category: run.ticket.category,
+            environment: run.ticket.environment,
+            priority: run.ticket.priority,
+          },
+          input.from,
+        );
+        return this.complete(run, step, port, { result: port }, null);
+      }
     }
+  }
+
+  /** O motor tem executor para esta ação (usado no manifesto de ativação). */
+  supportsAction(key: string) {
+    return Object.prototype.hasOwnProperty.call(this.actions, key);
   }
 
   /**
@@ -809,10 +1043,13 @@ export class FlowEngine {
     feedback?: StepInput['feedback'],
   ): Promise<void> {
     const node = this.node(run, step.node_id);
-    const outgoing = run.definition.edges.filter((item) => item.source === step.node_id);
-    const exact = outgoing.find((item) => item.port === result);
-    const internal = !exact && (FLOW_INTERNAL_RESULTS as readonly string[]).includes(result);
-    const port = exact ? result : resultPort(result);
+    const transition = resolveFlowTransition(
+      run.definition,
+      step.node_id,
+      result,
+      step.step_input?.from?.nodeId ?? null,
+    );
+    const port = transition.port;
     const detailed = { ...output, result: output.result ?? result };
     await run.client.query(
       `UPDATE flow_execution_steps SET status='completed',port=$2,step_output=$3,actor_id=$4,finished_at=$5
@@ -832,20 +1069,13 @@ export class FlowEngine {
       result,
     };
     const next = feedback ? { feedback } : {};
-    if (internal) {
-      // `needs_information`: repete a etapa com a resposta; `retry`: volta à etapa anterior.
-      const target =
-        result === 'retry' ? (step.step_input?.from?.nodeId ?? null) : step.node_id;
-      if (target && this.node(run, target))
-        return this.enter(run, target, { from, ...next });
-    }
-    const edge = outgoing.find((item) => item.port === port);
-    if (!edge)
+    // `needs_information` repete a etapa com a resposta; `retry` volta à etapa anterior.
+    if (transition.kind === 'missing')
       return this.fail(
         run,
         `A saída «${portLabel(node, port)}» de «${node?.label ?? step.node_id}» não tem destino.`,
       );
-    await this.enter(run, edge.target, { from, ...next });
+    await this.enter(run, transition.target, { from, ...next });
   }
 
   private async fail(run: Run, reason: string) {
@@ -906,18 +1136,21 @@ export class FlowEngine {
   private async runAction(run: Run, node: FlowNode, step: StepRow) {
     const executor = this.actions[actionKey(node)];
     if (!executor) return this.fail(run, `A ação «${actionKey(node)}» não está disponível.`);
+    const ticket = {
+      id: run.ticket.id,
+      projectId: run.ticket.project_id,
+      createdBy: run.ticket.created_by,
+      origin: run.ticket.origin,
+    };
     const result = await executor({
       client: run.client,
-      ticket: {
-        id: run.ticket.id,
-        projectId: run.ticket.project_id,
-        createdBy: run.ticket.created_by,
-        origin: run.ticket.origin,
-      },
+      ticket,
       node,
       step: { id: step.id, attempt: step.attempt, startedAt: new Date(step.started_at) },
+      execution: { id: run.execution.id, definition: run.definition },
       previous: await this.previousCopilot(run),
       now: this.clock(),
+      effects: databaseActionEffects(run.client, ticket),
     });
     if ('wait' in result) {
       await run.client.query(
@@ -927,7 +1160,7 @@ export class FlowEngine {
       await this.setExecution(run, { status: 'waiting', wake_at: result.wait });
       return;
     }
-    await this.complete(run, step, result.port, result.output ?? {}, null);
+    await this.complete(run, step, result.port, result.output ?? {}, null, result.feedback);
   }
 
   /** Instruções do run: etapa, contexto de entrada, comentários que a trouxeram e tentativa anterior. */
@@ -1005,9 +1238,14 @@ export class FlowEngine {
         parts.push(
           `Análise de «${this.node(run, analysis.node_id)?.label ?? analysis.node_id}»: ${clip(analysis.step_output.summary, 1200)}`,
         );
-      parts.push(
-        'Copia para o workspace cada ficheiro do site que alterares, no mesmo caminho relativo, e altera-o aí; reporta-os em files. Indica em proposedTests os testes para o QA.',
-      );
+      if (developmentNodeConfig(node).repositoryId)
+        parts.push(
+          'Trabalha diretamente no checkout Git do repositório (diretório atual), numa branch própria já preparada: altera, cria ou apaga os ficheiros necessários. Não executes comandos git (o ZeroOps faz o commit, calcula o diff completo e publica). Usa a ferramenta zeroops_run_tests para correr os testes configurados; só contam os testes executados pelo ZeroOps. No relatório deixa files vazio.',
+        );
+      else
+        parts.push(
+          'Copia para o workspace cada ficheiro do site que alterares, no mesmo caminho relativo, e altera-o aí; reporta-os em files. Indica em proposedTests os testes para o QA.',
+        );
     }
     return clip(parts.join('\n\n'), INSTRUCTIONS_LIMIT);
   }
@@ -1067,47 +1305,17 @@ export class FlowEngine {
   private async startCopilot(run: Run, node: FlowNode, step: StepRow, input: StepInput) {
     const mode = copilotMode(node);
     const profile = run.execution.execution_context?.agentProfiles?.[node.id] ?? null;
-    if (profile && !profile.definition.modes.includes(mode))
-      return this.complete(
-        run,
-        step,
-        'failed',
-        {
-          errorCode: 'agent_profile_mode_unsupported',
-          reason: `O perfil «${profile.definition.name}» não suporta o modo ${mode}.`,
-        },
-        null,
-      );
-    if (node.config.skipWhenAutoDisabled) {
-      const project = (
-        await run.client.query<{ auto: boolean }>(
-          'SELECT agent_auto_investigate AS auto FROM projects WHERE id=$1',
-          [run.ticket.project_id],
+    const autoInvestigate = node.config.skipWhenAutoDisabled
+      ? Boolean(
+          (
+            await run.client.query<{ auto: boolean }>(
+              'SELECT agent_auto_investigate AS auto FROM projects WHERE id=$1',
+              [run.ticket.project_id],
+            )
+          ).rows[0]?.auto,
         )
-      ).rows[0];
-      if (!project?.auto)
-        return this.complete(
-          run,
-          step,
-          'failed',
-          {
-            errorCode: 'auto_disabled',
-            reason: 'A investigação automática está desativada neste projeto.',
-          },
-          null,
-        );
-    }
-    if (!(await copilotReady(run.client, run.ticket.project_id)))
-      return this.complete(
-        run,
-        step,
-        'failed',
-        {
-          errorCode: 'copilot_not_configured',
-          reason: 'O Copilot não está configurado e verificado neste projeto.',
-        },
-        null,
-      );
+      : true;
+    const ready = await copilotReady(run.client, run.ticket.project_id);
     const author = (
       await run.client.query<{ role: string }>(
         'SELECT role FROM project_memberships WHERE project_id=$1 AND user_id=$2',
@@ -1118,12 +1326,18 @@ export class FlowEngine {
       author && author.role !== 'client'
         ? run.ticket.created_by
         : await teamRequester(run.client, run.ticket.project_id);
-    if (!requestedBy)
+    const block = flowCopilotBlock(node, {
+      profile: profile ? { name: profile.definition.name, modes: profile.definition.modes } : null,
+      autoInvestigate,
+      copilotReady: ready,
+      hasTeamMember: Boolean(requestedBy),
+    });
+    if (block || !requestedBy)
       return this.complete(
         run,
         step,
         'failed',
-        { errorCode: 'no_team_member', reason: 'Não há membros da equipa ativos no projeto.' },
+        block ?? { errorCode: 'no_team_member', reason: 'Não há membros da equipa ativos.' },
         null,
       );
     const instructions = await this.instructionsWithIncident(run, node, step, input);
@@ -1174,6 +1388,35 @@ export class FlowEngine {
         ? (snapshotHashes[node.id] ?? null)
         : (run.execution.execution_context?.repositorySnapshotHash ?? null);
     const tools = profile?.definition.allowedTools ?? null;
+    const capabilityManifest =
+      profile && run.execution.execution_context?.capabilitiesByNode?.[node.id];
+    const development = developmentNodeConfig(node);
+    let developmentWorkspaceId: string | null = null;
+    if (mode === 'develop' && development.repositoryId) {
+      const key = (
+        await run.client.query<{ key: string }>('SELECT `key` FROM tickets WHERE id=$1', [
+          run.ticket.id,
+        ])
+      ).rows[0]?.key;
+      const ensured = await ensureWorkspace(run.client, {
+        ticketId: run.ticket.id,
+        ticketKey: key ?? run.ticket.id,
+        projectId: run.ticket.project_id,
+        repositoryId: development.repositoryId,
+        nodeId: node.id,
+        executionId: run.execution.id,
+        publish: development.publish,
+      });
+      if ('unavailable' in ensured)
+        return this.complete(
+          run,
+          step,
+          'failed',
+          { errorCode: 'repository_unavailable', reason: ensured.unavailable },
+          null,
+        );
+      developmentWorkspaceId = ensured.workspace.id;
+    }
     const runId = await queueAgentRun(run.client, {
       ticketId: run.ticket.id,
       projectId: run.ticket.project_id,
@@ -1184,6 +1427,7 @@ export class FlowEngine {
       mode: mode === 'develop' ? 'implement' : 'investigate',
       flowStepId: step.id,
       clientQuestionsAllowed: mode === 'analysis' && node.config.askClient !== false,
+      ...(developmentWorkspaceId ? { developmentWorkspaceId } : {}),
       ...(model ? { model } : {}),
       ...(profile
         ? {
@@ -1191,6 +1435,7 @@ export class FlowEngine {
             repositorySnapshotHash,
             repositoryResources,
             allowedTools: tools ?? [],
+            ...(capabilityManifest ? { capabilityManifest } : {}),
           }
         : repositoryResources.length
           ? {
@@ -1249,6 +1494,24 @@ export class FlowEngine {
     };
     const evidence = json(result.evidence);
     const tests = json(result.proposed_tests);
+    const workspace = (
+      await run.client.query<{
+        id: string;
+        branch: string;
+        repository_id: string;
+        base_sha: string | null;
+        head_sha: string | null;
+        diff_sha256: string | null;
+        tests_passed: boolean;
+        files: unknown;
+      }>(
+        `SELECT w.id,w.branch,w.repository_id,w.base_sha,w.head_sha,w.diff_sha256,w.tests_passed,w.files
+           FROM agent_runs r JOIN development_workspaces w ON w.id=r.development_workspace_id
+          WHERE r.id=$1`,
+        [step.agent_run_id],
+      )
+    ).rows[0];
+    const files = workspace ? json(workspace.files) : null;
     const output: FlowStepOutput = {
       summary: result.summary ?? undefined,
       replyDraft: result.reply_draft,
@@ -1256,23 +1519,43 @@ export class FlowEngine {
       patch: result.patch,
       proposedTests: Array.isArray(tests) ? (tests as string[]) : [],
       errorCode: result.error_code,
+      ...(workspace?.base_sha && workspace.head_sha && workspace.diff_sha256
+        ? {
+            development: {
+              workspaceId: workspace.id,
+              branch: workspace.branch,
+              baseSha: workspace.base_sha,
+              headSha: workspace.head_sha,
+              diffSha256: workspace.diff_sha256,
+              scopeHash: scopeHash({
+                repositoryId: workspace.repository_id,
+                baseSha: workspace.base_sha,
+                headSha: workspace.head_sha,
+                diffSha256: workspace.diff_sha256,
+              }),
+              testsPassed: Boolean(workspace.tests_passed),
+              files: Array.isArray(files) ? files.length : 0,
+            },
+          }
+        : {}),
     };
-    if (result.status !== 'succeeded') return this.complete(run, step, 'failed', output, null);
-    const legacyEdge = run.definition.edges.some(
-      (edge) => edge.source === step.node_id && edge.port === 'needs_information',
-    );
-    if (copilotMode(node) === 'analysis' && result.client_message_id && !legacyEdge) {
+    const outcome = flowCopilotOutcome(run.definition, node, {
+      succeeded: result.status === 'succeeded',
+      askedClient: Boolean(result.client_message_id),
+    });
+    if (outcome === 'await_client') {
       // A análise perguntou algo ao cliente: a etapa espera pela resposta e depois repete-se.
       await run.client.query(
         'UPDATE flow_execution_steps SET agent_run_id=NULL,step_output=$2 WHERE id=$1',
-        [step.id, { ...output, result: 'needs_information', awaitingClient: { runId: step.agent_run_id } }],
+        [
+          step.id,
+          { ...output, result: 'needs_information', awaitingClient: { runId: step.agent_run_id } },
+        ],
       );
       await this.moveTicket(run, 'awaiting_information', null);
       await this.event(run, step.id, 'awaiting_client', null, { runId: step.agent_run_id });
       return;
     }
-    if (copilotMode(node) === 'analysis' && result.client_message_id && legacyEdge)
-      return this.complete(run, step, 'needs_information', output, null);
-    await this.complete(run, step, 'done', output, null);
+    await this.complete(run, step, outcome, output, null);
   }
 }

@@ -41,23 +41,28 @@ API HTTP ──> serviços de aplicação ──> políticas de domínio
 
 As dependências diretas observadas e autorizadas são explícitas. Uma nova ligação entre domínios exige rever a direção, o motivo e os testes antes de entrar nesta lista.
 
-| Domínio         | Pode depender diretamente de                     |
-| --------------- | ------------------------------------------------ |
-| `agents`        | `identity`, `tickets`                            |
-| `connectors`    | nenhum domínio                                   |
-| `executions`    | nenhum domínio                                   |
-| `flows`         | `agents`, `health`, `identity`, `tickets`        |
-| `health`        | `connectors`, `identity`, `integrations`, `smtp` |
-| `identity`      | nenhum domínio                                   |
-| `integrations`  | `connectors`, `identity`, `smtp`                 |
-| `metrics`       | `identity`, `tickets`                            |
-| `notifications` | `identity`, `integrations`, `smtp`               |
-| `operations`    | `identity`                                       |
-| `smtp`          | nenhum domínio                                   |
-| `tickets`       | `identity`                                       |
-| `workflow`      | `identity`, `tickets`                            |
+| Domínio         | Pode depender diretamente de                                          |
+| --------------- | --------------------------------------------------------------------- |
+| `agents`        | `identity`, `tickets`                                                 |
+| `connectors`    | `identity`                                                            |
+| `executions`    | nenhum domínio                                                        |
+| `flows`         | `agents`, `health`, `identity`, `tickets`                             |
+| `health`        | `agents`, `connectors`, `identity`, `integrations`, `smtp`, `tickets` |
+| `identity`      | nenhum domínio                                                        |
+| `integrations`  | `connectors`, `identity`, `smtp`                                      |
+| `metrics`       | `identity`, `tickets`                                                 |
+| `notifications` | `identity`, `integrations`, `smtp`                                    |
+| `operations`    | `identity`                                                            |
+| `smtp`          | nenhum domínio                                                        |
+| `tickets`       | `identity`                                                            |
+| `workflow`      | `identity`, `tickets`                                                 |
 
 O mapa é protegido por `tests/architecture.boundaries.test.ts`, que também rejeita ciclos. Contratos partilhados e utilitários criptográficos de baixo nível ficam fora dos domínios; por isso o gateway não importa o serviço de runs apenas para calcular hashes e o manifesto do candidato pertence a `executions`, não a `workflow`.
+
+Esta tabela descreve a allowlist do teste, não certifica o grafo atual. A baseline
+P00 já falha por dependências fora dessa lista, ciclos e TSDoc preexistentes.
+O [inventário P00](compatibilidade-zeroops-agentico-p00.md) distingue essas dívidas
+das alterações da entrega; não foram abertas exceções para esconder as falhas.
 
 As dependências da tabela incluem adapters/factories locais que ainda fazem composição com integrações externas (por exemplo, o factory de Health). Essa composição deve migrar para entrypoints quando aumentar; não é autorização para um caso de uso importar detalhes internos arbitrários do domínio dependente.
 
@@ -98,6 +103,24 @@ export function approveStage(/* ... */) {
 - Usar SQL parametrizado. Transações abrangem todas as alterações que precisam de consistência; não esconder efeitos externos dentro de callbacks transacionais sem política para retries.
 - Representar falhas com erros de domínio tipados/códigos estáveis e traduzir para HTTP na fronteira da API. Não devolver sucesso vazio quando uma operação falha.
 - Autorização deve ser verificada no backend para cada caso de uso. A UI não é uma fronteira de segurança.
+- Permissões delegáveis por projeto são resolvidas em `identity/project-permissions`.
+  Grants não promovem papéis nem conferem revisão de tickets. Mutações funcionais
+  e de grants obtêm o lock de projeto antes de locks funcionais, revalidam a BD e
+  usam auditoria/revisão transacional. Revogações não removem grants de terceiros.
+  Ver [ADRs P00](adrs-agentico-p00.md) e [progresso P00/P01](progresso-zeroops-agentico.md).
+- Agentes e skills (P04) são capacidades versionadas em `agents`, com o bundle e o hash
+  imutáveis. O executor só materializa bundles verificados por hash e compila-os para o SDK.
+  Hooks, skills e especialistas nunca concedem permissões: a autorização fica na política
+  efetiva e no `ConnectorGateway`.
+- Autoridade única (P11): enquanto um ticket tem execução de fluxo viva, só o motor muda o
+  seu estado. `tickets/flow-authority.ts` é a única verificação, usada por `TicketsService`,
+  `TicketGovernanceService` e `WorkflowService`; caminhos legados rejeitam (`FLOW_MANAGED`) ou
+  delegam no motor. Tickets antigos sem execução não são adotados implicitamente
+  (`flows/flow-adoption.ts`, decisão auditada única por ticket).
+- Manutenção que remove dados (`operations/retention.service.ts`) nunca corre sozinha:
+  dry-run com hash, aplicação com `expect` igual e predicados reavaliados com lock no momento
+  da remoção. Métricas operacionais (`metrics/operations-metrics.service.ts`) só agregam
+  valores registados; ausência de dados aparece como `null`, nunca como zero inventado.
 - Não misturar políticas de Qualidade e Produção. Acesso a Produção é somente leitura neste produto e requer configuração/autorizações próprias.
 - Separar investigação read-only de execução de alterações. Escrita em QA exige autorização ligada ao ticket, artefacto e ambiente; nunca reutilizar a credencial do conector de investigação.
 - Evitar funções/classe gigantes; extrair uma unidade quando tiver nome, contrato e teste próprios e quando isso tornar o fluxo principal mais fácil de compreender.

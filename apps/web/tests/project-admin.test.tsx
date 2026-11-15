@@ -1,6 +1,10 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { healthSettingsSchema, type InstanceProject } from '@zeroops/contracts';
+import {
+  healthSettingsSchema,
+  projectPermissionKeys,
+  type InstanceProject,
+} from '@zeroops/contracts';
 import { App } from '../src/App';
 import { parseFlowsRoute } from '../src/features/flows/FlowsPage';
 import {
@@ -63,6 +67,13 @@ function mockApi(user = actor) {
     }
     const detail = path.match(/^\/api\/project-admin\/([^/]+)$/);
     if (detail?.[1]) return Response.json(project(detail[1]));
+    const access = path.match(/^\/api\/projects\/([^/]+)\/access$/);
+    if (access?.[1])
+      return Response.json({
+        project: project(access[1]),
+        isAdmin: user.instanceAdmin || user.role === 'admin',
+        permissions: user.instanceAdmin || user.role === 'admin' ? projectPermissionKeys : [],
+      });
     if (path.endsWith('/flows')) return Response.json([]);
     if (/\/flows\/[^/]+$/.test(path))
       return Response.json({ error: 'not_found', message: 'Flow not found.' }, { status: 404 });
@@ -246,6 +257,7 @@ describe('Explicit project administration', () => {
       'Parâmetros e integrações',
       'Saúde e notificações',
       'Fluxos de resolução',
+      'Permissões do projeto',
     ]);
     fireEvent.change(name, { target: { value: 'Draft one' } });
     view.rerender(tree('two'));

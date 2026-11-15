@@ -404,12 +404,12 @@ describe('AlertmanagerReceiver', () => {
     const first = await runs.claimNext();
     expect(first?.runId).toBeDefined();
     expect(first?.ticket.key).toBeDefined();
-    await runs.complete(first!.runId, { summary: 'MySQL parado.', replyDraft: null, evidence: [] });
+    await runs.complete(first!.lease, { summary: 'MySQL parado.', replyDraft: null, evidence: [] });
     expect(await incidentState(ticketId)).toBe('reviewing');
     expect((await triggers()).map((run) => run.run_trigger)).toEqual(['auto', 'incident_review']);
 
     const review = await runs.claimNext();
-    await runs.complete(review!.runId, {
+    await runs.complete(review!.lease, {
       summary: 'O MySQL parou e foi reiniciado.',
       replyDraft: 'A base de dados esteve indisponível e foi reposta.',
       evidence: [],

@@ -12,9 +12,12 @@ const webRoot = path.join(root, 'apps/web/src');
 
 const allowedDomainDependencies: Readonly<Record<string, readonly string[]>> = {
   agents: ['identity', 'tickets'],
+  capabilities: ['delivery', 'development', 'flows', 'identity', 'tickets'],
   connectors: ['identity'],
+  delivery: ['development', 'identity', 'tickets'],
+  development: ['agents', 'executions', 'identity', 'tickets'],
   executions: [],
-  flows: ['agents', 'health', 'identity', 'tickets'],
+  flows: ['agents', 'delivery', 'development', 'health', 'identity', 'tickets'],
   health: ['agents', 'connectors', 'identity', 'integrations', 'smtp', 'tickets'],
   identity: [],
   integrations: ['connectors', 'identity', 'smtp'],

@@ -41,10 +41,16 @@ WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL;
 -- Child-first deletion predicates (all ticket scopes use SELECT id FROM tickets WHERE project_id=$1):
 -- notification_delivery_state -> matching outbox payload.ticketId
 -- notification_outbox -> matching payload.ticketId (derived subquery for MySQL)
+-- delivery_events -> delivery_runs -> ticket; delivery_runs -> ticket (P09; resource_locks expire)
+-- capability_development_events -> capability_developments -> ticket (P10; refused while publishing/reconciling)
+-- development_review_decisions/publications/test_runs/revisions/workspaces -> ticket (P08)
 -- flow_decisions -> flow_execution_steps -> flow_executions -> ticket
 -- flow_execution_events -> flow_executions -> ticket
 -- flow_execution_steps -> flow_executions -> ticket
 -- flow_executions -> ticket
+-- ticket_flow_adoptions -> ticket (P11; explicit adoption/exclusion records)
+-- ticket_routing_events, ticket_routing_replies, ticket_routing_jobs, ticket_routing -> ticket (P05)
+-- agent_job_events -> ticket_id (no FK; explicitly scoped)
 -- flow_assistant_requests -> ticket_id (no FK; explicitly scoped)
 -- connector_relay_requests -> agent_runs -> ticket
 -- agent_run_inputs -> agent_runs -> ticket
@@ -66,10 +72,25 @@ WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL;
 DELETE FROM `identity_confirmations` WHERE (project_id=$1 OR project_id IS NULL) AND EXISTS(SELECT 1 FROM tickets t WHERE t.project_id=$1 AND (identity_confirmations.target=t.id OR identity_confirmations.target LIKE CONCAT(t.id,':%')));
 DELETE FROM `notification_delivery_state` WHERE outbox_id IN (SELECT o.id FROM notification_outbox o JOIN tickets t ON t.id=JSON_UNQUOTE(JSON_EXTRACT(o.payload,'$.ticketId')) WHERE t.project_id=$1);
 DELETE FROM `notification_outbox` WHERE id IN (SELECT id FROM (SELECT o.id FROM notification_outbox o JOIN tickets t ON t.id=JSON_UNQUOTE(JSON_EXTRACT(o.payload,'$.ticketId')) WHERE t.project_id=$1) purge_outbox);
+DELETE FROM `delivery_events` WHERE delivery_id IN (SELECT id FROM delivery_runs WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1));
+DELETE FROM `delivery_runs` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `capability_development_events` WHERE development_id IN (SELECT id FROM capability_developments WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1));
+DELETE FROM `capability_developments` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `development_review_decisions` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `development_publications` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `development_test_runs` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `development_revisions` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `development_workspaces` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
 DELETE FROM `flow_decisions` WHERE step_id IN (SELECT id FROM flow_execution_steps WHERE execution_id IN (SELECT id FROM flow_executions WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1)));
 DELETE FROM `flow_execution_events` WHERE execution_id IN (SELECT id FROM flow_executions WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1));
 DELETE FROM `flow_execution_steps` WHERE execution_id IN (SELECT id FROM flow_executions WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1));
 DELETE FROM `flow_executions` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `ticket_flow_adoptions` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `ticket_routing_events` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `ticket_routing_replies` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `ticket_routing_jobs` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `ticket_routing` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
+DELETE FROM `agent_job_events` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
 DELETE FROM `flow_assistant_requests` WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1);
 DELETE FROM `connector_relay_requests` WHERE run_id IN (SELECT id FROM agent_runs WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1));
 DELETE FROM `agent_run_inputs` WHERE run_id IN (SELECT id FROM agent_runs WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id=$1));

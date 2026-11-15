@@ -3,6 +3,7 @@ import { parseArgs } from 'node:util';
 import { Database } from '../../../packages/backend/src/database/database.js';
 import { createHealthMonitoring } from '../../../packages/backend/src/modules/health/health.module.js';
 import { FlowEngine } from '../../../packages/backend/src/modules/flows/flow-engine.js';
+import { FlowAdoptionService } from '../../../packages/backend/src/modules/flows/flow-adoption.js';
 import { createFlowActionRegistry } from '../../../packages/backend/src/modules/incidents/incident.module.js';
 import { IdentityCipher } from '../../../packages/backend/src/modules/identity/identity-security.js';
 import {
@@ -11,6 +12,10 @@ import {
 } from '../../../packages/backend/src/modules/integrations/integration-probe.js';
 import { IntegrationSettingsService } from '../../../packages/backend/src/modules/integrations/integration-settings.service.js';
 import { OperatorSession } from '../../../packages/backend/src/modules/operations/operator-session.js';
+import {
+  RetentionService,
+  retentionPolicyFromEnv,
+} from '../../../packages/backend/src/modules/operations/retention.service.js';
 
 const usage = `zeroops-ops <comando> --as <email-admin> [opcoes]
 
@@ -22,6 +27,14 @@ const usage = `zeroops-ops <comando> --as <email-admin> [opcoes]
   agent-token     --out /caminho/ficheiro Gera o token do agente e escreve-o (modo 600); nunca o imprime.
   health-run                             Corre um ciclo de verificacoes e entrega alertas.
   health-report                          Envia ja o relatorio periodico.
+  migration-inventory [--project ID]     Inventario de fluxos/execucoes/esperas/jobs com hashes (so leitura).
+  flow-adoption   [--project ID] --disposition start|exclude [--tickets ID,ID] [--reason R]
+                  [--apply --expect HASH]
+                  Tickets antigos sem execucao: sem --apply mostra a selecao e o hash (dry-run);
+                  com --apply regista a disposicao (auditada, uma vez por ticket). Nunca automatico.
+  retention       [--project ID | --all-projects] [--apply --expect HASH]
+                  Retencao de eventos de jobs, simulacoes, outbox entregue e deltas de runs
+                  (ZEROOPS_RETENTION_*_DAYS; 0 desativa). Sem --apply: selecao e hash (dry-run).
 
 Nao aceita passwords: atua em nome de um administrador existente e fica auditado (ops.cli).`;
 
@@ -38,6 +51,13 @@ const { positionals, values: args } = parseArgs({
     out: { type: 'string' },
     url: { type: 'string' },
     matchers: { type: 'string' },
+    project: { type: 'string' },
+    disposition: { type: 'string' },
+    reason: { type: 'string' },
+    expect: { type: 'string' },
+    tickets: { type: 'string' },
+    apply: { type: 'boolean', default: false },
+    'all-projects': { type: 'boolean', default: false },
   },
 });
 const command = positionals[0];
@@ -71,6 +91,7 @@ const health = createHealthMonitoring(
   undefined,
   { ticketCreated: [flowEngine.onTicketCreated], incidentDelegate: flowEngine.incidentDelegate },
 ).service;
+const adoption = new FlowAdoptionService(db, flowEngine);
 
 const required = (name: 'host' | 'port' | 'from' | 'file' | 'out' | 'url') => {
   const value = args[name];
@@ -146,6 +167,26 @@ async function run(operator: OperatorSession): Promise<Record<string, unknown>> 
       return health.runNow(operator.actor);
     case 'health-report':
       return { ...(await health.reportNow(operator.actor)) };
+    case 'migration-inventory':
+      return adoption.inventory(operator.actor, args.project ?? operator.actor.projectId);
+    case 'flow-adoption': {
+      const projectId = args.project ?? operator.actor.projectId;
+      if (!args.apply) return { dryRun: true, ...(await adoption.plan(operator.actor, projectId)) };
+      return adoption.apply(operator.actor, {
+        projectId,
+        disposition: args.disposition,
+        reason: args.reason,
+        expect: args.expect,
+        ...(args.tickets ? { ticketIds: args.tickets.split(',').map((id) => id.trim()) } : {}),
+      });
+    }
+    case 'retention': {
+      const projectId = args['all-projects'] ? null : (args.project ?? operator.actor.projectId);
+      const service = new RetentionService(db, retentionPolicyFromEnv(env));
+      if (!args.apply) return { dryRun: true, ...(await service.plan(operator.actor, projectId)) };
+      if (!args.expect) throw new Error('--expect HASH obrigatorio com --apply (hash do dry-run).');
+      return service.apply(operator.actor, { projectId, expect: args.expect });
+    }
     default:
       throw new Error(`Comando desconhecido: ${command}\n\n${usage}`);
   }

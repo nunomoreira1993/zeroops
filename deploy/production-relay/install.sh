@@ -151,6 +151,7 @@ fi
 sed -e 's/\r$//' \
   -e "s|^ExecStart=.*zeroops-relay.php.*|& $CONF_DIR|" \
   -e "s|^Description=.*|& [${INSTANCE:-principal}]|" \
+  -e "s|^StateDirectory=.*|StateDirectory=$SERVICE|" \
   "$SRC_DIR/zeroops-relay.service" > "/etc/systemd/system/$SERVICE.service"
 chmod 0644 "/etc/systemd/system/$SERVICE.service"
 systemctl daemon-reload

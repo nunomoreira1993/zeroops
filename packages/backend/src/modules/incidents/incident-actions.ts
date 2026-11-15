@@ -20,6 +20,11 @@ import {
   type RecoveryCriterion,
   type ValidationSettings,
 } from '../../../../contracts/src/index.js';
+import {
+  acquireResourceLock,
+  healthResourceKey,
+  releaseLocksOf,
+} from '../../database/resource-locks.js';
 import type {
   FlowActionContext,
   FlowActionExecutor,
@@ -52,6 +57,12 @@ const INCIDENT_GRACE_MS = 2 * 60_000;
 const RELAY_DEADLINE_MS = 90_000;
 /** Espera máxima por outra intervenção em curso no mesmo recurso. */
 const BUSY_LIMIT_MS = 30 * 60_000;
+/** Contrato versionado do pedido de intervenção enviado ao relay. */
+export const INTERVENTION_CONTRACT = 'zeroops.intervention/2';
+/** O lock do recurso cobre a intervenção e a validação seguinte (renovado em cada medição). */
+const HEALTH_LOCK_SECONDS = 2 * 3600;
+/** Resultado desconhecido: o recurso fica reservado até reconciliar ou alguém decidir. */
+const UNCERTAIN_LOCK_SECONDS = 7 * 24 * 3600;
 
 const RELAY_TOOLS: Record<InterventionAction, string> = {
   service_restart: 'restart',
@@ -110,6 +121,7 @@ interface InterventionRow {
   relay_request_id: string | null;
   result_text: string | null;
   created_at: Date;
+  resource_key?: string | null;
 }
 
 const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
@@ -214,10 +226,45 @@ function lastAuthorization(steps: TrailStep[]) {
   });
   if (index < 0) return null;
   const incident = steps[index]!.step_output!.incident!;
-  const approved = steps
+  const approval = steps
     .slice(index + 1)
-    .some((step) => step.actor_id && (step.port === 'approve' || step.port === 'success'));
-  return { incident, approved };
+    .find((step) => step.actor_id && (step.port === 'approve' || step.port === 'success'));
+  return { incident, approved: Boolean(approval), approverId: approval?.actor_id ?? null };
+}
+
+/** O aprovador continua ativo no projeto (ou é administrador da instância) no momento de executar. */
+async function approverStillActive(context: FlowActionContext, userId: string) {
+  const row = (
+    await context.client.query<{ id: string }>(
+      `SELECT u.id FROM users u
+         LEFT JOIN project_memberships m ON m.user_id=u.id AND m.project_id=$2
+        WHERE u.id=$1 AND NOT u.disabled AND (u.instance_admin OR (m.user_id IS NOT NULL AND NOT m.disabled))`,
+      [userId, context.ticket.projectId],
+    )
+  ).rows[0];
+  return Boolean(row);
+}
+
+/** Lock do recurso real: o host (partilhado entre projetos); sem host, a unidade no ambiente. */
+function healthLockKey(environment: string, host: string | null, target: string) {
+  return host ? healthResourceKey(host, null) : healthResourceKey(`?${environment}`, target);
+}
+
+const lockHolder = (context: FlowActionContext) => ({
+  kind: 'intervention' as const,
+  id: context.ticket.id,
+  projectId: context.ticket.projectId,
+});
+
+/** Liberta o recurso do ticket, salvo se houver uma intervenção com resultado desconhecido. */
+async function releaseHealthLock(context: FlowActionContext) {
+  const uncertain = (
+    await context.client.query<{ id: string }>(
+      "SELECT id FROM incident_interventions WHERE ticket_id=$1 AND status='uncertain' LIMIT 1",
+      [context.ticket.id],
+    )
+  ).rows[0];
+  if (!uncertain) await releaseLocksOf(context.client, lockHolder(context));
 }
 
 /** Relatório da investigação: o mais recente nas etapas ou o resumo do Copilot anterior. */
@@ -268,6 +315,7 @@ function interventionLine(row: InterventionRow) {
     cancelled: 'cancelada',
     running: 'em curso',
     pending: 'pendente',
+    uncertain: 'resultado desconhecido (por reconciliar)',
   };
   const result = row.result_text ? ` — ${clip(row.result_text, 300)}` : '';
   return `${label} em ${row.target}${change}: ${statusLabel[row.status] ?? row.status}${result}`;
@@ -288,14 +336,15 @@ async function insertIntervention(
     relayRequestId?: string | null;
     result?: string | null;
     finished: boolean;
+    resourceKey?: string | null;
   },
 ) {
   const id = randomUUID();
   await context.client.query(
     `INSERT INTO incident_interventions(id,ticket_id,project_id,environment,step_id,action,target,parameter,
        previous_value,new_value,rollback_hint,decision,decision_reason,status,relay_request_id,result_text,
-       actor_kind,created_at,finished_at)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'agent',$17,$18)`,
+       actor_kind,created_at,finished_at,resource_key,contract_version)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'agent',$17,$18,$19,$20)`,
     [
       id,
       context.ticket.id,
@@ -315,6 +364,8 @@ async function insertIntervention(
       values.result ? clip(values.result, 2000) : null,
       context.now,
       values.finished ? context.now : null,
+      values.resourceKey ? clip(values.resourceKey, 300) : null,
+      INTERVENTION_CONTRACT,
     ],
   );
   return id;
@@ -344,19 +395,36 @@ async function finishIntervention(
   );
 }
 
-/** Outra intervenção em curso no mesmo recurso (evita intervenções em simultâneo). */
-async function busyResource(context: FlowActionContext, incident: IncidentRow) {
+/**
+ * Outra intervenção em curso no mesmo recurso (evita intervenções em simultâneo): intervenções
+ * pendentes do projeto ou o lock durável do recurso real detido por outro ticket (de qualquer projeto).
+ */
+async function busyResource(context: FlowActionContext, incident: IncidentRow, target?: string) {
   const row = (
     await context.client.query<{ busy: number }>(
       `SELECT COUNT(*) AS busy FROM incident_interventions i
          JOIN health_incidents h ON h.ticket_id=i.ticket_id
         WHERE i.project_id=$1 AND i.environment=$2 AND i.ticket_id<>$3
-          AND i.status IN ('pending','running')
+          AND i.status IN ('pending','running','uncertain')
           AND (h.resource_host <=> $4)`,
       [context.ticket.projectId, incident.environment, context.ticket.id, incident.resource_host],
     )
   ).rows[0];
-  return Number(row?.busy ?? 0) > 0;
+  if (Number(row?.busy ?? 0) > 0) return true;
+  // Demonstrações não tocam no recurso real: não esperam pelo lock partilhado.
+  if (incident.demo_scenario) return false;
+  const key = healthLockKey(
+    incident.environment,
+    incident.resource_host,
+    target ?? incident.resource_unit ?? '*',
+  );
+  const lock = (
+    await context.client.query<{ holder_id: string }>(
+      'SELECT holder_id FROM resource_locks WHERE lock_key=$1 AND holder_id<>$2 AND expires_at>NOW(3)',
+      [key, context.ticket.id],
+    )
+  ).rows[0];
+  return Boolean(lock);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -517,6 +585,18 @@ function createRemediate(deps: IncidentActionDeps): FlowActionExecutor {
       return { port: 'failed', output: { reason: 'Sem incidente da Saúde associado ao pedido.' } };
     const current = await stepIncident(context);
     if (current.interventionId) return pollIntervention(context, current);
+    const pendingUncertain = (
+      await context.client.query<{ id: string }>(
+        "SELECT id FROM incident_interventions WHERE ticket_id=$1 AND status='uncertain' LIMIT 1",
+        [context.ticket.id],
+      )
+    ).rows[0];
+    if (pendingUncertain) {
+      const reason =
+        'Há uma intervenção anterior com resultado desconhecido: reconciliar antes de repetir (nunca se repete automaticamente).';
+      await note(context, reason);
+      return { port: 'uncertain', output: { reason } };
+    }
 
     const steps = await trail(context);
     const authorization = lastAuthorization(steps);
@@ -548,12 +628,19 @@ function createRemediate(deps: IncidentActionDeps): FlowActionExecutor {
       proposal,
     );
     const needsApproval = authorized.decision !== 'auto' || evaluation.decision === 'approval';
+    const approverGone =
+      needsApproval &&
+      authorization.approved &&
+      authorization.approverId !== null &&
+      !(await approverStillActive(context, authorization.approverId));
     const refusal =
       evaluation.decision === 'forbidden' || authorized.decision === 'forbidden'
         ? evaluation.reason
         : needsApproval && !authorization.approved
           ? 'A ação exige aprovação humana e não foi aprovada.'
-          : null;
+          : approverGone
+            ? 'Quem aprovou a ação já não tem acesso ativo ao projeto: a aprovação deixou de valer.'
+            : null;
     const base: IncidentOutput = {
       action,
       target: proposal.target,
@@ -617,7 +704,9 @@ function createRemediate(deps: IncidentActionDeps): FlowActionExecutor {
         },
       };
     }
-    if (await busyResource(context, incident)) {
+    const lockHost = action === 'server_reboot' ? proposal.target : resource.host;
+    const resourceKey = healthLockKey(incident.environment, lockHost, proposal.target);
+    if (await busyResource(context, { ...incident, resource_host: lockHost }, proposal.target)) {
       if (elapsedMs(context) < BUSY_LIMIT_MS)
         return {
           wait: later(context.now, 60_000),
@@ -646,10 +735,23 @@ function createRemediate(deps: IncidentActionDeps): FlowActionExecutor {
       await note(context, `Intervenção não executada: ${reason}`);
       return { port: 'forbidden', output: { reason, incident: { ...base, interventionId: id } } };
     }
+    const lock = await acquireResourceLock(
+      context.client,
+      resourceKey,
+      lockHolder(context),
+      HEALTH_LOCK_SECONDS,
+    );
+    if (!lock.acquired)
+      return {
+        wait: later(context.now, 60_000),
+        output: { reason: 'Outra intervenção (possivelmente de outro projeto) detém o recurso.' },
+      };
     const requestId = randomUUID();
     const interventionId = await record('running', 'Enviado ao relay.', {
       relayRequestId: requestId,
+      resourceKey,
     });
+    const deadline = new Date(context.now.getTime() + RELAY_DEADLINE_MS);
     await context.client.query(
       'INSERT INTO connector_relay_requests(id,project_id,run_id,tool,payload,created_at) VALUES($1,$2,NULL,$3,$4,$5)',
       [
@@ -657,7 +759,11 @@ function createRemediate(deps: IncidentActionDeps): FlowActionExecutor {
         context.ticket.projectId,
         RELAY_TOOLS[action],
         JSON.stringify({
+          contractVersion: INTERVENTION_CONTRACT,
           interventionId,
+          idempotencyKey: requestId,
+          deadline: deadline.toISOString(),
+          resourceKey,
           environment: incident.environment,
           unit: action === 'server_reboot' ? null : proposal.target,
           host: action === 'server_reboot' ? proposal.target : resource.host,
@@ -678,7 +784,7 @@ async function pollIntervention(
   const row = (
     await context.client.query<InterventionRow>(
       `SELECT id,action,target,parameter,previous_value,new_value,rollback_hint,decision,status,
-              relay_request_id,result_text,created_at
+              relay_request_id,result_text,created_at,resource_key
          FROM incident_interventions WHERE id=$1 FOR UPDATE`,
       [current.interventionId],
     )
@@ -688,8 +794,10 @@ async function pollIntervention(
     port,
     output: { reason, summary: reason, incident: { ...current, ...extra } },
   });
-  if (row.status === 'cancelled')
+  if (row.status === 'cancelled') {
+    await releaseHealthLock(context);
     return finished('failed', row.result_text ?? 'A intervenção foi cancelada.');
+  }
   const request = row.relay_request_id
     ? (
         await context.client.query<{
@@ -727,22 +835,54 @@ async function pollIntervention(
       rollback,
     });
   }
+  if (request?.status === 'failed' && request.error_code === 'UNCERTAIN') {
+    const reason = `O relay foi interrompido durante a intervenção: ${request.error_message ?? 'resultado desconhecido'}. Não é repetida; o recurso fica reservado até alguém confirmar.`;
+    await finishIntervention(context, row.id, 'uncertain', reason);
+    if (row.resource_key)
+      await acquireResourceLock(
+        context.client,
+        row.resource_key,
+        lockHolder(context),
+        UNCERTAIN_LOCK_SECONDS,
+      );
+    await note(context, `Intervenção com resultado desconhecido: ${reason}`);
+    return finished('uncertain', reason);
+  }
   if (request?.status === 'failed' || request?.status === 'expired') {
     const reason = `O relay recusou ou falhou a intervenção${request.error_code ? ` (${request.error_code})` : ''}: ${request.error_message ?? 'sem detalhe'}.`;
     await finishIntervention(context, row.id, 'failed', reason);
+    await releaseHealthLock(context);
     await note(context, `Intervenção falhou: ${reason}`);
     return finished('failed', reason);
   }
   if (context.now.getTime() - new Date(row.created_at).getTime() > RELAY_DEADLINE_MS) {
-    if (row.relay_request_id)
-      await context.client.query(
-        "UPDATE connector_relay_requests SET status='expired',finished_at=NOW(3) WHERE id=$1 AND status IN ('pending','claimed')",
-        [row.relay_request_id],
+    // Nunca entregue ao relay: é seguro dar por falhada (o relay recusa pedidos fora do prazo).
+    const expired = row.relay_request_id
+      ? await context.client.query(
+          "UPDATE connector_relay_requests SET status='expired',finished_at=NOW(3) WHERE id=$1 AND status='pending'",
+          [row.relay_request_id],
+        )
+      : { rowCount: 1 };
+    if (expired.rowCount) {
+      const reason = 'O relay não recolheu o pedido a tempo: a intervenção não foi executada.';
+      await finishIntervention(context, row.id, 'failed', reason);
+      await releaseHealthLock(context);
+      await note(context, `Intervenção falhou: ${reason}`);
+      return finished('failed', reason);
+    }
+    // Já recolhido pelo relay: o efeito é desconhecido. Não se repete; reconcilia-se mais tarde.
+    const reason =
+      'O relay recolheu o pedido mas não respondeu a tempo: resultado desconhecido. A intervenção não é repetida; o recurso fica reservado até reconciliar.';
+    await finishIntervention(context, row.id, 'uncertain', reason);
+    if (row.resource_key)
+      await acquireResourceLock(
+        context.client,
+        row.resource_key,
+        lockHolder(context),
+        UNCERTAIN_LOCK_SECONDS,
       );
-    const reason = 'O relay não respondeu a tempo: a intervenção não foi confirmada.';
-    await finishIntervention(context, row.id, 'failed', reason);
-    await note(context, `Intervenção falhou: ${reason}`);
-    return finished('failed', reason);
+    await note(context, `Intervenção com resultado desconhecido: ${reason}`);
+    return finished('uncertain', reason);
   }
   return { wait: later(context.now, 5000) };
 }
@@ -799,9 +939,7 @@ function createValidate(deps: IncidentActionDeps): FlowActionExecutor {
         resource,
         settings,
       });
-    else measurement = { ok: null, detail: 'Sem sonda para o critério.' };
-    // Sem dados do critério, vale o estado dos alertas do incidente.
-    if (measurement.ok === null)
+    else if (criterion === 'alerts_resolved')
       measurement =
         incident.state !== 'open'
           ? { ok: true, detail: 'Os alertas do incidente recuperaram.' }
@@ -809,11 +947,24 @@ function createValidate(deps: IncidentActionDeps): FlowActionExecutor {
               ok: false,
               detail: `O alerta ${incident.alert_name ?? incident.root_title} continua ativo.`,
             };
+    else measurement = { ok: null, detail: 'Sem sonda para o critério.' };
+    // Sem telemetria recente o resultado é desconhecido: nunca conta como serviço saudável.
+    const unknown = measurement.ok === null;
+    if (unknown)
+      measurement = {
+        ok: null,
+        detail: `Sem telemetria recente para ${criterion}: resultado desconhecido (${measurement.detail})`,
+      };
 
     const current = await stepIncident(context);
     const measurements = [
       ...(current.measurements ?? []),
-      { at: context.now.toISOString(), ok: measurement.ok === true, detail: measurement.detail },
+      {
+        at: context.now.toISOString(),
+        ok: measurement.ok === true,
+        ...(unknown ? { unknown: true } : {}),
+        detail: measurement.detail,
+      },
     ].slice(-20);
     let okSince: string | null = null;
     for (const item of measurements) okSince = item.ok ? (okSince ?? item.at) : null;
@@ -825,16 +976,25 @@ function createValidate(deps: IncidentActionDeps): FlowActionExecutor {
 
     if (okSince && context.now.getTime() - new Date(okSince).getTime() >= observationMs) {
       const summary = `Recuperação confirmada (${criterion}): ${measurement.detail}`;
+      await releaseHealthLock(context);
       await note(context, summary);
       return { port: 'recovered', output: { summary, incident: output } };
     }
     if (elapsedMs(context) >= timeoutMs && !okSince) {
+      if (unknown) {
+        const reason = `Sem telemetria ao fim de ${settings.timeoutMinutes} min: recuperação por confirmar (${measurement.detail}).`;
+        await releaseHealthLock(context);
+        await note(context, `${reason} A escalar.`);
+        return { port: 'unknown', output: { reason, incident: output } };
+      }
       const intervened = done.some((row) => ['succeeded', 'simulated'].includes(row.status));
+      const uncertain = done.some((row) => row.status === 'uncertain');
       const reason = `Sem recuperação ao fim de ${settings.timeoutMinutes} min: ${measurement.detail}`;
-      if (intervened && attempts < settings.maxAttempts) {
+      if (intervened && !uncertain && attempts < settings.maxAttempts) {
         await note(context, `${reason} Nova tentativa (${attempts + 1}/${settings.maxAttempts}).`);
         return { port: 'retry', output: { reason, incident: output } };
       }
+      await releaseHealthLock(context);
       await note(context, `${reason} A escalar.`);
       return { port: 'not_recovered', output: { reason, incident: output } };
     }
@@ -842,6 +1002,11 @@ function createValidate(deps: IncidentActionDeps): FlowActionExecutor {
     const next = Math.min(
       context.now.getTime() + (demo ? 20_000 : 60_000),
       Math.max(deadline, context.now.getTime() + 5000),
+    );
+    // Renova a reserva do recurso enquanto a validação observa (impede remediações concorrentes).
+    await context.client.query(
+      "UPDATE resource_locks SET expires_at=GREATEST(expires_at,TIMESTAMPADD(SECOND,$2,NOW(3))) WHERE holder_kind='intervention' AND holder_id=$1",
+      [context.ticket.id, HEALTH_LOCK_SECONDS],
     );
     return { wait: new Date(next), output: { incident: output } };
   };

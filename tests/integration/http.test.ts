@@ -204,7 +204,8 @@ describe('HTTP, sessao e CSRF', () => {
     expect(queued.status).toBe(201);
     const run = (await queued.json()) as AgentRun;
     const runs = new AgentRunsService(fixture.db);
-    expect((await runs.claimNext())?.runId).toBe(run.id);
+    const claimed = await runs.claimNext();
+    expect(claimed?.runId).toBe(run.id);
     const endpoint = `${base}/api/tickets/${ticket.id}/agent-runs/${run.id}`;
     expect((await fetch(`${endpoint}/events/stream`)).status).toBe(401);
     expect(
@@ -372,7 +373,7 @@ describe('HTTP, sessao e CSRF', () => {
       expect(prompts[1]).toContain('Confirme tambem a disponibilidade.');
       expect(report.summary).toBe('Conversa validada.');
       await conversation.close();
-      await runs.complete(run.id, report);
+      await runs.complete(claimed!.lease, report);
       for (;;) {
         const chunk = await reader.read();
         if (chunk.done) break;

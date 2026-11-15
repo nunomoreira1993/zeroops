@@ -15,6 +15,21 @@ const SNAPSHOT_LIMIT = 256 * 1024;
 const RESOURCE_LIMIT = 160;
 const LINK_LIMIT = 10;
 const TEXT_EXTENSIONS = new Set(['.md', '.txt', '.json', '.yaml', '.yml', '.sh', '.py', '.ts']);
+/** Ficheiros de texto aceites num bundle de skill (scripts, referências e exemplos). */
+const SKILL_EXTENSIONS = new Set([
+  ...TEXT_EXTENSIONS,
+  '.js',
+  '.mjs',
+  '.ps1',
+  '.sql',
+  '.csv',
+  '.toml',
+  '.ini',
+  '.xml',
+  '.html',
+  '.php',
+]);
+const SKILL_TREE_LIMIT = 40;
 const RELEVANCE_LIMIT = 3;
 const relevanceStopWords = new Set([
   'about',
@@ -282,6 +297,57 @@ export class RepositoryResources {
       }
     }
     return { snapshotHash: repositorySnapshotHash(snapshots), resources: snapshots };
+  }
+
+  /**
+   * Lê a árvore de uma skill descoberta (diretório do `SKILL.md`) para importação no catálogo.
+   * Só aceita um `SKILL.md` presente no catálogo do site; ignora ocultos, symlinks e binários.
+   */
+  async readSkillTree(siteKey: string | null, skillPath: string) {
+    const catalog = await this.discover(siteKey);
+    const resource = catalog.resources.find(
+      (item) => item.path === skillPath && item.kind === 'skill',
+    );
+    const root = await this.repositoryRoot(siteKey);
+    if (!catalog.available || !root || !resource) return null;
+    const directory = skillPath.includes('/') ? skillPath.slice(0, skillPath.lastIndexOf('/')) : '';
+    const files: { path: string; content: string }[] = [];
+    const visit = async (relativeDirectory: string, depth: number): Promise<void> => {
+      if (depth > 5 || files.length > SKILL_TREE_LIMIT) return;
+      const info = await lstat(resolve(root, relativeDirectory || '.')).catch(() => null);
+      if (!info?.isDirectory() || info.isSymbolicLink()) return;
+      const entries = await readdir(resolve(root, relativeDirectory || '.'), {
+        withFileTypes: true,
+      }).catch(() => []);
+      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (entry.name.startsWith('.')) continue;
+        const path = normalize(
+          relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name,
+        );
+        if (entry.isDirectory()) await visit(path, depth + 1);
+        else if (entry.isFile()) {
+          const extension = path.slice(path.lastIndexOf('.')).toLowerCase();
+          if (!SKILL_EXTENSIONS.has(extension)) continue;
+          const content = await this.readWithin(root, path);
+          if (content === null || content.includes('\u0000')) continue;
+          files.push({ path: directory ? path.slice(directory.length + 1) : path, content });
+        }
+      }
+    };
+    await visit(directory, 0);
+    return { path: skillPath, siteKey, files };
+  }
+
+  /** Lê um `.agent.md` descoberto no catálogo do site (importação de especialistas). */
+  async readAgentFile(siteKey: string | null, agentPath: string) {
+    const catalog = await this.discover(siteKey);
+    const resource = catalog.resources.find(
+      (item) => item.path === agentPath && item.kind === 'agent',
+    );
+    const root = await this.repositoryRoot(siteKey);
+    if (!catalog.available || !root || !resource) return null;
+    const content = await this.readWithin(root, agentPath);
+    return content === null ? null : { path: agentPath, siteKey, content };
   }
 
   private async repositoryRoot(siteKey: string | null) {

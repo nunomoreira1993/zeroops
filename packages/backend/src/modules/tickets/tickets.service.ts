@@ -26,6 +26,7 @@ import { TicketsReadService } from './tickets.read.service.js';
 import { toComment, toTicket, type CommentRow, type TicketRow } from './tickets.rows.js';
 import { appendHumanComment } from './ticket-comments.js';
 import { invalidateTicketDependencies } from './ticket-dependencies.js';
+import { statusAfterTeamChange } from './flow-authority.js';
 import type { Queryable } from '../identity/membership.js';
 import {
   healthOccurrenceSuppressed,
@@ -51,7 +52,13 @@ const assignmentFields = [
  * agente quando o cliente responde). Injetada pela composição para manter `tickets` sem
  * dependências de módulos superiores.
  */
-export type PublicCommentHook = (client: Queryable, actor: User, ticketId: string) => Promise<void>;
+export type PublicCommentHook = (
+  client: Queryable,
+  actor: User,
+  ticketId: string,
+  /** Mensagem pública acabada de gravar (liga respostas a perguntas pendentes). */
+  comment?: { id: string },
+) => Promise<void>;
 
 export interface CreatedTicket {
   id: string;
@@ -68,6 +75,10 @@ export interface CreateTicketOptions {
   origin?: TicketOrigin;
   /** Tipo de alerta da Saúde que abriu o ticket (escolhe o fluxo associado a esse alerta). */
   alertKey?: string;
+  /** Fluxo publicado a usar diretamente (processos internos, ex.: desenvolvimento de capacidade). */
+  flowId?: string;
+  /** Processo de desenvolvimento de capacidade a ligar ao ticket (P10), na mesma transação. */
+  capabilityDevelopmentId?: string;
 }
 /** Reação à criação do ticket, na mesma transação (ex.: investigação automática do Copilot). */
 export type TicketCreatedHook = (
@@ -242,15 +253,7 @@ export class TicketsService {
       if (JSON.stringify(before) === JSON.stringify(after)) return toTicket(current);
       await invalidateTicketDependencies(client, member, id, current.version + 1, 'content');
 
-      const nextStatus = [
-        'awaiting_information',
-        'awaiting_client',
-        'awaiting_technical',
-        'awaiting_confirmation',
-        'blocked',
-      ].includes(current.status)
-        ? 'investigating'
-        : current.status;
+      const nextStatus = await statusAfterTeamChange(client, current.id, current.status);
       await client.query(
         `UPDATE tickets
          SET title=$2,description=$3,category=$4,environment=$5,priority=$6,
@@ -383,15 +386,7 @@ export class TicketsService {
           [id, member.projectId, assignment.stage, assignment.userId, member.id],
         );
       }
-      const nextStatus = [
-        'awaiting_information',
-        'awaiting_client',
-        'awaiting_technical',
-        'awaiting_confirmation',
-        'blocked',
-      ].includes(current.status)
-        ? 'investigating'
-        : current.status;
+      const nextStatus = await statusAfterTeamChange(client, id, current.status);
       await client.query(
         'UPDATE tickets SET status=$2,version=version+1,updated_at=NOW(3) WHERE id=$1',
         [id, nextStatus],
@@ -427,7 +422,7 @@ export class TicketsService {
       await findTicket(client, member, id, true);
       const comment = await appendHumanComment(client, member, id, data.body, data.visibility);
       if (data.visibility === 'public')
-        for (const hook of this.publicCommentHooks) await hook(client, member, id);
+        for (const hook of this.publicCommentHooks) await hook(client, member, id, comment);
       return comment;
     });
   }
@@ -505,15 +500,7 @@ export class TicketsService {
          VALUES($1,$2,$3,$4,$5,$6)`,
         [randomUUID(), commentId, row.version, member.id, current.body, row.body],
       );
-      const nextStatus = [
-        'awaiting_information',
-        'awaiting_client',
-        'awaiting_technical',
-        'awaiting_confirmation',
-        'blocked',
-      ].includes(ticket.status)
-        ? 'investigating'
-        : ticket.status;
+      const nextStatus = await statusAfterTeamChange(client, ticketId, ticket.status);
       await client.query(
         'UPDATE tickets SET status=$2,version=version+1,updated_at=NOW(3) WHERE id=$1',
         [ticketId, nextStatus],

@@ -1,21 +1,71 @@
-import type { FlowNode, FlowStepOutput } from '../../../../contracts/src/index.js';
+import type { FlowDefinition, FlowNode, FlowStepOutput } from '../../../../contracts/src/index.js';
 import type { Queryable } from '../identity/membership.js';
 import { closeHealthIncident } from '../health/health-incident-lifecycle.js';
 import { appendAutomatedComment } from '../tickets/ticket-comments.js';
+import { deliverAction } from './flow-deliver-action.js';
 
 export interface FlowActionContext {
   client: Queryable;
   ticket: { id: string; projectId: string; createdBy: string; origin: string };
   node: FlowNode;
   step: { id: string; attempt: number; startedAt: Date };
+  /** Execução real do motor (ausente no simulador: ações que dependem dela ficam indisponíveis). */
+  execution?: { id: string; definition: FlowDefinition };
   /** Último resultado do Copilot nesta execução (resumo, resposta proposta e diff). */
   previous: { summary: string | null; replyDraft: string | null; patch: string | null };
   now: Date;
+  /**
+   * Efeitos externos das ações portáveis. O motor usa a base de dados; o simulador regista-os sem
+   * os executar e o ensaio isolado entrega-os num destino de teste (P07).
+   */
+  effects: FlowActionEffects;
 }
 
-/** Segue por uma porta, ou espera e volta a ser avaliada em `wait` (verificações com prazo). */
+/** Efeitos de que dependem as ações portáveis (as mesmas regras correm no motor e no simulador). */
+export interface FlowActionEffects {
+  comment(visibility: 'public' | 'internal', body: string): Promise<void>;
+  /** Estado do incidente da Saúde do ticket (`null` = sem incidente). */
+  healthIncidentState(): Promise<string | null>;
+  closeHealthIncident(): Promise<void>;
+}
+
+/** Efeitos reais sobre o ticket (comentários, incidente da Saúde). */
+export function databaseActionEffects(
+  client: Queryable,
+  ticket: FlowActionContext['ticket'],
+): FlowActionEffects {
+  return {
+    comment: (visibility, body) =>
+      appendAutomatedComment(client, {
+        ticketId: ticket.id,
+        projectId: ticket.projectId,
+        authorId: ticket.createdBy,
+        visibility,
+        body,
+        authorKind: 'system',
+      }).then(() => undefined),
+    healthIncidentState: async () =>
+      (
+        await client.query<{ state: string }>(
+          'SELECT state FROM health_incidents WHERE ticket_id=$1 FOR UPDATE',
+          [ticket.id],
+        )
+      ).rows[0]?.state ?? null,
+    closeHealthIncident: () => closeHealthIncident(client, ticket.id).then(() => undefined),
+  };
+}
+
+/**
+ * Segue por uma porta, ou espera e volta a ser avaliada em `wait` (verificações com prazo). O
+ * `feedback` acompanha a porta até à etapa seguinte (ex.: conflito de integração → desenvolvimento).
+ */
 export type FlowActionResult =
-  { port: string; output?: FlowStepOutput } | { wait: Date; output?: FlowStepOutput };
+  | {
+      port: string;
+      output?: FlowStepOutput;
+      feedback?: { comment: string; actor: string | null; evidence?: string | null };
+    }
+  | { wait: Date; output?: FlowStepOutput };
 
 export type FlowActionExecutor = (context: FlowActionContext) => Promise<FlowActionResult>;
 
@@ -27,28 +77,13 @@ export type FlowActionRegistry = Readonly<Record<string, FlowActionExecutor>>;
 
 const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
 
-async function comment(
-  context: FlowActionContext,
-  visibility: 'public' | 'internal',
-  body: string,
-) {
-  await appendAutomatedComment(context.client, {
-    ticketId: context.ticket.id,
-    projectId: context.ticket.projectId,
-    authorId: context.ticket.createdBy,
-    visibility,
-    body,
-    authorKind: 'system',
-  });
-}
-
 const clientMessage: FlowActionExecutor = async (context) => {
   const fallback = text(context.node.config.body);
   const body =
     context.node.config.source === 'previous_reply'
       ? context.previous.replyDraft?.trim() || fallback
       : fallback;
-  await comment(context, 'public', body);
+  await context.effects.comment('public', body);
   return { port: 'done', output: { clientMessage: body } };
 };
 
@@ -59,7 +94,7 @@ const internalNote: FlowActionExecutor = async (context) => {
     context.node.config.source === 'previous_summary' && summary
       ? `${fallback}\n\n${summary}`
       : fallback;
-  await comment(context, 'internal', body);
+  await context.effects.comment('internal', body);
   return { port: 'done', output: { note: body } };
 };
 
@@ -85,13 +120,8 @@ const verifyHealthRecovery: FlowActionExecutor = async (context) => {
   const timeoutMs =
     (Number.isFinite(minutes) && minutes > 0 ? Math.min(minutes, 1440) : 30) * 60_000;
   const elapsed = context.now.getTime() - context.step.startedAt.getTime();
-  const incident = (
-    await context.client.query<{ state: string }>(
-      'SELECT state FROM health_incidents WHERE ticket_id=$1 FOR UPDATE',
-      [context.ticket.id],
-    )
-  ).rows[0];
-  if (!incident) {
+  const state = await context.effects.healthIncidentState();
+  if (state === null) {
     if (context.ticket.origin === 'health' && elapsed < INCIDENT_GRACE_MS)
       return { wait: new Date(context.now.getTime() + 30_000) };
     return {
@@ -99,8 +129,8 @@ const verifyHealthRecovery: FlowActionExecutor = async (context) => {
       output: { reason: 'Sem incidente da Saúde associado: não foi possível verificar.' },
     };
   }
-  if (incident.state !== 'open') {
-    await closeHealthIncident(context.client, context.ticket.id);
+  if (state !== 'open') {
+    await context.effects.closeHealthIncident();
     return { port: 'passed', output: { summary: 'Os alertas do incidente recuperaram.' } };
   }
   if (elapsed >= timeoutMs)
@@ -125,6 +155,18 @@ const deploy: FlowActionExecutor = async (context) => ({
   },
 });
 
+/**
+ * Ações cujos efeitos passam todos por effects (sem acesso direto à base de dados): o simulador e
+ * o ensaio isolado executam o mesmo código do motor. As restantes precisam de resultado no cenário.
+ */
+export const PORTABLE_FLOW_ACTIONS: ReadonlySet<string> = new Set([
+  'client_message',
+  'internal_note',
+  'health_remediation',
+  'verify_health_recovery',
+  'deploy',
+]);
+
 /** Executores por omissão (integrações externas ausentes seguem pelas portas de recurso). */
 export const defaultFlowActions: FlowActionRegistry = {
   client_message: clientMessage,
@@ -132,4 +174,5 @@ export const defaultFlowActions: FlowActionRegistry = {
   health_remediation: healthRemediation,
   verify_health_recovery: verifyHealthRecovery,
   deploy,
+  deliver: deliverAction,
 };

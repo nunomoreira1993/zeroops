@@ -374,6 +374,7 @@ export function FlowNextActionPanel({
             stepId: next.stepId,
             port: choice.port,
             ...(comment.trim() ? { comment: comment.trim() } : {}),
+            ...(next.review?.headSha ? { artifactSha: next.review.headSha } : {}),
             idempotencyKey: key,
           },
         },
@@ -411,6 +412,13 @@ export function FlowNextActionPanel({
                 ? t('À espera do sistema.', 'Waiting for the system.')
                 : `${t('Com', 'With')}: ${next.assignee?.label ?? t('equipa', 'team')}`}
           </p>
+          {next.review && (
+            <p className="muted">
+              {next.review.headSha
+                ? `${t('Review do commit', 'Review of commit')} ${next.review.headSha.slice(0, 12)}${next.review.testsPassed ? '' : ` · ${t('testes falhados: só pode rejeitar', 'tests failed: reject only')}`}`
+                : t('Ainda não existe um commit para rever.', 'No commit to review yet.')}
+            </p>
+          )}
           {next.canAct && next.options.length > 0 && (
             <>
               <div className="flow-decisions">

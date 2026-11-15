@@ -26,6 +26,15 @@ export class AgentProfilesController {
     return this.profiles.create(req.identity, projectId, raw);
   }
 
+  @Post('import')
+  importAgent(
+    @Req() req: AuthenticatedRequest,
+    @Param('projectId') projectId: string,
+    @Body() raw: unknown,
+  ) {
+    return this.profiles.importAgent(req.identity, projectId, raw);
+  }
+
   @Post(':profileId/versions')
   addVersion(
     @Req() req: AuthenticatedRequest,

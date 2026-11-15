@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import type { Capabilities, ProjectAccess } from '@zeroops/contracts';
+import type { Capabilities, ProjectAccess, ProjectPermissionAccess } from '@zeroops/contracts';
 import { useSession } from '../lib/session';
 import { useResource } from '../lib/hooks';
 import { roleLabels } from '../lib/format';
@@ -26,6 +26,10 @@ export function Shell({ route, children }: { route: string; children: ReactNode 
   }, []);
   const capabilities = useResource<Capabilities>('/capabilities');
   const projects = useResource<ProjectAccess[]>('/projects');
+  const access = useResource<ProjectPermissionAccess>(
+    session ? `/projects/${encodeURIComponent(session.user.projectId)}/access` : null,
+    15000,
+  );
   const reloadProjects = projects.reload;
   useEffect(() => {
     window.addEventListener(PROJECTS_CHANGED_EVENT, reloadProjects);
@@ -43,14 +47,55 @@ export function Shell({ route, children }: { route: string; children: ReactNode 
   const workspace: NavItem[] = [
     { route: 'dashboard', label: t('Visão geral', 'Overview'), icon: 'grid' },
     { route: 'tickets', label: t('Pedidos', 'Requests'), icon: 'ticket' },
-    ...(user.role === 'admin' || user.instanceAdmin
-      ? [{ route: 'flows', label: t('Fluxos', 'Flows'), icon: 'flow' as const }]
+    ...(user.role === 'admin' ||
+    user.instanceAdmin ||
+    access.data?.permissions.includes('flows.view')
+      ? [
+          { route: 'flows', label: t('Fluxos', 'Flows'), icon: 'flow' as const },
+          {
+            route: 'capabilities',
+            label: t('Agentes e skills', 'Agents and skills'),
+            icon: 'bot' as const,
+          },
+        ]
       : []),
     { route: 'integrations', label: t('Integrações', 'Integrations'), icon: 'plug' },
   ];
   const administration: NavItem[] = [
+    ...(access.data?.permissions.includes('project.permissions.manage')
+      ? [
+          {
+            route: `projects/${encodeURIComponent(user.projectId)}/permissoes`,
+            label: t('Permissões do projeto', 'Project permissions'),
+            icon: 'users' as const,
+          },
+        ]
+      : []),
+    ...(user.role === 'admin' ||
+    user.instanceAdmin ||
+    access.data?.permissions.includes('repositories.manage')
+      ? [
+          {
+            route: `projects/${encodeURIComponent(user.projectId)}/repositorios`,
+            label: t('Repositórios Git', 'Git repositories'),
+            icon: 'folder' as const,
+          },
+          {
+            route: `projects/${encodeURIComponent(user.projectId)}/pipelines`,
+            label: t('Pipelines de entrega', 'Delivery pipelines'),
+            icon: 'flow' as const,
+          },
+        ]
+      : []),
     ...(user.role !== 'client'
-      ? [{ route: 'health', label: t('Saúde', 'Health'), icon: 'pulse' as const }]
+      ? [
+          { route: 'health', label: t('Saúde', 'Health'), icon: 'pulse' as const },
+          {
+            route: `projects/${encodeURIComponent(user.projectId)}/operacao`,
+            label: t('Operação', 'Operations'),
+            icon: 'pulse' as const,
+          },
+        ]
       : []),
     ...(user.role === 'admin' || user.instanceAdmin
       ? [{ route: 'team', label: t('Equipa e acessos', 'Team and access'), icon: 'users' as const }]
@@ -301,6 +346,7 @@ export function Shell({ route, children }: { route: string; children: ReactNode 
           </div>
         </header>
         <main id="main-content" ref={main} tabIndex={-1} className="page-content">
+          {access.error && <Notice>{access.error}</Notice>}
           {mutation.error && <Notice>{mutation.error}</Notice>}
           {capabilities.error && (
             <Notice tone="warning">

@@ -15,6 +15,8 @@ export * from './alert-rules.js';
 export * from './health-charts.js';
 export * from './sites.js';
 export * from './avatars.js';
+export * from './project-permissions.js';
+export * from './capabilities.js';
 
 export const roles = ['client', 'technical', 'qa', 'release', 'admin'] as const;
 export const roleSchema = z.enum(roles);
@@ -324,4 +326,15 @@ export interface Capabilities {
   blockers: string[];
 }
 export * from './flows.js';
+export * from './flow-conditions.js';
+export * from './flow-activation.js';
+export * from './flow-routing-policy.js';
+export * from './flow-authoring.js';
+export * from './ticket-routing.js';
 export * from './incidents.js';
+export * from './flow-transitions.js';
+export * from './flow-simulation.js';
+export * from './development.js';
+export * from './delivery.js';
+export * from './capability-development.js';
+export * from './operations-metrics.js';

@@ -217,8 +217,18 @@ export class ProductionRelayService {
         data.ok ? null : data.message,
       ],
     );
-    if (!update.rowCount)
+    if (!update.rowCount) {
+      // Repetição do mesmo resultado (resposta perdida no caminho de volta): aceite sem efeito.
+      const existing = (
+        await this.db.query<{ status: string }>(
+          'SELECT status FROM connector_relay_requests WHERE id=$1 AND project_id=$2',
+          [requestId, projectId],
+        )
+      ).rows[0];
+      if (existing && existing.status === (data.ok ? 'done' : 'failed'))
+        return { status: 'accepted', duplicate: true };
       throw new DomainError('EXPIRED', 'O pedido já não está à espera de resultado.', 409);
+    }
     return { status: 'accepted' };
   }
 }

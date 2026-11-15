@@ -5,24 +5,45 @@ import type {
   InvestigationContext,
   InvestigationResult,
 } from '../../../packages/backend/src/modules/agents/agent-runs.service.js';
+import type {
+  FencedOutcome,
+  HeartbeatState,
+  JobLease,
+} from '../../../packages/backend/src/modules/agents/job-leases.js';
 import type { AgentCommand } from './agent-commands.js';
 import type { CopilotAgent } from './copilot.adapter.js';
 import type { AgentRunConversation } from './run-conversation.js';
 import { investigationPrompt } from './investigation-prompt.js';
 import { FusionUnavailableError } from './copilot-sdk.adapter.js';
 import { unifiedDiff } from './unified-diff.js';
+import {
+  CapabilityIntegrityError,
+  materializeCapabilities,
+  type CompiledCapabilities,
+} from './capability-bundle.js';
+import {
+  DevelopmentFailure,
+  DevelopmentStale,
+  type DevelopmentRunner,
+  type PreparedDevelopment,
+} from './development-runner.js';
 
 /** Tamanho máximo da proposta de alteração guardada no run. */
 const PATCH_LIMIT = 400_000;
 
 /** Operações do serviço de runs usadas pelo executor (permite testar sem base de dados). */
 export interface AgentRunQueue {
+  /** Reclama a próxima tentativa para este executor (o worker e os limites são do adaptador). */
   claimNext(): Promise<InvestigationContext | null>;
-  reportProgress(runId: string, progress: string): Promise<void>;
-  recordEffectiveTools?(runId: string, tools: string[]): Promise<void>;
+  /** Renova o lease; sem posse, o runner para sem novos efeitos. */
+  heartbeat?(lease: JobLease): Promise<HeartbeatState>;
+  reportProgress(lease: JobLease, progress: string): Promise<unknown>;
+  recordEffectiveTools?(lease: JobLease, tools: string[]): Promise<unknown>;
   isCancelRequested(runId: string): Promise<boolean>;
-  complete(runId: string, result: InvestigationResult): Promise<void>;
-  fail(runId: string, errorCode: string): Promise<void>;
+  complete(lease: JobLease, result: InvestigationResult): Promise<FencedOutcome | void>;
+  fail(lease: JobLease, errorCode: string): Promise<FencedOutcome | void>;
+  /** Devolve a tentativa à fila (paragem ordenada do executor). */
+  release?(lease: JobLease, reason: string): Promise<FencedOutcome | void>;
 }
 
 export interface InvestigationRunnerOptions {
@@ -37,6 +58,8 @@ export interface InvestigationRunnerOptions {
   timeoutMs: number;
   outputLimitBytes: number;
   cancelPollMs: number;
+  /** Intervalo do heartbeat do lease (por omissão, um quarto da duração do lease). */
+  heartbeatMs?: number;
   /** Conectores de leitura: URL interno e descoberta dos comandos disponíveis para o run. */
   connectors?: {
     url: string;
@@ -51,7 +74,9 @@ export interface InvestigationRunnerOptions {
   /** Dono do workspace quando o Copilot corre com outro uid. */
   workspaceOwner?: { uid: number; gid: number };
   /** Conversa ao vivo do run (streaming, perguntas e mensagens da equipa). */
-  conversation?: (runId: string) => AgentRunConversation;
+  conversation?: (runId: string, lease: JobLease) => AgentRunConversation;
+  /** P08: desenvolvimento em checkout Git isolado (runs com `developmentWorkspaceId`). */
+  development?: DevelopmentRunner;
 }
 
 export class InvestigationRunner {
@@ -63,26 +88,58 @@ export class InvestigationRunner {
       console.info(JSON.stringify(event)),
   ) {}
 
-  /** Processa no máximo um run; devolve false quando a fila está vazia. */
-  async runOnce(): Promise<boolean> {
+  /**
+   * Processa no máximo um run; devolve false quando a fila está vazia. `shutdown` interrompe o run
+   * em curso e devolve-o à fila (paragem ordenada) em vez de o falhar.
+   */
+  async runOnce(shutdown?: AbortSignal): Promise<boolean> {
+    if (shutdown?.aborted) return false;
     const context = await this.queue.claimNext();
     if (!context) return false;
-    const { runId } = context;
+    const { runId, lease } = context;
     const workspace = await mkdtemp(join(this.options.workspaceRoot, 'run-'));
     const abort = new AbortController();
+    let leaseLost = false;
+    let stopping = false;
+    const onShutdown = () => {
+      stopping = true;
+      abort.abort();
+    };
+    shutdown?.addEventListener('abort', onShutdown, { once: true });
+    const heartbeatMs = this.options.heartbeatMs ?? Math.max(1000, (lease.leaseSeconds * 1000) / 4);
+    let lastHeartbeat = Date.now();
+    let checking = false;
     const watcher = setInterval(() => {
-      void this.queue.isCancelRequested(runId).then(
-        (cancel) => {
-          if (cancel) abort.abort();
-        },
-        () => undefined,
-      );
+      if (checking || abort.signal.aborted) return;
+      checking = true;
+      const due = this.queue.heartbeat && Date.now() - lastHeartbeat >= heartbeatMs;
+      const check = due
+        ? this.queue.heartbeat!(lease).then((state) => {
+            lastHeartbeat = Date.now();
+            if (!state.owned) leaseLost = true;
+            return !state.owned || state.cancelRequested;
+          })
+        : this.queue.isCancelRequested(runId);
+      void check
+        .then(
+          (stop) => {
+            if (stop) abort.abort();
+          },
+          () => undefined,
+        )
+        .finally(() => {
+          checking = false;
+        });
     }, this.options.cancelPollMs);
     let failureCode: string | null = null;
-    const conversation = this.options.conversation?.(runId);
+    let cleanupCapabilities: (() => Promise<void>) | null = null;
+    let compiled: CompiledCapabilities | null = null;
+    let development: PreparedDevelopment | null = null;
+    let developmentFailed = true;
+    const conversation = this.options.conversation?.(runId, lease);
     conversation?.start();
     try {
-      this.log({ event: 'agent.run_started', runId });
+      this.log({ event: 'agent.run_started', runId, attempt: context.attempt, epoch: lease.epoch });
       const credentials = await this.copilotEnv(context);
       if (!credentials) {
         failureCode = 'copilot_not_configured';
@@ -96,15 +153,18 @@ export class InvestigationRunner {
       const commands = allowedTools
         ? discovered.filter((command) => allowedTools.includes(command.tool))
         : discovered;
-      await this.queue.recordEffectiveTools?.(runId, [
+      await this.queue.recordEffectiveTools?.(lease, [
         'view',
         'grep',
         'glob',
         ...(commands.length ? commands.map((command) => command.tool) : []),
+        ...(context.capabilities?.manifest.skills.length ? ['skill'] : []),
+        ...(context.capabilities?.manifest.delegates.length ? ['task'] : []),
+        ...(context.developmentWorkspaceId ? ['zeroops_run_tests'] : []),
       ]);
       const implement = context.mode === 'implement';
       await this.queue.reportProgress(
-        runId,
+        lease,
         implement ? 'Copilot a preparar a alteração' : 'Copilot a investigar',
       );
       const connectorEnv: Record<string, string> =
@@ -113,14 +173,61 @@ export class InvestigationRunner {
           : {};
       const env = { ...credentials, ...connectorEnv };
       const site = await this.siteSources(context.project?.siteKey ?? null);
+      if (context.developmentWorkspaceId) {
+        if (!this.options.development) {
+          failureCode = 'development_unavailable';
+          throw new Error('Executor sem workspaces Git configurados.');
+        }
+        await this.queue.reportProgress(lease, 'A preparar o checkout Git isolado');
+        development = await this.options.development.prepare(runId, lease);
+      }
+      if (context.capabilities) {
+        const materialized = await materializeCapabilities(
+          this.options.workspaceRoot,
+          context.capabilities,
+          this.options.workspaceOwner,
+        ).catch((error: unknown) => {
+          if (error instanceof CapabilityIntegrityError) failureCode = 'capability_integrity';
+          throw error;
+        });
+        cleanupCapabilities = materialized.cleanup;
+        compiled = materialized.compiled;
+        this.log({
+          event: 'agent.capabilities_materialized',
+          runId,
+          agent: compiled.manifest.agent.name,
+          skills: compiled.manifest.skills.map((skill) => `${skill.name}@${skill.version}`),
+          specialists: compiled.manifest.delegates.map((agent) => `${agent.name}@${agent.version}`),
+        });
+      }
+      const siteDirectories = development ? [] : site.readOnlyDirectories;
+      const readOnlyDirectories = compiled?.skillDirectory
+        ? [...siteDirectories, compiled.skillDirectory]
+        : siteDirectories;
+      const isActive = () => !abort.signal.aborted;
       const report = await this.adapter.execute({
-        workspace,
+        workspace: development ? development.checkout.path : workspace,
         mode: implement ? 'implement' : 'investigate',
-        prompt: investigationPrompt(context, site.sources, commands),
+        prompt: investigationPrompt(
+          context,
+          development ? this.options.development!.promptSources(development) : site.sources,
+          commands,
+        ),
         timeoutMs: this.options.timeoutMs,
         outputLimitBytes: this.options.outputLimitBytes,
-        readOnlyDirectories: site.readOnlyDirectories,
+        readOnlyDirectories,
+        ...(compiled ? { capabilities: compiled } : {}),
         signal: abort.signal,
+        isActive,
+        ...(development
+          ? {
+              gitWorkspace: true,
+              tools: [this.options.development!.testTool(development, lease, isActive)],
+            }
+          : {}),
+        // As ferramentas já estão limitadas pela política efetiva do run: um plano não precisa de
+        // nova aprovação humana. As perguntas `ask_user` continuam a ir para a equipa.
+        planApproval: 'auto',
         ...(connectors && commands.length
           ? {
               shell: {
@@ -132,6 +239,40 @@ export class InvestigationRunner {
         ...(Object.keys(env).length ? { env } : {}),
         ...(conversation ? { conversation } : {}),
       });
+      if (abort.signal.aborted) throw new Error('Run interrompido.');
+      if (development) {
+        await this.queue.reportProgress(lease, 'A fazer commit e a executar os testes finais');
+        const outcome = await this.options.development!.finalize(development, lease, isActive);
+        developmentFailed = false;
+        if (!outcome.testsPassed) {
+          failureCode = 'development_tests_failed';
+          throw new Error('Os testes finais falharam.');
+        }
+        conversation?.publish({
+          type: 'status',
+          text: `Commit ${outcome.headSha.slice(0, 12)} testado (${outcome.files.length} ficheiros)`,
+        });
+        await conversation?.close();
+        const result = await this.queue.complete(lease, {
+          summary: report.summary,
+          replyDraft: report.replyDraft,
+          evidence: report.evidence,
+          clientQuestions: report.clientQuestions,
+          patch:
+            outcome.diff.length > PATCH_LIMIT
+              ? `${outcome.diff.slice(0, PATCH_LIMIT)}\n# (diff truncado)\n`
+              : outcome.diff || null,
+          proposedTests: report.proposedTests,
+        });
+        this.log({
+          event: result === 'stale' ? 'agent.run_stale_rejected' : 'agent.run_succeeded',
+          runId,
+          epoch: lease.epoch,
+          headSha: outcome.headSha,
+          publications: outcome.publications,
+        });
+        return true;
+      }
       const patch = implement
         ? await this.patch(workspace, site.readOnlyDirectories, report.files)
         : null;
@@ -140,36 +281,56 @@ export class InvestigationRunner {
         text: implement ? 'Proposta de alteração concluída' : 'Investigação concluída',
       });
       await conversation?.close();
-      await this.queue.complete(runId, {
+      const outcome = await this.queue.complete(lease, {
         summary: report.summary,
         replyDraft: report.replyDraft,
         evidence: report.evidence,
         clientQuestions: report.clientQuestions,
         ...(implement ? { patch, proposedTests: report.proposedTests } : {}),
       });
-      this.log({ event: 'agent.run_succeeded', runId });
-    } catch (error) {
-      const code = abort.signal.aborted
-        ? 'cancelled'
-        : error instanceof FusionUnavailableError
-          ? 'fusion_unavailable'
-          : (failureCode ?? 'agent_failed');
-      conversation?.publish({
-        type: 'status',
-        text: code === 'cancelled' ? 'Investigação cancelada' : 'Investigação falhou',
-      });
-      await conversation?.close();
-      await this.queue.fail(runId, code);
       this.log({
-        event: 'agent.run_failed',
+        event: outcome === 'stale' ? 'agent.run_stale_rejected' : 'agent.run_succeeded',
         runId,
-        code,
-        type: error instanceof Error ? error.name : 'UnknownError',
-        message: error instanceof Error ? error.message.slice(0, 300) : undefined,
+        epoch: lease.epoch,
       });
+    } catch (error) {
+      if (error instanceof DevelopmentStale) leaseLost = true;
+      if (error instanceof DevelopmentFailure) failureCode = error.code;
+      if (leaseLost) {
+        // Outro executor detém (ou vai deter) a tentativa: nenhuma escrita desta tentativa.
+        this.log({ event: 'agent.run_lease_lost', runId, epoch: lease.epoch });
+      } else if (stopping && this.queue.release) {
+        await conversation?.close();
+        await this.queue.release(lease, 'shutdown');
+        this.log({ event: 'agent.run_released', runId, epoch: lease.epoch });
+      } else {
+        const code = abort.signal.aborted
+          ? 'cancelled'
+          : error instanceof FusionUnavailableError
+            ? 'fusion_unavailable'
+            : (failureCode ?? 'agent_failed');
+        conversation?.publish({
+          type: 'status',
+          text: code === 'cancelled' ? 'Investigação cancelada' : 'Investigação falhou',
+        });
+        await conversation?.close();
+        await this.queue.fail(lease, code);
+        this.log({
+          event: 'agent.run_failed',
+          runId,
+          code,
+          type: error instanceof Error ? error.name : 'UnknownError',
+          message: error instanceof Error ? error.message.slice(0, 300) : undefined,
+        });
+      }
     } finally {
       clearInterval(watcher);
+      shutdown?.removeEventListener('abort', onShutdown);
       await conversation?.close();
+      await cleanupCapabilities?.().catch(() => undefined);
+      await this.options.development
+        ?.release(development, lease, developmentFailed)
+        .catch(() => undefined);
       await rm(workspace, { recursive: true, force: true });
     }
     return true;

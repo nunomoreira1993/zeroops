@@ -22,15 +22,24 @@ export function TicketAssignmentsPanel({
   ticket,
   assignments,
   onChanged,
+  flowRoles = null,
 }: {
   ticket: Ticket;
   assignments: TicketAssignments;
   onChanged: (message: string) => void;
+  /**
+   * Papéis usados como responsável pelas etapas do fluxo do ticket. `null` = pedido anterior aos
+   * fluxos (mostra as quatro etapas originais).
+   */
+  flowRoles?: readonly string[] | null;
 }) {
   const { session, request } = useSession();
   const { t } = useIdentityLocale();
   const isProjectAdmin = session?.user.role === 'admin';
-  const people = useResource<ManagedUser[]>(isProjectAdmin ? '/users' : null);
+  const visible = stages.filter(
+    ([stage]) => flowRoles === null || flowRoles.includes(stage) || assignments[stage],
+  );
+  const people = useResource<ManagedUser[]>(isProjectAdmin && visible.length ? '/users' : null);
   const mutation = useMutation();
   const [values, setValues] = useState({
     clientUserId: assignments.client?.userId ?? '',
@@ -38,16 +47,17 @@ export function TicketAssignmentsPanel({
     qaUserId: assignments.qa?.userId ?? '',
     releaseUserId: assignments.release?.userId ?? '',
   });
+  if (!visible.length) return null;
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
     void mutation.run(async () => {
+      // O backend substitui as quatro atribuições: as etapas ocultas mantêm o valor atual.
       const input = ticketAssignmentsInputSchema.safeParse({
         expectedVersion: ticket.version,
-        clientUserId: data.get('clientUserId') || null,
-        technicalUserId: data.get('technicalUserId') || null,
-        qaUserId: data.get('qaUserId') || null,
-        releaseUserId: data.get('releaseUserId') || null,
+        clientUserId: values.clientUserId || null,
+        technicalUserId: values.technicalUserId || null,
+        qaUserId: values.qaUserId || null,
+        releaseUserId: values.releaseUserId || null,
       });
       if (!input.success)
         throw new Error(
@@ -79,10 +89,15 @@ export function TicketAssignmentsPanel({
         ) : (
           <>
             <p className="muted">
-              {t(
-                'Cada etapa exige uma pessoa diferente com acesso ativo.',
-                'Each stage requires a different person with active access.',
-              )}
+              {flowRoles === null
+                ? t(
+                    'Cada etapa exige uma pessoa diferente com acesso ativo.',
+                    'Each stage requires a different person with active access.',
+                  )
+                : t(
+                    'Responsáveis por papel usados pelas etapas do fluxo (uma pessoa diferente por papel). Revisores, aprovações e entrega são definidos em cada etapa do fluxo.',
+                    'Role owners used by the flow steps (a different person per role). Reviewers, approvals and delivery are defined in each flow step.',
+                  )}
             </p>
             {mutation.error && <Notice>{mutation.error}</Notice>}
             <form className="stack" onSubmit={submit}>
@@ -90,7 +105,7 @@ export function TicketAssignmentsPanel({
                 <legend className="sr-only">
                   {t('Atribuir responsáveis por etapa', 'Assign owners per stage')}
                 </legend>
-                {stages.map(([stage, field, label, role]) => {
+                {visible.map(([stage, field, label, role]) => {
                   const current = assignments[stage];
                   const available = (people.data ?? []).filter(
                     (person) => !person.disabled && person.role === role,
@@ -135,7 +150,7 @@ export function TicketAssignmentsPanel({
         )
       ) : (
         <dl className="metadata-list">
-          {stages.map(([stage, , label]) => (
+          {visible.map(([stage, , label]) => (
             <div key={stage}>
               <dt>{t(label[0], label[1])}</dt>
               <dd>{assignments[stage]?.displayName ?? t('Por atribuir', 'Unassigned')}</dd>

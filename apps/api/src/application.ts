@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { Controller, Get, Inject, Module, Req } from '@nestjs/common';
+import { Controller, Get, Inject, Module, Param, Query, Req } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import express from 'express';
 import type { Server } from 'node:http';
@@ -10,6 +10,7 @@ import { IdentityService } from '../../../packages/backend/src/modules/identity/
 import { TicketsService } from '../../../packages/backend/src/modules/tickets/tickets.service.js';
 import { TicketGovernanceService } from '../../../packages/backend/src/modules/tickets/ticket-governance.service.js';
 import { MetricsService } from '../../../packages/backend/src/modules/metrics/metrics.service.js';
+import { OperationsMetricsService } from '../../../packages/backend/src/modules/metrics/operations-metrics.service.js';
 import { WorkflowService } from '../../../packages/backend/src/modules/workflow/workflow.service.js';
 import { unconfiguredCapabilities } from '../../../packages/backend/src/capabilities.js';
 import { AuthController, HTTP_CONFIG, type HttpConfig } from './http/auth.controller.js';
@@ -32,7 +33,9 @@ import { AgentRunsController } from './http/agent-runs.controller.js';
 import { AgentRunsService } from '../../../packages/backend/src/modules/agents/agent-runs.service.js';
 import { FlowEngine } from '../../../packages/backend/src/modules/flows/flow-engine.js';
 import { createFlowActionRegistry } from '../../../packages/backend/src/modules/incidents/incident.module.js';
+import { FlowSimulationService } from '../../../packages/backend/src/modules/flows/flow-simulation.service.js';
 import { FlowsService } from '../../../packages/backend/src/modules/flows/flows.service.js';
+import { TicketRouter } from '../../../packages/backend/src/modules/flows/ticket-routing.js';
 import { FlowsAdminController, TicketFlowController } from './http/flows.controller.js';
 import { HealthIncidentLifecycle } from '../../../packages/backend/src/modules/health/health-incident-lifecycle.js';
 import { AgentRunEventsService } from '../../../packages/backend/src/modules/agents/agent-run-events.service.js';
@@ -47,11 +50,33 @@ import { ProductionRelayService } from '../../../packages/backend/src/modules/co
 import { ProjectLogoController } from './http/project-logo.controller.js';
 import { ProjectLogoService } from '../../../packages/backend/src/modules/identity/project-logo.service.js';
 import { ProjectAdminController } from './http/project-admin.controller.js';
+import { ProjectPermissionsController } from './http/project-permissions.controller.js';
+import {
+  GitRepositoriesController,
+  TicketDevelopmentController,
+} from './http/git-repositories.controller.js';
+import { DevelopmentStore } from '../../../packages/backend/src/modules/development/development.store.js';
+import { DeliveryStore } from '../../../packages/backend/src/modules/delivery/delivery.store.js';
+import {
+  allowedPipelineOrigins,
+  PipelinesService,
+} from '../../../packages/backend/src/modules/delivery/pipelines.service.js';
+import { PipelineCallbacksController, PipelinesController } from './http/pipelines.controller.js';
+import { CapabilityDevelopmentController } from './http/capability-development.controller.js';
+import {
+  CapabilityDevelopmentService,
+  capabilityTicketCreated,
+} from '../../../packages/backend/src/modules/capabilities/capability-development.service.js';
+import { GitRepositoriesService } from '../../../packages/backend/src/modules/development/git-repositories.service.js';
+import { allowedRepositoryRoots } from '../../../packages/backend/src/modules/development/git.js';
+import { ProjectPermissionsService } from '../../../packages/backend/src/modules/identity/project-permissions.service.js';
 import { AgentModelsController } from './http/agent-models.controller.js';
 import { AgentModelsService } from '../../../packages/backend/src/modules/agents/agent-models.service.js';
 import { AgentProfilesService } from '../../../packages/backend/src/modules/agents/agent-profiles.service.js';
 import { RepositoryResources } from '../../../packages/backend/src/modules/agents/repository-resources.js';
 import { AgentProfilesController } from './http/agent-profiles.controller.js';
+import { CapabilityCatalogController } from './http/capability-catalog.controller.js';
+import { SkillsService } from '../../../packages/backend/src/modules/agents/skills.service.js';
 import { UserAvatarController } from './http/user-avatar.controller.js';
 import { UserAvatarService } from '../../../packages/backend/src/modules/identity/user-avatar.service.js';
 
@@ -60,6 +85,7 @@ class OperationsController {
   constructor(
     @Inject(Database) private readonly db: Database,
     @Inject(MetricsService) private readonly metrics: MetricsService,
+    @Inject(OperationsMetricsService) private readonly operations: OperationsMetricsService,
   ) {}
 
   @Get('health')
@@ -81,6 +107,16 @@ class OperationsController {
   @Get('metrics')
   summary(@Req() request: AuthenticatedRequest) {
     return this.metrics.summary(request.identity);
+  }
+
+  /** P11: filas, etapas, leases, intervenção humana, uso Copilot, entregas e Health (equipa). */
+  @Get('projects/:projectId/operations/metrics')
+  operationsSummary(
+    @Req() request: AuthenticatedRequest,
+    @Param('projectId') projectId: string,
+    @Query('days') days: unknown,
+  ) {
+    return this.operations.summary(request.identity, projectId, Number(days) || 30);
   }
 }
 
@@ -133,10 +169,12 @@ export async function createApplication(
       : unavailableMail);
   const identity = new IdentityService(db, cipher, mail);
   // Cada ticket segue o fluxo do projeto (modelos por omissão reproduzem o percurso anterior).
-  const agentProfiles = new AgentProfilesService(
-    db,
-    new RepositoryResources(privateConfig.agentSitesRoot ?? process.env.ZEROOPS_AGENT_SITES_ROOT),
+  const repositoryResources = new RepositoryResources(
+    privateConfig.agentSitesRoot ?? process.env.ZEROOPS_AGENT_SITES_ROOT,
   );
+  const agentProfiles = new AgentProfilesService(db, repositoryResources);
+  const deliveries = new DeliveryStore(db, cipher);
+  const skills = new SkillsService(db, repositoryResources, agentProfiles);
   const flowEngine = new FlowEngine(
     db,
     createFlowActionRegistry(db, { settings, publicUrl: config.publicUrl }),
@@ -153,6 +191,12 @@ export async function createApplication(
     { directory: privateConfig.prometheusRulesDir, url: privateConfig.prometheusUrl },
     { ticketCreated: [flowEngine.onTicketCreated], incidentDelegate: flowEngine.incidentDelegate },
   );
+  // P10: o hook de capacidades corre antes do motor (liga o ticket ao processo ou reverte-o).
+  const tickets = new TicketsService(
+    db,
+    [flowEngine.onPublicComment],
+    [capabilityTicketCreated, flowEngine.onTicketCreated],
+  );
   @Module({
     controllers: [
       AuthController,
@@ -167,16 +211,24 @@ export async function createApplication(
       RelayController,
       ProjectLogoController,
       ProjectAdminController,
+      ProjectPermissionsController,
+      GitRepositoriesController,
+      TicketDevelopmentController,
+      PipelinesController,
+      CapabilityDevelopmentController,
+      PipelineCallbacksController,
       AgentModelsController,
       UserAvatarController,
       FlowsAdminController,
       TicketFlowController,
       AgentProfilesController,
+      CapabilityCatalogController,
     ],
     providers: [
       { provide: Database, useValue: db },
       { provide: AgentModelsService, useValue: new AgentModelsService(db) },
       { provide: AgentProfilesService, useValue: agentProfiles },
+      { provide: SkillsService, useValue: skills },
       { provide: UserAvatarService, useValue: new UserAvatarService(db) },
       { provide: ProjectLogoService, useValue: new ProjectLogoService(db) },
       { provide: AgentInstructionsService, useValue: new AgentInstructionsService(db) },
@@ -192,20 +244,51 @@ export async function createApplication(
       },
       { provide: AgentRunEventsService, useValue: new AgentRunEventsService(db) },
       { provide: IdentityService, useValue: identity },
+      { provide: ProjectPermissionsService, useValue: new ProjectPermissionsService(db) },
+      {
+        provide: GitRepositoriesService,
+        useValue: new GitRepositoriesService(db, cipher, {
+          allowedRoots: allowedRepositoryRoots(),
+        }),
+      },
+      {
+        provide: DevelopmentStore,
+        useValue: new DevelopmentStore(db, undefined, (client, ticketId) =>
+          deliveries.ticketDeliveries(client, ticketId),
+        ),
+      },
+      { provide: DeliveryStore, useValue: deliveries },
+      {
+        provide: PipelinesService,
+        useValue: new PipelinesService(db, cipher, {
+          allowedOrigins: allowedPipelineOrigins(),
+          publicUrl: config.publicUrl,
+        }),
+      },
       { provide: AccountService, useValue: new AccountService(db, cipher, mail) },
       { provide: IntegrationSettingsService, useValue: settings },
       // O fluxo do projeto decide o que acontece a cada ticket novo e a cada resposta do autor.
+      { provide: TicketsService, useValue: tickets },
       {
-        provide: TicketsService,
-        useValue: new TicketsService(
-          db,
-          [flowEngine.onPublicComment],
-          [flowEngine.onTicketCreated],
-        ),
+        provide: CapabilityDevelopmentService,
+        useValue: new CapabilityDevelopmentService(db, {
+          createTicket: (actor, input, options) => tickets.create(actor, input, options),
+          runtimeVersion: () => process.env.ZEROOPS_VERSION,
+        }),
       },
       { provide: FlowsService, useValue: new FlowsService(db, flowEngine, agentProfiles) },
+      {
+        provide: FlowSimulationService,
+        useValue: new FlowSimulationService(
+          db,
+          (key) => flowEngine.supportsAction(key),
+          agentProfiles,
+        ),
+      },
+      { provide: TicketRouter, useValue: new TicketRouter(db, flowEngine) },
       { provide: TicketGovernanceService, useValue: new TicketGovernanceService(db) },
       { provide: MetricsService, useValue: new MetricsService(db) },
+      { provide: OperationsMetricsService, useValue: new OperationsMetricsService(db) },
       { provide: WorkflowService, useValue: new WorkflowService(db, unconfiguredCapabilities()) },
       { provide: HTTP_CONFIG, useValue: config },
     ],
@@ -229,6 +312,16 @@ export async function createApplication(
     }),
   );
   app.use(sessionMiddleware(identity, config.publicUrl, db, config.trustLoopbackProxy));
+  // Callbacks de pipeline: a assinatura HMAC é verificada sobre o corpo exato recebido.
+  app.use(
+    /^\/api\/pipelines\/[^/]+\/callbacks$/i,
+    express.json({
+      limit: '64kb',
+      verify: (request, _response, buffer) => {
+        (request as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(buffer);
+      },
+    }),
+  );
   // Resultados SQL/logs do relay de Produção excedem o limite geral (são limitados no serviço).
   app.use('/api/relay', express.json({ limit: '2mb' }));
   // Logotipo do projeto em base64 (máx. 256 KB binário, validado no serviço).
@@ -240,6 +333,11 @@ export async function createApplication(
   app.use('/api/account/avatar', express.json({ limit: '720kb' }));
   // Definições de fluxo com disposição e instruções por etapa.
   app.use(/^\/api\/project-admin\/[^/]+\/flows(?:\/.*)?$/i, express.json({ limit: '512kb' }));
+  // Envio de skills e agentes (bundle até 768 KB de texto, validado no serviço).
+  app.use(
+    /^\/api\/project-admin\/[^/]+\/(?:skills(?:\/[^/]+)?\/(?:import|versions)|agent-profiles\/import)$/i,
+    express.json({ limit: '1mb' }),
+  );
   app.use(express.json({ limit: '64kb' }));
   const staticDirectory = config.staticDirectory;
   if (staticDirectory) {

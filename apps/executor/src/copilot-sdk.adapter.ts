@@ -6,6 +6,8 @@ import {
   type PermissionRequest,
   type PermissionRequestResult,
   type SessionConfig,
+  type Tool,
+  type ToolResultObject,
 } from '@github/copilot-sdk';
 import { isAbsolute } from 'node:path';
 import {
@@ -23,6 +25,7 @@ import {
   validateShell,
 } from './agent-report.js';
 import type { CopilotAgent, CopilotExecuteInput } from './copilot.adapter.js';
+import { CapabilityToolGuard, compileSessionCapabilities } from './capability-bundle.js';
 import { agentEnvironment, type AgentIdentity } from './copilot-process.js';
 import { PermissionPolicy, type PermissionRequestLike } from './permission-policy.js';
 import {
@@ -179,12 +182,51 @@ export class CopilotSdkAdapter implements CopilotAgent {
     if (readOnly.some((directory) => !isAbsolute(directory)))
       throw new Error('Diretorio adicional invalido.');
     const conversation = input.conversation;
+    const capabilities = input.capabilities
+      ? compileSessionCapabilities(input.capabilities, shell?.tool ?? null)
+      : null;
+    const guard = new CapabilityToolGuard(
+      input.capabilities?.manifest ?? null,
+      input.isActive ?? (() => true),
+    );
     const policy = new PermissionPolicy({
       root,
       mode: input.mode,
       readOnlyDirectories: readOnly,
       shell,
+      ...(input.isActive ? { isActive: input.isActive } : {}),
+      ...(input.tools?.length ? { customTools: input.tools.map((tool) => tool.name) } : {}),
     });
+    const isActive = input.isActive ?? (() => true);
+    const customTools = (input.tools ?? []).map((tool): Tool => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+      defer: 'never',
+      handler: async (args, invocation): Promise<ToolResultObject> => {
+        if (!isActive())
+          return {
+            textResultForLlm:
+              'Tentativa sem posse (cancelada ou expirada). Termina sem mais alterações.',
+            resultType: 'denied',
+          };
+        try {
+          const result = await tool.handler(args, { toolCallId: invocation.toolCallId });
+          return {
+            textResultForLlm: result.text,
+            resultType: result.ok ? 'success' : 'failure',
+            ...(result.ok ? {} : { error: clip(result.text, 300) }),
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'erro';
+          return {
+            textResultForLlm: `Falha interna da ferramenta: ${clip(message, 200)}. Não houve alterações.`,
+            resultType: 'failure',
+            error: clip(message, 300),
+          };
+        }
+      },
+    }));
     const runEnv = input.env ?? {};
     const redact = createRedactor(Object.values(runEnv));
     const identityEnv: Record<string, string> = this.options.identity
@@ -254,11 +296,41 @@ export class CopilotSdkAdapter implements CopilotAgent {
           'glob',
           'create',
           'edit',
+          // Os modelos GPT editam com `apply_patch`; sem ele não conseguem gravar o relatório.
+          'apply_patch',
           'ask_user',
           'exit_plan_mode',
           'report_intent',
           ...(shell ? [shell.tool] : []),
+          ...(capabilities?.tools ?? []),
+          ...customTools.map((tool) => tool.name),
         ],
+        ...(customTools.length ? { tools: customTools } : {}),
+        ...(capabilities
+          ? {
+              ...capabilities.config,
+              hooks: {
+                // Sem posse, fora do conjunto fixado ou acima do limite: recusado. Nunca aprova; a
+                // decisão final das restantes chamadas continua na PermissionPolicy.
+                onPreToolUse: (hook: {
+                  toolName: string;
+                  toolArgs: unknown;
+                  toolCallId?: string;
+                }) => {
+                  const denied = guard.check(hook);
+                  if (denied)
+                    conversation?.publish({
+                      type: 'permission',
+                      kind: hook.toolName,
+                      decision: 'denied',
+                      detail: clip(denied.permissionDecisionReason, 300),
+                      ...(hook.toolCallId ? { toolCallId: hook.toolCallId } : {}),
+                    });
+                  return denied;
+                },
+              },
+            }
+          : {}),
         streaming: true,
         onPermissionRequest: (request: PermissionRequest): PermissionRequestResult => {
           const decision = policy.decide(request as unknown as PermissionRequestLike);
@@ -296,6 +368,13 @@ export class CopilotSdkAdapter implements CopilotAgent {
           request: ExitPlanModeRequest,
         ): Promise<ExitPlanModeResult> => {
           const plan = [request.summary, request.planContent].filter(Boolean).join('\n\n');
+          if (input.planApproval === 'auto' && request.recommendedAction) {
+            conversation?.publish({
+              type: 'status',
+              text: `Plano aprovado automaticamente (${request.recommendedAction}); ferramentas limitadas pela política do run.`,
+            });
+            return { approved: true, selectedAction: request.recommendedAction };
+          }
           const answer = conversation
             ? await conversation.ask(
                 {
@@ -307,7 +386,13 @@ export class CopilotSdkAdapter implements CopilotAgent {
                 stop.signal,
               )
             : null;
-          if (answer === null) return { approved: true, selectedAction: request.recommendedAction };
+          // Sem resposta (timeout, cancelamento ou sem conversa) não há aprovação humana.
+          if (answer === null)
+            return {
+              approved: false,
+              feedback:
+                'Sem aprovação humana do plano. Continua sem executar o plano e conclui o relatório com o que foi apurado.',
+            };
           return request.actions.includes(answer)
             ? { approved: true, selectedAction: answer }
             : { approved: false, feedback: answer };
@@ -326,6 +411,14 @@ export class CopilotSdkAdapter implements CopilotAgent {
       let failure = null as string | null;
       const off = session.on((event) => {
         if (event.type === 'session.idle') idle?.();
+        if (
+          event.type === 'subagent.completed' ||
+          event.type === 'subagent.failed' ||
+          event.type === 'tool.execution_complete'
+        ) {
+          const toolCallId = (event.data as { toolCallId?: unknown } | undefined)?.toolCallId;
+          guard.release(typeof toolCallId === 'string' ? toolCallId : undefined);
+        }
         const payload = mapSessionEvent(event, redact);
         if (!payload) return;
         if (payload.type === 'error') failure = payload.message;
@@ -353,7 +446,7 @@ export class CopilotSdkAdapter implements CopilotAgent {
 
       try {
         conversation?.publish({ type: 'status', text: 'Copilot a investigar' });
-        await turn(input.prompt + reportInstruction(input.mode, shell));
+        await turn(input.prompt + reportInstruction(input.mode, shell, input.gitWorkspace));
         while (conversation && !stop.signal.aborted) {
           await conversation.flush();
           const messages = conversation.takeMessages();
@@ -374,7 +467,9 @@ export class CopilotSdkAdapter implements CopilotAgent {
       }
       if (stop.signal.aborted) throw new Error('Copilot interrompido; requer reconciliacao.');
       try {
-        return await readAgentReport(root, resultPath, input.mode);
+        return await readAgentReport(root, resultPath, input.mode, {
+          gitWorkspace: input.gitWorkspace,
+        });
       } catch (error) {
         if (failure) throw new Error(`Copilot falhou: ${failure}`, { cause: error });
         throw error;

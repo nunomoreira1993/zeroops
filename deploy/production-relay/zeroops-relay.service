@@ -21,6 +21,9 @@ TasksMax=16
 # Isolamento: sistema de ficheiros so de leitura, sem privilegios adicionais.
 NoNewPrivileges=yes
 ProtectSystem=strict
+# Journal de idempotencia das intervencoes (unica pasta gravavel; criada pelo systemd).
+StateDirectory=zeroops-relay
+StateDirectoryMode=0700
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

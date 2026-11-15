@@ -12,6 +12,7 @@ import {
 import { IdentityCipher } from '../../../packages/backend/src/modules/identity/identity-security.js';
 import { createHealthMonitoring } from '../../../packages/backend/src/modules/health/health.module.js';
 import { FlowEngine } from '../../../packages/backend/src/modules/flows/flow-engine.js';
+import { TicketRouter } from '../../../packages/backend/src/modules/flows/ticket-routing.js';
 import { createFlowActionRegistry } from '../../../packages/backend/src/modules/incidents/incident.module.js';
 
 if (!process.env.ZEROOPS_DATABASE_URL) throw new Error('ZEROOPS_DATABASE_URL obrigatorio.');
@@ -69,6 +70,7 @@ const flowEngine = new FlowEngine(
   db,
   createFlowActionRegistry(db, { settings, publicUrl: mailConfig.publicUrl }),
 );
+const ticketRouter = new TicketRouter(db, flowEngine);
 const health = createHealthMonitoring(
   db,
   settings,
@@ -147,6 +149,8 @@ const flowCycle = async () => {
   flowActive = true;
   try {
     for (let round = 0; round < 10 && !stopping; round += 1) if (!(await flowEngine.tick())) break;
+    // Perguntas de encaminhamento sem resposta no prazo seguem o fallback configurado.
+    if (!stopping) await ticketRouter.expireOverdue();
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -170,18 +174,8 @@ try {
     }),
   );
 }
-// Tickets em curso de antes dos fluxos entram no fluxo por omissão na decisão da equipa.
-try {
-  const started = await flowEngine.backfill(500);
-  if (started) console.warn(JSON.stringify({ event: 'flows.backfilled', started }));
-} catch (error) {
-  console.error(
-    JSON.stringify({
-      event: 'flows.backfill_failed',
-      type: error instanceof Error ? error.name : 'UnknownError',
-    }),
-  );
-}
+// P11: tickets antigos sem execução já não entram automaticamente no fluxo (sem backfill no
+// arranque); a adoção é explícita e auditada (`zeroops-ops flow-adoption`).
 const flowTimer = setInterval(() => {
   void flowCycle();
 }, 15000);

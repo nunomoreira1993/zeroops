@@ -11,9 +11,12 @@ export class CandidateService {
   async recordVerifiedCandidate(runId: string, rawManifest: unknown) {
     const manifest = candidateManifestSchema.parse(rawManifest);
     const paths = new Set(manifest.files.map((file) => file.path));
+    const removed = 'vcs' in manifest ? manifest.removed : [];
     if (
       paths.size !== manifest.files.length ||
-      manifest.sqlFiles.some((path) => !paths.has(path))
+      manifest.sqlFiles.some((path) => !paths.has(path)) ||
+      removed.some((path) => paths.has(path)) ||
+      paths.size + removed.length === 0
     ) {
       throw new DomainError(
         'invalid_manifest',

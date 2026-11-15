@@ -46,6 +46,28 @@ describe('contrato Copilot sem executar agente real', () => {
     expect(result.files[0]?.sha256).toHaveLength(64);
     expect(result.verifiedTests).toBe(false);
   });
+  it('ignora evidencias nao pedidas no desenvolvimento mas valida-as na investigacao', async () => {
+    const report = {
+      summary: 'Candidato',
+      files: [],
+      proposedTests: [],
+      evidence: [{ source: 'app.js', finding: 'sem detail', environment: 'quality' }],
+    };
+    const adapter = (directory: string) =>
+      new CopilotCliAdapter({
+        async run() {
+          await writeFile(join(directory, '.zeroops-result.json'), JSON.stringify(report));
+          return { exitCode: 0, interrupted: false };
+        },
+      });
+    const implement = await workspace();
+    const result = await adapter(implement).execute({ ...limits, workspace: implement });
+    expect(result.evidence).toEqual([]);
+    const investigate = await workspace();
+    await expect(
+      adapter(investigate).execute({ ...limits, mode: 'investigate', workspace: investigate }),
+    ).rejects.toThrow();
+  });
   it('recusa sucesso aparente sem resultado e paths externos', async () => {
     const directory = await workspace();
     const adapter = new CopilotCliAdapter({
@@ -92,7 +114,9 @@ describe('contrato Copilot sem executar agente real', () => {
       shell: { tool: 'bash', commands: ['zo-sql', 'zo-loki'] },
       env: { ZEROOPS_RUN_TOKEN: 'abc' },
     });
-    expect(seen?.arguments).toContain('--available-tools=view,grep,glob,create,edit,bash');
+    expect(seen?.arguments).toContain(
+      '--available-tools=view,grep,glob,create,edit,apply_patch,bash',
+    );
     expect(seen?.arguments).toContain('--allow-tool=shell(zo-sql:*)');
     expect(seen?.arguments).toContain('--allow-tool=shell(zo-loki:*)');
     expect(seen?.arguments).not.toContain('--allow-tool=shell');

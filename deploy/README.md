@@ -100,7 +100,7 @@ docker compose logs --tail 50 executor connectors
 
 Migracao `sql/024_ticket_flows.sql` (tabelas `flows`, `flow_versions`, `flow_executions`, `flow_execution_steps`, `flow_decisions`, `flow_execution_events`, `flow_assistant_requests`). Nao e preciso configurar nada para manter o comportamento anterior: na primeira visita/ticket de cada projeto sao criados os fluxos _Geral_ (por omissao) e _Saude_ publicados, e _Manutencao de cliente_ em rascunho.
 
-- `worker`: periodicamente chama `tick` (verificacoes com prazo, etapas Copilot orfas); no arranque atualiza os fluxos Saude ainda iguais ao modelo anterior (`flows.templates_upgraded`; nova versao, tickets em curso mantem a sua) e chama `backfill` (tickets em curso anteriores aos fluxos).
+- `worker`: periodicamente chama `tick` (verificacoes com prazo, etapas Copilot orfas); no arranque atualiza os fluxos Saude ainda iguais ao modelo anterior (`flows.templates_upgraded`; nova versao, tickets em curso mantem a sua). Desde P11 ja nao faz `backfill`: tickets antigos sem execucao so entram num fluxo por adocao explicita e auditada (`ops flow-adoption`, abaixo).
 - `executor`: alem dos runs do Copilot, consome `flow_assistant_requests` (assistente do fluxo e do ticket) sem ferramentas de escrita nem shell; pedidos interrompidos ficam `failed` e podem ser repetidos. Etapas `develop` devolvem um diff gerado a partir dos ficheiros copiados para o workspace (no modelo Saude, a etapa «Copilot tenta a correcao»).
 
 Acoes que dependem de integracao por configurar: aplicar no ambiente a correcao da Saude (o Copilot ja prepara o diff numa copia temporaria; sem integracao `health_remediation` segue por «indisponivel») e deploy (`deploy` segue por «manual» e espera confirmacao do responsavel de release).
@@ -145,7 +145,15 @@ ops health-settings --file /caminho/no/contentor/health.json --as admin@exemplo.
 ops agent-token --out /tmp/token.env --as admin@exemplo.pt   # ZEROOPS_TOKEN=..., modo 600
 ops health-run --as admin@exemplo.pt
 ops health-report --as admin@exemplo.pt
+# P11 (ver docs/operacao-zeroops-agentico.md): so leitura / dry-run por omissao
+ops migration-inventory --as admin@exemplo.pt
+ops flow-adoption --as admin@exemplo.pt                          # dry-run: candidatos + hash
+ops flow-adoption --disposition exclude --tickets ID --reason "fora do fluxo" --apply --expect HASH --as admin@exemplo.pt
+ops retention --all-projects --as admin@exemplo.pt              # dry-run: selecao + hash
+ops retention --all-projects --apply --expect HASH --as admin@exemplo.pt
 ```
+
+`retention` usa `ZEROOPS_RETENTION_JOB_EVENTS_DAYS` (180), `ZEROOPS_RETENTION_SIMULATIONS_DAYS` (90), `ZEROOPS_RETENTION_OUTBOX_DAYS` (180) e `ZEROOPS_RETENTION_RUN_DELTAS_DAYS` (30) do ambiente da API (`0` desativa). O `--expect` tem de ser o hash do dry-run imediatamente anterior; se a selecao mudar, nada e removido.
 
 O primeiro administrador cria-se num terminal interativo (a password nunca passa por argumentos):
 

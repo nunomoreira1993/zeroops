@@ -279,6 +279,8 @@ function RunItems({
           <span className={`tiny-badge agent-run-badge-${run.status}`}>
             {active && <span className="spinner" aria-hidden="true" />}
             {t(...statusText[run.status])}
+            {(run.attempt ?? 0) > 1 &&
+              ` · ${t(`tentativa ${run.attempt}`, `attempt ${run.attempt}`)}`}
           </span>
         }
         footer={

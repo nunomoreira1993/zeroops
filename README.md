@@ -14,6 +14,7 @@ O código cobre o portal, workflow, integração do Copilot para investigação 
 - Outbox durável em MySQL, processado pelo worker. A entrega real depende de configuração SMTP verificada.
 - Módulo Saúde com 21 verificações, alertas, relatório diário e suporte para agente no host. A configuração e entrega remotas atuais não foram verificadas nesta revisão; a documentação operacional contém registos históricos que não devem ser tratados como estado atual.
 - Fluxos de resolução por projeto: editor visual, assistente Copilot para alterar o fluxo por conversa, simulação com tickets antigos, versões publicadas e acompanhamento por ticket. Ver [funcionalidades](funcionalidades.md#14-fluxos-de-resolução).
+- Plano agêntico P00–P11 (permissões delegáveis, versões, jobs duráveis, agentes/skills, pipeline, Health pelo fluxo, capacidades e rollout, operação): estado real e limitações em [progresso](docs/progresso-zeroops-agentico.md); procedimentos de operação, com indicação do que foi ensaiado em QA, em [operação](docs/operacao-zeroops-agentico.md).
 
 Continuam por implementar: anexos privados, execução governada de alterações em QA, testes independentes do candidato, preview/QA automatizados e operador SVN/release. Produção fica limitada a monitorização read-only aprovada; não existe escrita nem deployment de ZeroOps em Produção neste âmbito. **Estado de runtime, configuração e acesso devem ser verificados no ambiente antes de cada operação.**
 

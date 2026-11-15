@@ -35,6 +35,20 @@ a regra não existe e qualquer intervenção é recusada. Com a Saúde do ambien
 ZeroOps, o relay recusa intervenções. Não há ferramenta para apagar ficheiros nem para escrever
 em bases de dados.
 
+### Idempotência das intervenções (relay 1.2.0, P09)
+
+- Os pedidos seguem o contrato `zeroops.intervention/2`: trazem prazo (`deadline`) e chave de
+  idempotência. Um pedido recebido fora do prazo não é executado.
+- Cada intervenção fica registada num journal local em `/var/lib/<serviço>/` (`StateDirectory`
+  do systemd, `0700`, a única pasta gravável do serviço). O mesmo pedido corre no máximo uma
+  vez neste servidor: uma repetição devolve o resultado guardado.
+- Se o relay for interrompido a meio de uma intervenção, esta **não é repetida**: o resultado é
+  reportado como desconhecido (`UNCERTAIN`) e o ZeroOps reconcilia-o pelo fluxo (sondas
+  recentes, escalada). Um restart nunca é repetido só porque a resposta expirou.
+- Resultados que o ZeroOps ainda não confirmou são reenviados no ciclo seguinte. O ZeroOps
+  aceita o mesmo resultado repetido (`duplicate`) e recusa com 409 um resultado contraditório.
+- As entradas do journal são apagadas ao fim de 7 dias.
+
 ## Segurança e impacto no site
 
 - Utilizador MySQL próprio `zeroops_agent@localhost`: `SELECT` em `pizzahut.*`,

@@ -85,6 +85,7 @@ const opIcons: Record<FlowNode['op'], string> = {
   action: '⚙',
   copilot_task: '✦',
   human_decision: '☑',
+  condition: '◇',
   end: '■',
 };
 

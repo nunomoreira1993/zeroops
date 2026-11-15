@@ -1,4 +1,4 @@
-export type MarkdownAction = 'bold' | 'italic' | 'heading' | 'list' | 'link' | 'code';
+export type MarkdownAction = 'bold' | 'italic' | 'heading' | 'list' | 'link' | 'code' | 'quote';
 
 export function formatMarkdown(value: string, start: number, end: number, action: MarkdownAction) {
   let selection = value.slice(start, end);
@@ -6,13 +6,16 @@ export function formatMarkdown(value: string, start: number, end: number, action
   let suffix: string;
   switch (action) {
     case 'heading':
-    case 'list': {
+    case 'list':
+    case 'quote': {
       const lastSelected = end > start && value[end - 1] === '\n' ? end - 1 : end;
       start = start === 0 ? 0 : value.lastIndexOf('\n', start - 1) + 1;
       const lineEnd = value.indexOf('\n', lastSelected);
       end = lineEnd < 0 ? value.length : lineEnd;
-      const marker = action === 'heading' ? '## ' : '- ';
-      selection = value.slice(start, end) || (action === 'heading' ? 'Título' : 'Item');
+      const marker = action === 'heading' ? '## ' : action === 'quote' ? '> ' : '- ';
+      selection =
+        value.slice(start, end) ||
+        (action === 'heading' ? 'Título' : action === 'list' ? 'Item' : '');
       const inserted = selection
         .split('\n')
         .map((line) => marker + line)

@@ -23,12 +23,37 @@ const deletions: ReadonlyArray<readonly [string, string]> = [
   ['notification_delivery_state', `outbox_id IN (${outboxSet})`],
   ['notification_outbox', `id IN (SELECT id FROM (${outboxSet}) purge_outbox)`],
   [
+    'delivery_events',
+    `delivery_id IN (SELECT id FROM delivery_runs WHERE ticket_id IN (${ticketSet}))`,
+  ],
+  ['delivery_runs', `ticket_id IN (${ticketSet})`],
+  // P10: o processo de capacidade sem o ticket ficaria órfão (e bloquearia a ativação do fluxo).
+  [
+    'capability_development_events',
+    `development_id IN (SELECT id FROM capability_developments WHERE ticket_id IN (${ticketSet}))`,
+  ],
+  ['capability_developments', `ticket_id IN (${ticketSet})`],
+  ...[
+    'development_review_decisions',
+    'development_publications',
+    'development_test_runs',
+    'development_revisions',
+    'development_workspaces',
+  ].map((table) => [table, `ticket_id IN (${ticketSet})`] as const),
+  [
     'flow_decisions',
     `step_id IN (SELECT id FROM flow_execution_steps WHERE execution_id IN (${executionSet}))`,
   ],
   ['flow_execution_events', `execution_id IN (${executionSet})`],
   ['flow_execution_steps', `execution_id IN (${executionSet})`],
   ['flow_executions', `ticket_id IN (${ticketSet})`],
+  // P11: disposição explícita de tickets antigos (FK só para o ticket).
+  ['ticket_flow_adoptions', `ticket_id IN (${ticketSet})`],
+  ['ticket_routing_events', `ticket_id IN (${ticketSet})`],
+  ['ticket_routing_replies', `ticket_id IN (${ticketSet})`],
+  ['ticket_routing_jobs', `ticket_id IN (${ticketSet})`],
+  ['ticket_routing', `ticket_id IN (${ticketSet})`],
+  ['agent_job_events', `ticket_id IN (${ticketSet})`],
   ['flow_assistant_requests', `ticket_id IN (${ticketSet})`],
   ['connector_relay_requests', `run_id IN (${runSet})`],
   ['agent_run_inputs', `run_id IN (${runSet})`],
@@ -210,6 +235,9 @@ export class ProjectTicketPurge {
       const blockers: string[] = [];
       for (const table of [
         'flow_assistant_requests',
+        'ticket_routing',
+        'ticket_routing_jobs',
+        'ticket_routing_events',
         'health_incidents',
         'health_alerts',
         'health_external_alerts',
@@ -237,12 +265,22 @@ export class ProjectTicketPurge {
       const unsafe: ReadonlyArray<readonly [string, string]> = [
         ['agent_runs', `ticket_id IN (${ticketSet}) AND status='running'`],
         ['flow_assistant_requests', `ticket_id IN (${ticketSet}) AND status='running'`],
+        ['ticket_routing_jobs', `ticket_id IN (${ticketSet}) AND status='running'`],
         ['execution_runs', `ticket_id IN (${ticketSet}) AND status IN ('pending','running')`],
         [
           'deployment_runs',
           `ticket_id IN (${ticketSet}) AND status IN ('pending','running','uncertain')`,
         ],
         ['connector_relay_requests', `run_id IN (${runSet}) AND status='claimed'`],
+        [
+          'delivery_runs',
+          `ticket_id IN (${ticketSet}) AND state IN ('integrating','starting','publishing','uncertain')`,
+        ],
+        ['incident_interventions', `ticket_id IN (${ticketSet}) AND status='uncertain'`],
+        [
+          'capability_developments',
+          `ticket_id IN (${ticketSet}) AND state IN ('publishing','reconciliation_required')`,
+        ],
         [
           'notification_delivery_state',
           `outbox_id IN (${outboxSet}) AND state IN ('processing','uncertain')`,

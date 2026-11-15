@@ -16,6 +16,7 @@ import { requireMember } from '../identity/membership.js';
 import { approveStage } from './domain/approval.js';
 import { nextTicketStatus } from './domain/ticket-transition.js';
 import { invalidateTicketDependencies } from '../tickets/ticket-dependencies.js';
+import { rejectWhenFlowManaged } from '../tickets/flow-authority.js';
 import { appendHumanComment } from '../tickets/ticket-comments.js';
 import { recordTicketMove } from '../tickets/ticket-move.js';
 
@@ -59,6 +60,9 @@ export class WorkflowService {
     const row = result.rows[0];
     const ticket = row ? { ...row, actorRole: member.role } : null;
     if (!ticket) throw new DomainError('not_found', 'Ticket nao encontrado.', 404);
+    // P08/P11: com um fluxo ativo, propostas, aprovações e transições passam pelo motor (etapas
+    // e revisores configurados); as rotas legadas não podem saltar essas etapas.
+    await rejectWhenFlowManaged(client, id);
     if (ticket.version !== version)
       throw new DomainError('stale_version', 'O ticket mudou. Recarregue a pagina.');
     return ticket;

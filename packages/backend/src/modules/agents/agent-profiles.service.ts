@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  agentImportSchema,
   agentProfileCreateSchema,
   agentProfileVersionInputSchema,
   agentProfileDefinitionSchema,
@@ -8,6 +9,9 @@ import {
   type AgentProfile,
   type AgentProfileDefinition,
   type AgentProfileRunSnapshot,
+  type CapabilityRunManifest,
+  type CapabilitySource,
+  type FlowManifest,
   type RepositoryResourceReference,
 } from '../../../../contracts/src/index.js';
 import type {
@@ -18,8 +22,11 @@ import type { FlowDefinition, FlowNode, User } from '../../../../contracts/src/i
 import type { Database } from '../../database/database.js';
 import { DomainError } from '../../errors.js';
 import { parseInput } from '../identity/identity.validation.js';
-import { requireProjectAdmin, type Queryable } from '../identity/membership.js';
+import type { Queryable } from '../identity/membership.js';
+import { requireProjectPermission } from '../identity/project-permissions.js';
 import { AgentModelsService } from './agent-models.service.js';
+import { profileDefinitionHash, resolveNodeCapabilities } from './capability-catalog.js';
+import { parseAgentMarkdown } from './skill-bundle.js';
 import {
   relevantRepositoryResources,
   repositorySnapshotHash,
@@ -34,9 +41,18 @@ interface ProfileRow {
   archived_at: Date | null;
 }
 
+/** Dependências resolvidas de uma definição (base do manifesto de ativação). */
+export type FlowDependencyResolution = Pick<
+  FlowManifest,
+  'agentProfiles' | 'repositoryResources' | 'globalInstructions' | 'skills' | 'delegates'
+> & {
+  delegationByNode?: Record<string, { maxConcurrency: number; maxDepth: number }>;
+};
+
 interface VersionRow {
   version: number;
   definition: unknown;
+  provenance?: unknown;
   created_at: Date;
   created_by: string | null;
   author: string | null;
@@ -164,8 +180,9 @@ export class AgentProfilesService {
   /** Lista o catálogo versionado do projeto; cria os quatro perfis iniciais na primeira consulta. */
   async list(actor: User, projectId: string): Promise<AgentProfile[]> {
     return this.db.transaction(async (client) => {
-      await requireProjectAdmin(client, actor, projectId);
-      await this.seed(client, projectId, actor.id);
+      const context = await requireProjectPermission(client, actor, projectId, 'flows.view', true);
+      if (context.permissions.includes('agents.manage'))
+        await this.seed(client, projectId, actor.id);
       const profiles = await client.query<ProfileRow>(
         `SELECT id,project_id,name,current_version,archived_at FROM zeroops_agent_profiles
           WHERE project_id=$1 ORDER BY archived_at IS NOT NULL,name`,
@@ -179,19 +196,27 @@ export class AgentProfilesService {
   async create(actor: User, projectId: string, raw: unknown) {
     const definition = parseInput(agentProfileCreateSchema, raw);
     return this.db.transaction(async (client) => {
-      const admin = await requireProjectAdmin(client, actor, projectId, false, true);
+      const context = await requireProjectPermission(
+        client,
+        actor,
+        projectId,
+        'agents.manage',
+        true,
+      );
       await this.assertNameAvailable(client, projectId, definition.name);
       await this.validateModel(client, projectId, definition);
       const id = randomUUID();
       await client.query(
         'INSERT INTO zeroops_agent_profiles(id,project_id,name,current_version,created_by) VALUES($1,$2,$3,1,$4)',
-        [id, projectId, definition.name, admin.id],
+        [id, projectId, definition.name, context.actor.id],
       );
       await client.query(
         'INSERT INTO zeroops_agent_profile_versions(id,profile_id,project_id,version,definition,created_by) VALUES($1,$2,$3,1,$4,$5)',
-        [randomUUID(), id, projectId, definition, admin.id],
+        [randomUUID(), id, projectId, definition, context.actor.id],
       );
-      await this.audit(client, admin.id, projectId, 'agent.profile.created', { profileId: id });
+      await this.audit(client, context.actor.id, projectId, 'agent.profile.created', {
+        profileId: id,
+      });
       return this.getProfile(client, projectId, id);
     });
   }
@@ -200,7 +225,13 @@ export class AgentProfilesService {
   async addVersion(actor: User, projectId: string, profileId: string, raw: unknown) {
     const input = parseInput(agentProfileVersionInputSchema, raw);
     return this.db.transaction(async (client) => {
-      const admin = await requireProjectAdmin(client, actor, projectId, false, true);
+      const context = await requireProjectPermission(
+        client,
+        actor,
+        projectId,
+        'agents.manage',
+        true,
+      );
       const profile = (
         await client.query<ProfileRow>(
           'SELECT id,project_id,name,current_version,archived_at FROM zeroops_agent_profiles WHERE id=$1 AND project_id=$2 FOR UPDATE',
@@ -217,13 +248,13 @@ export class AgentProfilesService {
       const version = Number(profile.current_version) + 1;
       await client.query(
         'INSERT INTO zeroops_agent_profile_versions(id,profile_id,project_id,version,definition,created_by) VALUES($1,$2,$3,$4,$5,$6)',
-        [randomUUID(), profileId, projectId, version, input.definition, admin.id],
+        [randomUUID(), profileId, projectId, version, input.definition, context.actor.id],
       );
       await client.query(
         'UPDATE zeroops_agent_profiles SET name=$2,current_version=$3,updated_at=NOW(3) WHERE id=$1',
         [profileId, input.definition.name, version],
       );
-      await this.audit(client, admin.id, projectId, 'agent.profile.version_created', {
+      await this.audit(client, context.actor.id, projectId, 'agent.profile.version_created', {
         profileId,
         version,
       });
@@ -234,33 +265,225 @@ export class AgentProfilesService {
   /** Arquiva o perfil para novas publicações sem alterar versões já fixadas em flows. */
   async archive(actor: User, projectId: string, profileId: string) {
     return this.db.transaction(async (client) => {
-      const admin = await requireProjectAdmin(client, actor, projectId, false, true);
+      const context = await requireProjectPermission(
+        client,
+        actor,
+        projectId,
+        'agents.manage',
+        true,
+      );
       const result = await client.query(
         'UPDATE zeroops_agent_profiles SET archived_at=COALESCE(archived_at,NOW(3)),updated_at=NOW(3) WHERE id=$1 AND project_id=$2',
         [profileId, projectId],
       );
       if (!result.rowCount)
         throw new DomainError('AGENT_PROFILE_NOT_FOUND', 'Perfil não encontrado.', 404);
-      await this.audit(client, admin.id, projectId, 'agent.profile.archived', { profileId });
+      await this.audit(client, context.actor.id, projectId, 'agent.profile.archived', {
+        profileId,
+      });
       return this.getProfile(client, projectId, profileId);
+    });
+  }
+
+  /**
+   * Importa um `.agent.md` (do repositório autorizado do projeto ou enviado) como perfil novo ou
+   * nova versão de um perfil existente. A origem fica registada; o ficheiro nunca é alterado.
+   */
+  async importAgent(actor: User, projectId: string, raw: unknown) {
+    const input = parseInput(agentImportSchema, raw);
+    let content: string;
+    let fileName: string;
+    let provenance: CapabilitySource;
+    if (input.source === 'repository') {
+      if (!input.path)
+        throw new DomainError('INVALID_INPUT', 'Indique o caminho do agente no repositório.', 400);
+      await requireProjectPermission(this.db, actor, projectId, 'agents.manage');
+      const siteKey = await this.siteKey(this.db, projectId);
+      const file = await this.repository.readAgentFile(siteKey, input.path);
+      if (!file)
+        throw new DomainError(
+          'AGENT_IMPORT_SOURCE_NOT_FOUND',
+          'O agente indicado não existe no repositório autorizado deste projeto.',
+          422,
+        );
+      content = file.content;
+      fileName = file.path;
+      provenance = { kind: 'repository', path: file.path, siteKey };
+    } else {
+      if (!input.content)
+        throw new DomainError('INVALID_INPUT', 'Envie o conteúdo do ficheiro .agent.md.', 400);
+      content = input.content;
+      fileName = input.fileName || 'agente.agent.md';
+      provenance = { kind: 'upload', path: fileName };
+    }
+    const { definition, ignored } = parseAgentMarkdown(content, fileName);
+    provenance = {
+      ...provenance,
+      sha256: createHash('sha256').update(content).digest('hex'),
+      ...(Object.keys(ignored).length ? { ignored } : {}),
+    };
+    return this.db.transaction(async (client) => {
+      const context = await requireProjectPermission(
+        client,
+        actor,
+        projectId,
+        'agents.manage',
+        true,
+      );
+      const profileId = input.profileId
+        ? await this.appendVersion(client, context.actor.id, projectId, input.profileId, {
+            definition,
+            provenance,
+            expectedVersion: input.expectedVersion,
+          })
+        : await this.insertProfile(client, context.actor.id, projectId, definition, provenance);
+      await this.audit(client, context.actor.id, projectId, 'agent.profile.imported', {
+        profileId,
+        source: provenance.kind,
+        path: provenance.path ?? null,
+        sha256: provenance.sha256,
+      });
+      return this.getProfile(client, projectId, profileId);
+    });
+  }
+
+  /**
+   * Adota no projeto destino a versão partilhada de um perfil: cria um perfil local (ou nova
+   * versão do perfil com o mesmo nome). Nunca copia bindings, credenciais ou conversas.
+   */
+  async adoptVersion(
+    client: Queryable,
+    actorId: string,
+    projectId: string,
+    definition: AgentProfileDefinition,
+    provenance: CapabilitySource,
+  ) {
+    const existing = (
+      await client.query<{ id: string; current_version: number }>(
+        'SELECT id,current_version FROM zeroops_agent_profiles WHERE project_id=$1 AND name=$2 FOR UPDATE',
+        [projectId, definition.name],
+      )
+    ).rows[0];
+    if (!existing) return this.insertProfile(client, actorId, projectId, definition, provenance);
+    const current = await this.loadProfileVersion(
+      client,
+      projectId,
+      existing.id,
+      Number(existing.current_version),
+      false,
+    );
+    if (current && profileDefinitionHash(current.definition) === profileDefinitionHash(definition))
+      return existing.id;
+    return this.appendVersion(client, actorId, projectId, existing.id, {
+      definition,
+      provenance,
+      expectedVersion: Number(existing.current_version),
     });
   }
 
   /** Lista metadados allowlisted do repositório; conteúdos são carregados apenas no snapshot do run. */
   async repositoryResources(actor: User, projectId: string) {
-    await requireProjectAdmin(this.db, actor, projectId);
-    const site =
+    await requireProjectPermission(this.db, actor, projectId, 'flows.view');
+    return this.repository.discover(await this.siteKey(this.db, projectId));
+  }
+
+  private async siteKey(client: Queryable, projectId: string) {
+    return (
       (
-        await this.db.query<{ site_key: string | null }>(
+        await client.query<{ site_key: string | null }>(
           'SELECT site_key FROM projects WHERE id=$1',
           [projectId],
         )
-      ).rows[0]?.site_key ?? null;
-    return this.repository.discover(site);
+      ).rows[0]?.site_key ?? null
+    );
   }
 
-  /** Validates profile and repository references while the published version is being created. */
-  async validateFlowDefinition(client: Queryable, projectId: string, definition: FlowDefinition) {
+  private async insertProfile(
+    client: Queryable,
+    actorId: string,
+    projectId: string,
+    definition: AgentProfileDefinition,
+    provenance: CapabilitySource | null,
+  ) {
+    await this.assertNameAvailable(client, projectId, definition.name);
+    await this.validateModel(client, projectId, definition);
+    const id = randomUUID();
+    await client.query(
+      'INSERT INTO zeroops_agent_profiles(id,project_id,name,current_version,created_by) VALUES($1,$2,$3,1,$4)',
+      [id, projectId, definition.name, actorId],
+    );
+    await client.query(
+      'INSERT INTO zeroops_agent_profile_versions(id,profile_id,project_id,version,definition,provenance,created_by) VALUES($1,$2,$3,1,$4,$5,$6)',
+      [
+        randomUUID(),
+        id,
+        projectId,
+        JSON.stringify(definition),
+        provenance ? JSON.stringify(provenance) : null,
+        actorId,
+      ],
+    );
+    return id;
+  }
+
+  private async appendVersion(
+    client: Queryable,
+    actorId: string,
+    projectId: string,
+    profileId: string,
+    input: {
+      definition: AgentProfileDefinition;
+      provenance: CapabilitySource | null;
+      expectedVersion: number | undefined;
+    },
+  ) {
+    const profile = (
+      await client.query<ProfileRow>(
+        'SELECT id,project_id,name,current_version,archived_at FROM zeroops_agent_profiles WHERE id=$1 AND project_id=$2 FOR UPDATE',
+        [profileId, projectId],
+      )
+    ).rows[0];
+    if (!profile) throw new DomainError('AGENT_PROFILE_NOT_FOUND', 'Perfil não encontrado.', 404);
+    if (profile.archived_at)
+      throw new DomainError('AGENT_PROFILE_ARCHIVED', 'O perfil está arquivado.', 409);
+    if (Number(profile.current_version) !== input.expectedVersion)
+      throw new DomainError('CONFLICT', 'O perfil mudou. Recarregue antes de editar.', 409);
+    await this.assertNameAvailable(client, projectId, input.definition.name, profileId);
+    await this.validateModel(client, projectId, input.definition);
+    const version = Number(profile.current_version) + 1;
+    await client.query(
+      'INSERT INTO zeroops_agent_profile_versions(id,profile_id,project_id,version,definition,provenance,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)',
+      [
+        randomUUID(),
+        profileId,
+        projectId,
+        version,
+        JSON.stringify(input.definition),
+        input.provenance ? JSON.stringify(input.provenance) : null,
+        actorId,
+      ],
+    );
+    await client.query(
+      'UPDATE zeroops_agent_profiles SET name=$2,current_version=$3,updated_at=NOW(3) WHERE id=$1',
+      [profileId, input.definition.name, version],
+    );
+    return profileId;
+  }
+
+  /**
+   * Validates profile and repository references while the published version is being created and
+   * returns the resolved dependencies (profile hashes, resource hashes) for the activation manifest.
+   */
+  async validateFlowDefinition(
+    client: Queryable,
+    projectId: string,
+    definition: FlowDefinition,
+  ): Promise<FlowDependencyResolution> {
+    const resolution: FlowDependencyResolution = {
+      agentProfiles: [],
+      repositoryResources: [],
+      globalInstructions: [],
+    };
     const hasReferences = this.hasRepositoryReferences(definition);
     const hasProfiles = definition.nodes.some(
       (node) => flowAgentProfileConfig(node).agentProfileId !== undefined,
@@ -278,7 +501,12 @@ export class AgentProfilesService {
     const catalog =
       hasReferences || hasProfiles || hasCopilot ? await this.repository.discover(siteKey) : null;
     const availableResources = new Set(catalog?.resources.map((item) => item.path) ?? []);
-    if ((hasProfiles || hasReferences) && !catalog?.available)
+    const resourceHash = new Map(catalog?.resources.map((item) => [item.path, item.sha256]) ?? []);
+    // Sem site ligado não há repositório nem instruções globais a fixar: perfis e skills do
+    // catálogo podem ser usados; um repositório ligado mas ilegível continua a bloquear.
+    const repositoryRequired =
+      hasReferences || (hasProfiles && catalog?.reason !== 'site_not_linked');
+    if (repositoryRequired && !catalog?.available)
       throw new DomainError(
         'REPOSITORY_UNAVAILABLE',
         'Não foi possível ler o repositório técnico configurado para este projeto.',
@@ -307,7 +535,26 @@ export class AgentProfilesService {
             422,
           );
         await this.validateModel(client, projectId, profile.definition);
+        resolution.agentProfiles.push({
+          nodeId: node.id,
+          profileId: profile.id,
+          version: profile.version,
+          definitionHash: profileDefinitionHash(profile.definition),
+        });
       }
+      const capabilities = await resolveNodeCapabilities(
+        client,
+        projectId,
+        node,
+        profile,
+        true,
+        (id, version) => this.loadProfileVersion(client, projectId, id, version, true),
+      );
+      if (capabilities.skills.length) (resolution.skills ??= []).push(...capabilities.skills);
+      if (capabilities.delegates.length)
+        (resolution.delegates ??= []).push(...capabilities.delegates);
+      if (capabilities.delegation)
+        (resolution.delegationByNode ??= {})[node.id] = capabilities.delegation;
       const refs = this.nodeResources(node);
       if (refs.length && node.op !== 'copilot_task')
         throw new DomainError(
@@ -322,8 +569,22 @@ export class AgentProfilesService {
             `O recurso técnico «${ref.path}» não existe ou não está autorizado neste projeto.`,
             422,
           );
+        resolution.repositoryResources.push({
+          nodeId: node.id,
+          path: ref.path,
+          required: Boolean(ref.required),
+          sha256: resourceHash.get(ref.path) ?? null,
+        });
       }
+      if (node.op === 'copilot_task')
+        for (const resource of catalog?.resources.filter((item) => item.globalInstruction) ?? [])
+          resolution.globalInstructions.push({
+            nodeId: node.id,
+            path: resource.path,
+            sha256: resource.sha256 ?? null,
+          });
     }
+    return resolution;
   }
 
   /** Resolve regras globais e recursos relevantes uma vez; os snapshots ficam fixos no ticket. */
@@ -350,12 +611,36 @@ export class AgentProfilesService {
       const profile = await this.profileForNode(client, projectId, node, false);
       if (profile) profiles[node.id] = profile;
     }
+    // Skills e especialistas fixados por etapa; bindings revalidados (revogações valem já).
+    const capabilitiesByNode: Record<string, CapabilityRunManifest> = {};
+    let capabilityError: { code: string; message: string } | null = null;
+    try {
+      for (const node of definition.nodes) {
+        const capabilities = await resolveNodeCapabilities(
+          client,
+          projectId,
+          node,
+          profiles[node.id] ?? null,
+          false,
+          (id, version) => this.loadProfileVersion(client, projectId, id, version, false),
+        );
+        if (capabilities.run) capabilitiesByNode[node.id] = capabilities.run;
+      }
+    } catch (error) {
+      if (!(error instanceof DomainError)) throw error;
+      capabilityError = { code: error.code.toLowerCase(), message: error.message };
+    }
     const copilotNodes = definition.nodes.filter((node) => node.op === 'copilot_task');
     const hasProfiles = Object.keys(profiles).length > 0;
     const catalog = copilotNodes.length > 0 ? await this.repository.discover(siteKey) : null;
-    if (hasProfiles && (!catalog?.available || catalog.unavailableGlobalInstructions?.length))
+    if (
+      hasProfiles &&
+      ((!catalog?.available && catalog?.reason !== 'site_not_linked') ||
+        catalog?.unavailableGlobalInstructions?.length)
+    )
       return {
         agentProfiles: profiles,
+        capabilitiesByNode,
         repositorySnapshotHash: null,
         repositoryResources: [],
         repositoryResourcePathsByNode: {},
@@ -442,11 +727,12 @@ export class AgentProfilesService {
     if (!references.size)
       return {
         agentProfiles: profiles,
+        capabilitiesByNode,
         repositorySnapshotHash: null,
         repositoryResources: [],
         repositoryResourcePathsByNode: {},
         repositorySnapshotHashesByNode: {},
-        error: null,
+        error: capabilityError,
       };
     const snapshot = await this.repository.snapshot(siteKey, [...references.values()]);
     const missing = snapshot.resources.find((item) => item.required && item.status !== 'loaded');
@@ -469,16 +755,19 @@ export class AgentProfilesService {
     );
     return {
       agentProfiles: profiles,
+      capabilitiesByNode,
       repositorySnapshotHash: snapshot.snapshotHash,
       repositoryResources: snapshot.resources,
       repositoryResourcePathsByNode: pathsByNodeRecord,
       repositorySnapshotHashesByNode: snapshotHashesByNode,
-      error: missing
-        ? {
-            code: 'repository_resource_unavailable',
-            message: `O recurso técnico obrigatório «${missing.path}» não pôde ser carregado (${missing.reason ?? missing.status}).`,
-          }
-        : null,
+      error: capabilityError
+        ? capabilityError
+        : missing
+          ? {
+              code: 'repository_resource_unavailable',
+              message: `O recurso técnico obrigatório «${missing.path}» não pôde ser carregado (${missing.reason ?? missing.status}).`,
+            }
+          : null,
     };
   }
 
@@ -492,6 +781,30 @@ export class AgentProfilesService {
     const config = flowAgentProfileConfig(node);
     const { agentProfileId: id, agentProfileVersion: version } = config;
     if (id === undefined) return null;
+    const profile = await this.loadProfileVersion(
+      client,
+      projectId,
+      id,
+      Number(version),
+      requireActive,
+    );
+    if (!profile)
+      throw new DomainError(
+        'AGENT_PROFILE_REFERENCE_INVALID',
+        'O perfil ou a versão selecionada não existe neste projeto.',
+        422,
+      );
+    return profile;
+  }
+
+  /** Versão imutável de um perfil do projeto (`null` se não existir neste projeto). */
+  async loadProfileVersion(
+    client: Queryable,
+    projectId: string,
+    id: string,
+    version: number,
+    requireActive: boolean,
+  ): Promise<AgentProfileRunSnapshot | null> {
     const row = (
       await client.query<{
         definition: unknown;
@@ -506,12 +819,7 @@ export class AgentProfilesService {
         [id, projectId, version],
       )
     ).rows[0];
-    if (!row)
-      throw new DomainError(
-        'AGENT_PROFILE_REFERENCE_INVALID',
-        'O perfil ou a versão selecionada não existe neste projeto.',
-        422,
-      );
+    if (!row) return null;
     if (requireActive && row.archived_at)
       throw new DomainError('AGENT_PROFILE_ARCHIVED', 'O perfil selecionado está arquivado.', 422);
     return { id, version: Number(version), definition: parseDefinition(row.definition) };
@@ -582,7 +890,7 @@ export class AgentProfilesService {
 
   private async profile(client: Queryable, row: ProfileRow): Promise<AgentProfile> {
     const versions = await client.query<VersionRow>(
-      `SELECT v.version,v.definition,v.created_at,v.created_by,u.display_name AS author
+      `SELECT v.version,v.definition,v.provenance,v.created_at,v.created_by,u.display_name AS author
          FROM zeroops_agent_profile_versions v LEFT JOIN users u ON u.id=v.created_by
         WHERE v.profile_id=$1 ORDER BY v.version DESC LIMIT 20`,
       [row.id],
@@ -598,6 +906,7 @@ export class AgentProfilesService {
           definition: parseDefinition(version.definition),
           createdAt: version.created_at.toISOString(),
           createdBy: version.author ?? version.created_by,
+          source: (version.provenance as CapabilitySource | null) ?? null,
         }))
         .sort((a, b) => a.version - b.version),
     };

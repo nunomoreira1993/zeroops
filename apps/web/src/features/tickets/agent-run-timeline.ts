@@ -196,6 +196,19 @@ function groupSteps(items: TimelineItem[]): TimelineItem[] {
   return grouped;
 }
 
+function capabilityText(event: Extract<AgentRunEvent, { type: 'capability' }>) {
+  if (event.kind === 'skill') return `Skill «${event.name}» carregada`;
+  const phase =
+    event.phase === 'started'
+      ? 'iniciado'
+      : event.phase === 'completed'
+        ? 'concluído'
+        : event.phase === 'failed'
+          ? 'falhou'
+          : 'invocado';
+  return `Especialista «${event.name}» ${phase}${event.detail ? `: ${event.detail}` : ''}`;
+}
+
 /**
  * Reconstrói a conversa ao vivo a partir dos eventos ordenados: junta os deltas por mensagem,
  * associa o fim e a permissão de cada ferramenta ao início, as respostas às perguntas, agrupa os
@@ -321,6 +334,9 @@ export function buildTimeline(events: readonly AgentRunEvent[]): AgentTimeline {
         break;
       case 'error':
         items.push({ kind: 'error', key, text: event.message });
+        break;
+      case 'capability':
+        items.push({ kind: 'status', key, text: capabilityText(event) });
         break;
     }
   }

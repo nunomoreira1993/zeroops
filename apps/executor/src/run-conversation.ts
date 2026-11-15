@@ -4,7 +4,7 @@ import type { ClaimedInput } from '../../../packages/backend/src/modules/agents/
 
 /** Persistência da conversa (implementada pelo `AgentRunEventsService`). */
 export interface ConversationStore {
-  append(runId: string, events: AgentRunEventPayload[]): Promise<void>;
+  append(runId: string, events: AgentRunEventPayload[]): Promise<unknown>;
   claimInputs(runId: string): Promise<ClaimedInput[]>;
 }
 
@@ -78,7 +78,9 @@ export class AgentRunConversation {
     const batch = this.buffer;
     this.buffer = [];
     this.writing = this.writing
-      .then(() => this.store.append(this.runId, batch))
+      .then(async () => {
+        await this.store.append(this.runId, batch);
+      })
       .catch((error) => this.options.onError?.(error));
     return this.writing;
   }

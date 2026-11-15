@@ -23,6 +23,8 @@ const profile: AgentProfileRunSnapshot = {
 
 const context = {
   runId: 'run-1',
+  lease: { jobId: 'run-1', workerId: 'w-test', epoch: 1, leaseSeconds: 90 },
+  attempt: 1,
   mode: 'investigate',
   projectId: 'project-1',
   project: { name: 'Projeto teste', siteKey: null },

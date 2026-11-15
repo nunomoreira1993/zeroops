@@ -21,8 +21,16 @@ import { IntegrationSettingsPanel } from '../integrations/IntegrationSettingsPan
 import { TeamPage } from '../team/TeamPage';
 import { ProjectLogoField } from './ProjectLogoField';
 
-export type ProjectAdminTab = 'geral' | 'utilizadores' | 'integracoes' | 'saude' | 'fluxos';
-const tabIds: ProjectAdminTab[] = ['geral', 'utilizadores', 'integracoes', 'saude', 'fluxos'];
+export type ProjectAdminTab =
+  'geral' | 'utilizadores' | 'integracoes' | 'saude' | 'fluxos' | 'permissoes';
+const tabIds: ProjectAdminTab[] = [
+  'geral',
+  'utilizadores',
+  'integracoes',
+  'saude',
+  'fluxos',
+  'permissoes',
+];
 
 export function parseProjectAdminRoute(route: string) {
   const [, id, tab, sub] = route.split('/');
@@ -64,6 +72,7 @@ function ProjectDetail({ id, tab, sub }: { id: string; tab: ProjectAdminTab; sub
     },
     { id: 'saude' as const, label: t('Saúde e notificações', 'Health and notifications') },
     { id: 'fluxos' as const, label: t('Fluxos de resolução', 'Resolution flows') },
+    { id: 'permissoes' as const, label: t('Permissões do projeto', 'Project permissions') },
   ];
   return (
     <ProjectAdminProvider key={project.id} project={project}>

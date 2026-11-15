@@ -1,15 +1,20 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import {
   alertRuleById,
   flowDefinitionSchema,
   flowLogic,
   flowMatchSchema,
+  flowRuntimeSupported,
   healthAlertKey,
+  parseRoutingPolicy,
+  planFlowSelection,
   selectFlow,
   toBinaryFlow,
   type FlowDefinition,
   type FlowMatch,
   type FlowMatchTicket,
+  type FlowRoutingPolicy,
+  type FlowSelectionPlan,
 } from '../../../../contracts/src/index.js';
 import type { Queryable } from '../identity/membership.js';
 import { defaultFlowTemplates } from './flow-templates.js';
@@ -26,6 +31,12 @@ export interface FlowRow {
   flow_definition: unknown;
   draft_version: number;
   published_version_id: string | null;
+  active_priority: number | null;
+  active_is_default: boolean;
+  active_flow_match: unknown;
+  pending_alert_keys: unknown;
+  /** Política semântica do rascunho (P05). */
+  routing_policy?: unknown;
   created_at: Date;
   updated_at: Date;
 }
@@ -39,6 +50,9 @@ export interface PublishedFlow {
   versionId: string;
   versionNumber: number;
   definition: FlowDefinition;
+  /** Política semântica da versão ativa (null sem política). */
+  policy: FlowRoutingPolicy | null;
+  manifestHash: string | null;
 }
 
 /** Hash da parte executável (sem disposição), guardado em cada versão publicada. */
@@ -65,10 +79,17 @@ export function parseDefinition(value: unknown): FlowDefinition {
   return flowDefinitionSchema.parse(value);
 }
 
+/** Lista de chaves de alerta guardada em JSON (valores inválidos são ignorados). */
+export function parseAlertKeys(value: unknown): string[] {
+  return Array.isArray(value)
+    ? [...new Set(value.filter((item): item is string => typeof item === 'string'))].sort()
+    : [];
+}
+
 /**
- * Cria os modelos por omissão num projeto sem fluxos: Geral (por omissão) e Saúde publicados, que
- * reproduzem o percurso anterior; Manutenção em rascunho. Idempotente e seguro em concorrência
- * (ids determinísticos e `INSERT IGNORE`), para poder correr dentro da criação de um ticket.
+ * Cria os modelos por omissão num projeto sem fluxos, todos em RASCUNHO (P02): nada entra em
+ * serviço sem «Ativar esta versão». Idempotente e seguro em concorrência (ids determinísticos e
+ * `INSERT IGNORE`). Sem fluxo ativo, os tickets novos ficam sem execução até haver uma ativação.
  */
 export async function ensureDefaultFlows(client: Queryable, projectId: string) {
   const existing = await client.query('SELECT id FROM flows WHERE project_id=$1 LIMIT 1', [
@@ -91,17 +112,6 @@ export async function ensureDefaultFlows(client: Queryable, projectId: string) {
         template.match,
         template.definition,
       ],
-    );
-    if (!template.publish) continue;
-    const versionId = templateUuid(projectId, template.template, 'version');
-    await client.query(
-      `INSERT IGNORE INTO flow_versions(id,flow_id,project_id,number,flow_definition,logic_hash)
-       VALUES($1,$2,$3,1,$4,$5)`,
-      [versionId, flowId, projectId, template.definition, logicHash(template.definition)],
-    );
-    await client.query(
-      'UPDATE flows SET published_version_id=$2 WHERE id=$1 AND published_version_id IS NULL',
-      [flowId, versionId],
     );
   }
   return true;
@@ -129,74 +139,53 @@ const LEGACY_TEMPLATE_LOGIC: Readonly<Record<string, readonly string[]>> = {
 /** Nome antigo dos modelos: só é substituído se o projeto não lhe mudou o nome. */
 const LEGACY_TEMPLATE_NAME: Readonly<Record<string, string>> = { health: 'Saúde' };
 
-/** Ids dos fluxos de modelo que ainda estão numa versão antiga não personalizada. */
+/**
+ * Ids dos fluxos de modelo cujo RASCUNHO ainda é um modelo antigo não personalizado. A versão
+ * ativa não é considerada: a atualização é só uma proposta no rascunho (P02).
+ */
 export async function legacyTemplateFlows(client: Queryable) {
   const templates = Object.keys(LEGACY_TEMPLATE_LOGIC);
   if (!templates.length) return [];
-  const rows = await client.query<{ id: string; template: string; logic_hash: string }>(
-    `SELECT f.id,f.template,v.logic_hash FROM flows f JOIN flow_versions v ON v.id=f.published_version_id
-      WHERE f.template IN (${templates.map((_, index) => `$${index + 1}`).join(',')})`,
+  const rows = await client.query<{ id: string; template: string; flow_definition: unknown }>(
+    `SELECT id,template,flow_definition FROM flows
+      WHERE template IN (${templates.map((_, index) => `$${index + 1}`).join(',')})`,
     templates,
   );
   return rows.rows
-    .filter((row) => LEGACY_TEMPLATE_LOGIC[row.template]?.includes(row.logic_hash))
+    .filter((row) => {
+      const parsed = flowDefinitionSchema.safeParse(row.flow_definition);
+      return (
+        parsed.success && LEGACY_TEMPLATE_LOGIC[row.template]?.includes(logicHash(parsed.data))
+      );
+    })
     .map((row) => row.id);
 }
 
 /**
- * Publica o modelo atual como nova versão de um fluxo de modelo não personalizado. Os tickets em
- * curso mantêm a versão com que entraram. Devolve false se o fluxo foi entretanto personalizado.
+ * Propõe o modelo atual no rascunho de um fluxo de modelo não personalizado, sem criar versão nem
+ * mudar o que está ativo: a equipa revê e usa «Ativar esta versão». Devolve false se o rascunho
+ * foi entretanto personalizado.
  */
 export async function upgradeTemplateFlow(client: Queryable, flowId: string) {
   const flow = (
-    await client.query<{
-      id: string;
-      project_id: string;
-      template: string;
-      flow_definition: unknown;
-      logic_hash: string;
-    }>(
-      `SELECT f.id,f.project_id,f.template,f.flow_definition,v.logic_hash
-         FROM flows f JOIN flow_versions v ON v.id=f.published_version_id
-        WHERE f.id=$1 FOR UPDATE`,
+    await client.query<{ id: string; template: string; flow_definition: unknown }>(
+      'SELECT id,template,flow_definition FROM flows WHERE id=$1 FOR UPDATE',
       [flowId],
     )
   ).rows[0];
   const legacy = flow ? LEGACY_TEMPLATE_LOGIC[flow.template] : undefined;
-  if (!flow || !legacy?.includes(flow.logic_hash)) return false;
-  if (!legacy.includes(logicHash(parseDefinition(flow.flow_definition)))) return false;
+  if (!flow || !legacy) return false;
+  const draft = flowDefinitionSchema.safeParse(flow.flow_definition);
+  if (!draft.success || !legacy.includes(logicHash(draft.data))) return false;
   const template = defaultFlowTemplates().find((item) => item.template === flow.template);
   if (!template) return false;
-  const number =
-    Number(
-      (
-        await client.query<{ top: number | null }>(
-          'SELECT MAX(number) AS top FROM flow_versions WHERE flow_id=$1',
-          [flow.id],
-        )
-      ).rows[0]?.top ?? 0,
-    ) + 1;
-  const versionId = randomUUID();
-  await client.query(
-    `INSERT INTO flow_versions(id,flow_id,project_id,number,flow_definition,logic_hash)
-     VALUES($1,$2,$3,$4,$5,$6)`,
-    [
-      versionId,
-      flow.id,
-      flow.project_id,
-      number,
-      template.definition,
-      logicHash(template.definition),
-    ],
-  );
   await client.query(
     `UPDATE flows SET flow_definition=$2,description=$3,draft_version=draft_version+1,
-            published_version_id=$4,name=IF(name=$5,$6,name),updated_at=NOW(3) WHERE id=$1`,
+            name=IF(name=$4,$5,name),updated_at=NOW(3) WHERE id=$1`,
     [
       flow.id,
       template.definition,
       template.description,
-      versionId,
       LEGACY_TEMPLATE_NAME[flow.template] ?? template.name,
       template.name,
     ],
@@ -214,92 +203,44 @@ function binaryDefinition(template: string | null, definition: FlowDefinition) {
   return toBinaryFlow(definition);
 }
 
-/** Ids dos fluxos cujo rascunho ou versão publicada ainda têm saídas antigas. */
+/** Ids dos fluxos cujo rascunho ainda tem saídas antigas (a versão ativa não é alterada). */
 export async function binaryMigrationFlows(client: Queryable) {
-  const rows = await client.query<{
-    id: string;
-    template: string | null;
-    flow_definition: unknown;
-    published: unknown;
-  }>(
-    `SELECT f.id,f.template,f.flow_definition,v.flow_definition AS published
-       FROM flows f LEFT JOIN flow_versions v ON v.id=f.published_version_id`,
+  const rows = await client.query<{ id: string; flow_definition: unknown }>(
+    'SELECT id,flow_definition FROM flows',
   );
   return rows.rows
-    .filter((row) =>
-      [row.flow_definition, row.published].some((value) => {
-        if (!value) return false;
-        const parsed = flowDefinitionSchema.safeParse(value);
-        return parsed.success && toBinaryFlow(parsed.data).changed;
-      }),
-    )
+    .filter((row) => {
+      const parsed = flowDefinitionSchema.safeParse(row.flow_definition);
+      return parsed.success && toBinaryFlow(parsed.data).changed;
+    })
     .map((row) => row.id);
 }
 
 /**
- * Converte um fluxo para duas saídas por etapa: rascunho e (se existir) nova versão publicada.
- * Os tickets em curso mantêm a versão com que entraram (o motor aceita as saídas antigas).
+ * Converte o RASCUNHO para duas saídas por etapa. A versão ativa mantém-se (o motor aceita as
+ * saídas antigas) até alguém ativar o rascunho convertido.
  */
 export async function migrateFlowToBinary(client: Queryable, flowId: string) {
   const flow = (
-    await client.query<{
-      id: string;
-      project_id: string;
-      template: string | null;
-      flow_definition: unknown;
-      published: unknown;
-    }>(
-      `SELECT f.id,f.project_id,f.template,f.flow_definition,v.flow_definition AS published
-         FROM flows f LEFT JOIN flow_versions v ON v.id=f.published_version_id
-        WHERE f.id=$1 FOR UPDATE`,
+    await client.query<{ id: string; template: string | null; flow_definition: unknown }>(
+      'SELECT id,template,flow_definition FROM flows WHERE id=$1 FOR UPDATE',
       [flowId],
     )
   ).rows[0];
   if (!flow) return false;
   const draft = flowDefinitionSchema.safeParse(flow.flow_definition);
-  const published = flow.published ? flowDefinitionSchema.safeParse(flow.published) : null;
-  const nextDraft = draft.success ? binaryDefinition(flow.template, draft.data) : null;
-  const nextPublished = published?.success ? binaryDefinition(flow.template, published.data) : null;
-  if (!nextDraft?.changed && !nextPublished?.changed) return false;
-  if (nextPublished?.changed) {
-    const number =
-      Number(
-        (
-          await client.query<{ top: number | null }>(
-            'SELECT MAX(number) AS top FROM flow_versions WHERE flow_id=$1',
-            [flow.id],
-          )
-        ).rows[0]?.top ?? 0,
-      ) + 1;
-    const versionId = randomUUID();
-    await client.query(
-      `INSERT INTO flow_versions(id,flow_id,project_id,number,flow_definition,logic_hash)
-       VALUES($1,$2,$3,$4,$5,$6)`,
-      [
-        versionId,
-        flow.id,
-        flow.project_id,
-        number,
-        nextPublished.definition,
-        logicHash(nextPublished.definition),
-      ],
-    );
-    await client.query('UPDATE flows SET published_version_id=$2 WHERE id=$1', [
-      flow.id,
-      versionId,
-    ]);
-  }
-  if (nextDraft?.changed)
-    await client.query(
-      `UPDATE flows SET flow_definition=$2,draft_version=draft_version+1,updated_at=NOW(3)
-        WHERE id=$1`,
-      [flow.id, nextDraft.definition],
-    );
+  const next = draft.success ? binaryDefinition(flow.template, draft.data) : null;
+  if (!next?.changed) return false;
+  await client.query(
+    `UPDATE flows SET flow_definition=$2,draft_version=draft_version+1,updated_at=NOW(3)
+      WHERE id=$1`,
+    [flow.id, next.definition],
+  );
   return true;
 }
 
-/** Fluxo do check associado; depois o flow exato do alerta ou a regra geral. */
-export async function flowForTicket(
+/** Fluxo do check associado; depois o flow exato do alerta ou os fluxos elegíveis pelas regras. */
+async function eligibleFlows(
   client: Queryable,
   ticket: FlowMatchTicket & { project_id: string; alert_key?: string | null },
 ) {
@@ -324,16 +265,39 @@ export async function flowForTicket(
   const linked =
     (checkFlowId && flows.find((flow) => flow.id === checkFlowId)) ||
     (alertFlowId && flows.find((flow) => flow.id === alertFlowId));
-  if (linked) return linked;
+  if (linked) return { kind: 'linked' as const, flow: linked };
   // Fluxos próprios de alertas só tratam esses alertas, salvo se forem o fluxo por omissão.
   const reserved = new Set(links.map((link) => link.flow_id));
-  return selectFlow(
-    flows.filter((flow) => flow.isDefault || !reserved.has(flow.id)),
-    ticket,
-  );
+  const eligible = flows.filter((flow) => flow.isDefault || !reserved.has(flow.id));
+  return { kind: 'rules' as const, eligible };
 }
 
-/** Fluxos publicados do projeto com a definição da versão em vigor (candidatos à seleção). */
+/**
+ * Seleção determinística (sem classificação semântica): associação da Saúde e depois a regra
+ * de menor prioridade. Usada no backfill e quando o Copilot não é necessário.
+ */
+export async function flowForTicket(
+  client: Queryable,
+  ticket: FlowMatchTicket & { project_id: string; alert_key?: string | null },
+) {
+  const resolved = await eligibleFlows(client, ticket);
+  return resolved.kind === 'linked' ? resolved.flow : selectFlow(resolved.eligible, ticket);
+}
+
+/**
+ * Plano de encaminhamento (P05): associações explícitas da Saúde são diretas; depois as regras
+ * estruturadas e, quando há políticas semânticas coincidentes, os candidatos a classificar.
+ */
+export async function flowSelectionPlan(
+  client: Queryable,
+  ticket: FlowMatchTicket & { project_id: string; alert_key?: string | null },
+): Promise<FlowSelectionPlan<PublishedFlow>> {
+  const resolved = await eligibleFlows(client, ticket);
+  if (resolved.kind === 'linked') return { kind: 'direct', flow: resolved.flow };
+  return planFlowSelection(resolved.eligible, ticket);
+}
+
+/** Fluxos ATIVOS do projeto com a definição da versão em vigor (candidatos à seleção). */
 export async function publishedFlows(
   client: Queryable,
   projectId: string,
@@ -341,26 +305,88 @@ export async function publishedFlows(
   const rows = await client.query<{
     id: string;
     name: string;
-    priority: number;
-    is_default: boolean;
-    flow_match: unknown;
+    active_priority: number;
+    active_is_default: boolean;
+    active_flow_match: unknown;
     version_id: string;
     number: number;
     flow_definition: unknown;
+    runtime_contract_version: number;
+    routing: unknown;
+    manifest_hash: string | null;
   }>(
-    `SELECT f.id,f.name,f.priority,f.is_default,f.flow_match,v.id AS version_id,v.number,v.flow_definition
+    `SELECT f.id,f.name,f.active_priority,f.active_is_default,f.active_flow_match,v.id AS version_id,
+            v.number,v.flow_definition,v.runtime_contract_version,v.routing,v.manifest_hash
        FROM flows f JOIN flow_versions v ON v.id=f.published_version_id
-      WHERE f.project_id=$1 ORDER BY f.priority,f.name`,
+      WHERE f.project_id=$1 AND f.active_priority IS NOT NULL
+      ORDER BY f.active_priority,f.name,f.id`,
     [projectId],
   );
-  return rows.rows.map((row) => ({
+  // Versões que este runtime não sabe executar nunca recebem tickets novos.
+  return rows.rows
+    .filter((row) => flowRuntimeSupported(Number(row.runtime_contract_version ?? 1)))
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      priority: Number(row.active_priority),
+      isDefault: Boolean(row.active_is_default),
+      match: parseMatch(row.active_flow_match),
+      versionId: row.version_id,
+      versionNumber: Number(row.number),
+      definition: parseDefinition(row.flow_definition),
+      policy: activePolicy(row.routing),
+      manifestHash: row.manifest_hash ?? null,
+    }));
+}
+
+/** Política da versão ativa (gravada em `flow_versions.routing.policy` na ativação). */
+export function activePolicy(routing: unknown): FlowRoutingPolicy | null {
+  let raw = routing;
+  if (typeof raw === 'string')
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  const policy = raw && typeof raw === 'object' ? (raw as { policy?: unknown }).policy : undefined;
+  return policy === undefined || policy === null ? null : parseRoutingPolicy(policy);
+}
+
+/**
+ * Versão fixada (por id) de um fluxo do projeto, mesmo que já não seja a ativa: o encaminhamento
+ * de um ticket usa sempre os candidatos fixados na criação. Null se não existir ou se este runtime
+ * não a souber executar.
+ */
+export async function pinnedFlow(
+  client: Queryable,
+  projectId: string,
+  flowId: string,
+  versionId: string,
+): Promise<Pick<
+  PublishedFlow,
+  'id' | 'name' | 'versionId' | 'versionNumber' | 'definition'
+> | null> {
+  const row = (
+    await client.query<{
+      id: string;
+      name: string;
+      version_id: string;
+      number: number;
+      flow_definition: unknown;
+      runtime_contract_version: number | null;
+    }>(
+      `SELECT f.id,f.name,v.id AS version_id,v.number,v.flow_definition,v.runtime_contract_version
+         FROM flow_versions v JOIN flows f ON f.id=v.flow_id
+        WHERE v.id=$1 AND f.id=$2 AND f.project_id=$3`,
+      [versionId, flowId, projectId],
+    )
+  ).rows[0];
+  if (!row || !flowRuntimeSupported(Number(row.runtime_contract_version ?? 1))) return null;
+  return {
     id: row.id,
     name: row.name,
-    priority: Number(row.priority),
-    isDefault: Boolean(row.is_default),
-    match: parseMatch(row.flow_match),
     versionId: row.version_id,
     versionNumber: Number(row.number),
     definition: parseDefinition(row.flow_definition),
-  }));
+  };
 }

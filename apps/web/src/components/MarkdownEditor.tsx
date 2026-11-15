@@ -7,6 +7,7 @@ const actions: { action: MarkdownAction; label: string; text: string }[] = [
   { action: 'italic', label: 'Itálico', text: 'I' },
   { action: 'heading', label: 'Título', text: 'H2' },
   { action: 'list', label: 'Lista', text: '☷' },
+  { action: 'quote', label: 'Citação', text: '❝' },
   { action: 'link', label: 'Ligação', text: 'Link' },
   { action: 'code', label: 'Bloco de código', text: '</>' },
 ];

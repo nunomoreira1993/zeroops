@@ -52,8 +52,9 @@ async function runningRun() {
   });
   await fixture.db.query("UPDATE agent_runs SET status='cancelled' WHERE status='queued'");
   const run = await runs.request(technical, ticket.id, {});
-  expect((await runs.claimNext())?.runId).toBe(run.id);
-  return { client, technical, ticket, run };
+  const claimed = await runs.claimNext();
+  expect(claimed?.runId).toBe(run.id);
+  return { client, technical, ticket, run, lease: claimed!.lease };
 }
 
 describe('AgentRunEventsService', () => {
@@ -236,8 +237,8 @@ describe('AgentRunEventsService', () => {
   });
 
   it('recusa entradas em runs terminados', async () => {
-    const { technical, ticket, run } = await runningRun();
-    await runs.complete(run.id, { summary: 'Feito.', replyDraft: null, evidence: [] });
+    const { technical, ticket, run, lease } = await runningRun();
+    await runs.complete(lease, { summary: 'Feito.', replyDraft: null, evidence: [] });
     await expect(
       events.submitInput(technical, ticket.id, run.id, { kind: 'message', text: 'Mais?' }),
     ).rejects.toThrow();

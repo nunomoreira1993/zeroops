@@ -13,6 +13,8 @@ import { FusionUnavailableError } from './copilot-sdk.adapter.js';
 
 const context: InvestigationContext = {
   runId: 'run-1',
+  lease: { jobId: 'run-1', workerId: 'w-test', epoch: 1, leaseSeconds: 90 },
+  attempt: 1,
   mode: 'investigate',
   projectId: 'project-1',
   project: { name: 'Pizza Hut', siteKey: 'pizzahut' },
@@ -51,7 +53,12 @@ const context: InvestigationContext = {
 };
 
 function queue(cancel = false) {
-  const calls: { completed?: InvestigationResult; failed?: string } = {};
+  const calls: {
+    completed?: InvestigationResult;
+    failed?: string;
+    released?: string;
+    heartbeats: number;
+  } = { heartbeats: 0 };
   let pending: InvestigationContext | null = context;
   const value: AgentRunQueue = {
     async claimNext() {
@@ -68,6 +75,9 @@ function queue(cancel = false) {
     },
     async fail(_id, code) {
       calls.failed = code;
+    },
+    async release(_lease, reason) {
+      calls.released = reason;
     },
   };
   return { value, calls };
@@ -354,6 +364,71 @@ describe('InvestigationRunner', () => {
     await runner.runOnce();
     expect(calls.failed).toBe('cancelled');
     expect(calls.completed).toBeUndefined();
+    await rm(opts.workspaceRoot, { recursive: true });
+  });
+
+  it('n?o escreve resultado quando perde o lease (outro executor recuperou a tentativa)', async () => {
+    const { value, calls } = queue();
+    const opts = await options();
+    const runner = new InvestigationRunner(
+      {
+        ...value,
+        async heartbeat() {
+          calls.heartbeats += 1;
+          return { owned: false, cancelRequested: false };
+        },
+      },
+      {
+        execute: (input) =>
+          new Promise((_resolve, reject) =>
+            input.signal?.addEventListener('abort', () => {
+              expect(input.isActive?.()).toBe(false);
+              reject(new Error('interrompido'));
+            }),
+          ),
+      },
+      { ...opts, heartbeatMs: 10 },
+      () => undefined,
+    );
+    await runner.runOnce();
+    expect(calls.heartbeats).toBeGreaterThan(0);
+    expect(calls.completed).toBeUndefined();
+    expect(calls.failed).toBeUndefined();
+    await rm(opts.workspaceRoot, { recursive: true });
+  });
+
+  it('mant?m a posse com heartbeat e devolve o run ? fila numa paragem ordenada', async () => {
+    const { value, calls } = queue();
+    const opts = await options();
+    const shutdown = new AbortController();
+    let planApproval: string | undefined;
+    const runner = new InvestigationRunner(
+      {
+        ...value,
+        async heartbeat() {
+          calls.heartbeats += 1;
+          if (calls.heartbeats === 3) shutdown.abort();
+          return { owned: true, cancelRequested: false };
+        },
+      },
+      {
+        execute: (input) => {
+          planApproval = input.planApproval;
+          return new Promise((_resolve, reject) =>
+            input.signal?.addEventListener('abort', () => reject(new Error('paragem'))),
+          );
+        },
+      },
+      { ...opts, heartbeatMs: 10 },
+      () => undefined,
+    );
+    await runner.runOnce(shutdown.signal);
+    expect(calls.heartbeats).toBeGreaterThanOrEqual(3);
+    expect(planApproval).toBe('auto');
+    expect(calls.released).toBe('shutdown');
+    expect(calls.failed).toBeUndefined();
+    expect(calls.completed).toBeUndefined();
+    expect(await runner.runOnce(shutdown.signal)).toBe(false);
     await rm(opts.workspaceRoot, { recursive: true });
   });
 });

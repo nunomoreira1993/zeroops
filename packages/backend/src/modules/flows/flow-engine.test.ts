@@ -3,19 +3,21 @@ import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FlowDefinition, Role, User } from '../../../../contracts/src/index.js';
 import { startTestDatabase } from '../../../../../tests/helpers/test-database.js';
+import { leaseJob } from '../../../../../tests/helpers/job-lease.js';
 import { AgentRunsService } from '../agents/agent-runs.service.js';
 import { TicketsService } from '../tickets/tickets.service.js';
 import { FlowAssistantQueue } from './flow-assistant.js';
 import { FlowEngine } from './flow-engine.js';
 import { logicHash } from './flow-store.js';
 import { FlowsService } from './flows.service.js';
+import { createFlowActionRegistry } from '../incidents/incident.module.js';
 
 let fixture: Awaited<ReturnType<typeof startTestDatabase>>;
 const now = new Date('2030-01-01T10:00:00Z');
 const clock = () => now;
 
 function services() {
-  const engine = new FlowEngine(fixture.db, undefined, clock);
+  const engine = new FlowEngine(fixture.db, createFlowActionRegistry(fixture.db), clock);
   return {
     engine,
     tickets: new TicketsService(fixture.db, [engine.onPublicComment], [engine.onTicketCreated]),
@@ -58,7 +60,7 @@ async function project() {
      VALUES ($1,$2,'quality','copilot',1,'verified','cifrado','{}',1,$3)`,
     [randomUUID(), id, admin.id],
   );
-  return {
+  const people = {
     id,
     admin,
     client: await member('client', id, 'Carla Cliente'),
@@ -66,6 +68,21 @@ async function project() {
     qa: await member('qa', id, 'Quintino QA'),
     release: await member('release', id, 'Rita Release'),
   };
+  // P02: os modelos nascem em rascunho; o projeto de teste ativa explicitamente o geral e a Saúde.
+  for (const template of ['general', 'health']) await activate(admin, id, template);
+  return people;
+}
+
+/** «Ativar esta versão» do rascunho atual de um fluxo (por id ou por modelo). */
+async function activate(admin: User, projectId: string, flowIdOrTemplate: string) {
+  const list = await app.flows.list(admin, projectId);
+  const flow = list.find(
+    (item) => item.id === flowIdOrTemplate || item.template === flowIdOrTemplate,
+  );
+  expect(flow).toBeDefined();
+  return app.flows.publish(admin, projectId, flow!.id, {
+    expectedDraftVersion: flow!.draftVersion,
+  });
 }
 
 /** Termina o run do Copilot pedido pela etapa atual do ticket (como o executor faria). */
@@ -80,9 +97,9 @@ async function finishRun(
     )
   ).rows[0];
   expect(run, 'run do Copilot em fila').toBeDefined();
-  await fixture.db.query("UPDATE agent_runs SET status='running' WHERE id=$1", [run!.id]);
-  if (result === 'fail') await app.runs.fail(run!.id, 'copilot_error');
-  else await app.runs.complete(run!.id, { replyDraft: null, evidence: [], ...result });
+  const lease = await leaseJob(fixture.db, run!.id);
+  if (result === 'fail') await app.runs.fail(lease, 'copilot_error');
+  else await app.runs.complete(lease, { replyDraft: null, evidence: [], ...result });
   return run!.instructions;
 }
 
@@ -145,6 +162,9 @@ describe('FlowEngine', () => {
     expect(await app.engine.upgradeTemplates()).toBe(0);
     const upgraded = await app.flows.get(p.admin, p.id, health.id);
     expect(upgraded.name).toBe('Incidente (Health)');
+    // P02: a atualização é uma proposta no rascunho; a versão ativa não muda.
+    expect(upgraded.published?.number).toBe(1);
+    expect(upgraded.pendingChanges.definition).toBe(true);
     expect(upgraded.draft.nodes.map((item) => item.id)).toEqual(
       expect.arrayContaining([
         'intake',
@@ -156,24 +176,38 @@ describe('FlowEngine', () => {
       ]),
     );
 
-    // O ticket em curso continua na versão antiga; o novo arranca pela receção do alerta.
+    // O ticket em curso continua na versão antiga; sem ativação, os novos também.
     const old = await view(p.technical, inFlight.id);
     expect(old.execution.version.number).toBe(1);
     expect(old.next?.nodeId).toBe('analise');
+    const beforeActivation = await app.tickets.create(p.technical, alert, { origin: 'health' });
+    expect((await view(p.technical, beforeActivation.id)).execution.version.number).toBe(1);
+
+    await activate(p.admin, p.id, health.id);
     const newer = await app.tickets.create(p.technical, alert, { origin: 'health' });
     const fresh = await view(p.technical, newer.id);
     expect(fresh.execution.version.number).toBe(2);
     expect(fresh.execution.flow.name).toBe('Incidente (Health)');
     expect(fresh.steps[0]?.nodeId ?? fresh.next?.nodeId).toBe('intake');
+    expect((await view(p.technical, inFlight.id)).execution.version.number).toBe(1);
   });
   it('Alertas: o ticket de um alerta com fluxo próprio entra nesse fluxo; os outros seguem a regra geral', async () => {
     const p = await project();
     const links = await app.flows.alertFlows(p.admin, p.id);
     const disk = 'prometheus:EspacoDiscoBaixo';
     expect(links.find((link) => link.key === disk)).toMatchObject({ flowId: null });
-    const own = await app.flows.createAlertFlow(p.admin, p.id, { alertKey: disk });
+    const created = await app.flows.createAlertFlow(p.admin, p.id, { alertKey: disk });
+    // P02: criar o fluxo do alerta só cria um rascunho; nada muda até à ativação.
+    expect(created.published).toBeNull();
+    expect(created.alertKeys).toEqual([]);
+    expect(created.pendingAlertKeys).toEqual([disk]);
+    expect(
+      (await app.flows.alertFlows(p.admin, p.id)).find((link) => link.key === disk),
+    ).toMatchObject({ flowId: null, pendingFlowId: created.id });
+    const own = await activate(p.admin, p.id, created.id);
     expect(own.published).not.toBeNull();
     expect(own.alertKeys).toEqual([disk]);
+    expect(own.pendingAlertKeys).toEqual([]);
     const alert = {
       title: '[Saúde][Produção] Disco quase cheio',
       description: 'Partição /var acima do limiar.',
@@ -219,7 +253,9 @@ describe('FlowEngine', () => {
     });
 
     const ruleFlow = await app.flows.createAlertFlow(p.admin, p.id, { alertKey: lowDiskKey });
-    const checkFlow = await app.flows.createAlertFlow(p.admin, p.id, { alertKey: checkKey });
+    const checkDraft = await app.flows.createAlertFlow(p.admin, p.id, { alertKey: checkKey });
+    await activate(p.admin, p.id, ruleFlow.id);
+    const checkFlow = await activate(p.admin, p.id, checkDraft.id);
     expect(checkFlow.alertKeys).toEqual([checkKey]);
 
     const alert = {
@@ -377,7 +413,10 @@ describe('FlowEngine', () => {
       const claimed = await queue.claimNext();
       expect(claimed?.id).toBe(request.id);
       expect(claimed?.prompt).toContain(message);
-      await queue.complete(request.id, `Proposta:\n\`\`\`json\n${JSON.stringify(reply)}\n\`\`\``);
+      await queue.complete(
+        claimed!.lease,
+        `Proposta:\n\`\`\`json\n${JSON.stringify(reply)}\n\`\`\``,
+      );
       const history = await app.flows.flowAssistantHistory(p.admin, p.id, created.id);
       return history.find((item) => item.id === request.id)!;
     };
@@ -560,19 +599,44 @@ describe('FlowEngine', () => {
     const request = await app.flows.requestTicketAssistant(p.technical, ticket.id, {
       message: 'Devolve ao desenvolvimento com este comentário: falta validar o IBAN.',
     });
-    const claimed = await queue.claimNext();
-    expect(claimed?.prompt).toMatch(/QA/);
-    await queue.complete(
-      request.id,
-      JSON.stringify({
-        reply: 'Está à espera do QA (Quintino QA). Posso devolver ao desenvolvimento.',
-        transition: {
-          stepId: flow.next!.stepId,
-          port: 'failure',
-          comment: 'Falta validar o IBAN.',
-        },
-      }),
+    const stale = await queue.claimNext({ workerId: 'assistente-antigo', leaseSeconds: 30 });
+    expect(stale?.prompt).toMatch(/QA/);
+    // O executor antigo perde o lease: a recuperação devolve o pedido à fila uma única vez.
+    await fixture.db.query(
+      'UPDATE flow_assistant_requests SET lease_until=DATE_SUB(NOW(3),INTERVAL 1 SECOND) WHERE id=$1',
+      [request.id],
     );
+    expect(await queue.recoverExpired()).toEqual({ requeued: 1, failed: 0 });
+    const claimed = await queue.claimNext({ workerId: 'assistente-novo', leaseSeconds: 30 });
+    expect(claimed?.lease.epoch).toBe(stale!.lease.epoch + 1);
+    const answer = JSON.stringify({
+      reply: 'Está à espera do QA (Quintino QA). Posso devolver ao desenvolvimento.',
+      transition: {
+        stepId: flow.next!.stepId,
+        port: 'failure',
+        comment: 'Falta validar o IBAN.',
+      },
+    });
+    expect(await queue.complete(stale!.lease, 'resposta tardia')).toBe('stale');
+    expect((await queue.heartbeat(stale!.lease)).owned).toBe(false);
+    expect(await queue.complete(claimed!.lease, answer)).toBe('accepted');
+    expect(await queue.complete(claimed!.lease, answer)).toBe('duplicate');
+    const assistantEvents = await fixture.db.query<{ event_type: string; worker_id: string }>(
+      'SELECT event_type,worker_id FROM agent_job_events WHERE job_id=$1 ORDER BY created_at,id',
+      [request.id],
+    );
+    expect(assistantEvents.rows.map((row) => row.event_type)).toEqual(
+      expect.arrayContaining([
+        'claimed',
+        'lease_expired_requeued',
+        'stale_attempt_rejected',
+        'lease_lost',
+        'completed',
+      ]),
+    );
+    expect(
+      assistantEvents.rows.filter((row) => row.event_type === 'completed').map((r) => r.worker_id),
+    ).toEqual(['assistente-novo']);
     // Quem pediu não tem o papel de QA: não pode aplicar.
     await expect(
       app.flows.applyTicketAssistant(p.technical, ticket.id, request.id, {

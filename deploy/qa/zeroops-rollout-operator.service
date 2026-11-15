@@ -1,0 +1,20 @@
+# Operador independente de rollout do ZeroOps (P10), so em Qualidade. Instalado por
+# install-rollout-operator.sh; corre fora dos contentores para sobreviver a troca da API/executor.
+[Unit]
+Description=ZeroOps rollout operator (Qualidade)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/zeroops/rollout-operator.env
+ExecStart=/usr/bin/python3 /usr/local/lib/zeroops/zeroops-rollout-operator.py
+Restart=always
+RestartSec=5
+# Um deploy em curso (filho) nao e morto quando o operador reinicia: o rollout e reconciliado no arranque.
+KillMode=process
+StandardOutput=append:/var/log/zeroops/rollout-operator.log
+StandardError=append:/var/log/zeroops/rollout-operator.log
+
+[Install]
+WantedBy=multi-user.target

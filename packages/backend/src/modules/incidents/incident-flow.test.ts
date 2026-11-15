@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { IncidentPolicy, Role, User } from '../../../../contracts/src/index.js';
 import { defaultIncidentPolicy } from '../../../../contracts/src/index.js';
 import { startTestDatabase } from '../../../../../tests/helpers/test-database.js';
+import { leaseJob } from '../../../../../tests/helpers/job-lease.js';
 import { AgentRunsService } from '../agents/agent-runs.service.js';
 import { FlowEngine } from '../flows/flow-engine.js';
 import { FlowsService } from '../flows/flows.service.js';
@@ -15,6 +16,10 @@ import { incidentDemoPayload } from './incident-demo.js';
 import { HealthRepository } from '../health/health.repository.js';
 import { HealthSuspensions } from './health-suspension.js';
 import { createFlowActionRegistry } from './incident.module.js';
+import { defaultFlowActions } from '../flows/flow-actions.js';
+import { createIncidentActions } from './incident-actions.js';
+import { IncidentPolicyRepository } from './incident-policy.repository.js';
+import { reconcileUncertainInterventions } from './incident-reconcile.js';
 
 /**
  * Critério de aceitação do fluxo «Incidente (Health)»: o mesmo fluxo trata disco cheio, pressão
@@ -81,6 +86,12 @@ async function project(policy: Partial<IncidentPolicy> = {}) {
     id,
     JSON.stringify({ ...defaultIncidentPolicy(), ...policy }),
   ]);
+  // P02: os modelos nascem em rascunho; o projeto ativa explicitamente o genérico e o da Saúde.
+  for (const template of ['general', 'health']) {
+    const flow = (await app.flows.list(admin, id)).find((item) => item.template === template);
+    expect(flow).toBeDefined();
+    await app.flows.publish(admin, id, flow!.id, { expectedDraftVersion: flow!.draftVersion });
+  }
   return { id, admin, technical: await member('technical', id, 'Tiago Técnico') };
 }
 
@@ -146,8 +157,7 @@ async function investigate(ticketId: string, text: string, report: Record<string
     )
   ).rows[0];
   expect(run, 'investigação do Copilot em fila').toBeDefined();
-  await fixture.db.query("UPDATE agent_runs SET status='running' WHERE id=$1", [run!.id]);
-  await app.runs.complete(run!.id, {
+  await app.runs.complete(await leaseJob(fixture.db, run!.id), {
     summary: `${text}\n\n\`\`\`zeroops-incident\n${JSON.stringify(report)}\n\`\`\``,
     replyDraft: null,
     evidence: [],
@@ -243,7 +253,8 @@ describe('Fluxo «Incidente (Health)»', () => {
       proposedAction: null,
       nextStep: 'Corrigir a configuração do logrotate e comprimir os logs manualmente.',
     });
-    // Sem intervenção: valida pelo estado do alerta, que continua ativo até ao prazo (30 min).
+    // Sem intervenção nem sonda do critério do disco: ao fim do prazo (30 min) a recuperação fica
+    // desconhecida (P09: sem telemetria não há serviço saudável) e o fluxo escala.
     expect((await view(p.technical, ticket.id)).next?.nodeId).toBe('validar');
     await advance(31);
     expect(await path(p.technical, ticket.id)).toEqual([
@@ -252,7 +263,7 @@ describe('Fluxo «Incidente (Health)»', () => {
       ['autorizar', 'no_action'],
       ['aprovacao', 'skipped'],
       ['intervir', 'no_action'],
-      ['validar', 'not_recovered'],
+      ['validar', 'unknown'],
       ['email_escala', 'done'],
       ['atribuir', 'done'],
       ['escalado', null],
@@ -658,5 +669,228 @@ describe('Suspender e retomar a Saúde', () => {
     await receiver.releaseMuted(now);
     expect(await stored()).toMatchObject({ suspended: false, muted: false });
     expect((await emails(p.id)).map((mail) => mail.body).join('\n')).toMatch(/CPU a 99% em web01/);
+  });
+});
+
+describe('P09 — Saúde controlada pelo fluxo', () => {
+  const restartPolicy = (validation: Record<string, number> = {}) =>
+    ({
+      services: services_(['php-fpm.service']),
+      rules: [
+        {
+          environment: 'any',
+          kind: 'any',
+          engine: 'any',
+          action: 'service_restart',
+          decision: 'auto',
+        },
+      ],
+      ...(Object.keys(validation).length ? { validation } : {}),
+    }) as Partial<IncidentPolicy>;
+
+  async function withRelay(projectId: string) {
+    await fixture.db.query(
+      "INSERT INTO connector_relays (project_id,token_hash,last_seen_at,tools) VALUES ($1,$2,$3,'sql,log,restart')",
+      [projectId, randomUUID().replace(/-/g, '').padEnd(64, '0'), now],
+    );
+  }
+  const touchRelays = () => fixture.db.query('UPDATE connector_relays SET last_seen_at=$1', [now]);
+  const requests = async (projectId: string) =>
+    (
+      await fixture.db.query<{ id: string; status: string; payload: unknown }>(
+        'SELECT id,status,payload FROM connector_relay_requests WHERE project_id=$1 ORDER BY created_at',
+        [projectId],
+      )
+    ).rows.map((row) => ({
+      ...row,
+      payload: (typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload) as Record<
+        string,
+        unknown
+      >,
+    }));
+  const restartReport = {
+    alertComponent: 'php-fpm',
+    causeComponent: 'php-fpm.service',
+    causeConfirmed: true,
+    proposedAction: { action: 'service_restart', target: 'php-fpm.service' },
+  };
+  const lockOf = async (ticketId: string) =>
+    (
+      await fixture.db.query<{ lock_key: string; expires_at: Date }>(
+        "SELECT lock_key,expires_at FROM resource_locks WHERE holder_kind='intervention' AND holder_id=$1",
+        [ticketId],
+      )
+    ).rows;
+
+  it('pedido recolhido pelo relay sem resposta: resultado desconhecido, nunca repetido, reconciliado depois', async () => {
+    const p = await project(restartPolicy());
+    await withRelay(p.id);
+    const ticket = await incident(p, {
+      alert: 'PhpFpmDown',
+      summary: 'php-fpm sem resposta em web07.',
+      labels: { instance: 'web07:9100', unit: 'php-fpm.service' },
+    });
+    await touchRelays();
+    await investigate(ticket.id, 'php-fpm bloqueado.', restartReport);
+    const [request] = await requests(p.id);
+    expect(request?.payload).toMatchObject({
+      contractVersion: 'zeroops.intervention/2',
+      idempotencyKey: request?.id,
+      resourceKey: expect.stringMatching(/^health:web07/),
+      unit: 'php-fpm.service',
+    });
+    expect(Date.parse(String(request?.payload.deadline))).toBeGreaterThan(now.getTime());
+    // O relay recolhe o pedido e não responde: passado o prazo, o efeito é desconhecido.
+    await fixture.db.query("UPDATE connector_relay_requests SET status='claimed' WHERE id=$1", [
+      request!.id,
+    ]);
+    await advance(3);
+    expect((await interventions(ticket.id)).map((row) => row.status)).toEqual(['uncertain']);
+    const steps = await path(p.technical, ticket.id);
+    expect(steps.find(([node]) => node === 'intervir')).toEqual(['intervir', 'uncertain']);
+    const [lock] = await lockOf(ticket.id);
+    expect(lock?.lock_key).toMatch(/^health:web07/);
+    expect(new Date(lock!.expires_at).getTime()).toBeGreaterThan(Date.now() + 6 * 24 * 3600_000);
+    await touchRelays();
+    await advance(10);
+    // Nunca há uma segunda intervenção só porque a resposta expirou.
+    expect(await requests(p.id)).toHaveLength(1);
+    expect((await interventions(ticket.id)).map((row) => row.status)).toEqual(['uncertain']);
+    // O relay entrega mais tarde o resultado (journal): a reconciliação regista-o e liberta o recurso.
+    await fixture.db.query(
+      "UPDATE connector_relay_requests SET status='done',result=$2,finished_at=$3 WHERE id=$1",
+      [request!.id, JSON.stringify({ message: 'Serviço reiniciado.' }), now],
+    );
+    expect(await reconcileUncertainInterventions(fixture.db)).toBe(1);
+    expect(await reconcileUncertainInterventions(fixture.db)).toBe(0);
+    expect((await interventions(ticket.id)).map((row) => row.status)).toEqual(['succeeded']);
+    expect(await lockOf(ticket.id)).toEqual([]);
+  });
+
+  it('pedido nunca recolhido expira com segurança: falha sem efeito e liberta o recurso', async () => {
+    const p = await project(restartPolicy());
+    await withRelay(p.id);
+    const ticket = await incident(p, {
+      alert: 'PhpFpmDown',
+      summary: 'php-fpm sem resposta em web06.',
+      labels: { instance: 'web06:9100', unit: 'php-fpm.service' },
+    });
+    await touchRelays();
+    await investigate(ticket.id, 'php-fpm bloqueado.', restartReport);
+    await advance(3);
+    expect((await requests(p.id)).map((row) => row.status)).toEqual(['expired']);
+    expect((await interventions(ticket.id)).map((row) => row.status)).toEqual(['failed']);
+    expect(await lockOf(ticket.id)).toEqual([]);
+  });
+
+  it('alertas correlacionados de dois projetos no mesmo host: uma remediação de cada vez', async () => {
+    const first = await project(
+      restartPolicy({ observationMinutes: 0, timeoutMinutes: 4, maxAttempts: 1 }),
+    );
+    const second = await project(restartPolicy());
+    await withRelay(first.id);
+    await withRelay(second.id);
+    const alert = {
+      alert: 'PhpFpmDown',
+      summary: 'php-fpm sem resposta em web08.',
+      labels: { instance: 'web08:9100', unit: 'php-fpm.service' },
+    };
+    const a = await incident(first, alert);
+    const b = await incident(second, alert);
+    await touchRelays();
+    await investigate(a.id, 'php-fpm bloqueado (A).', restartReport);
+    await investigate(b.id, 'php-fpm bloqueado (B).', restartReport);
+    const [requestA] = await requests(first.id);
+    expect(requestA?.status).toBe('pending');
+    // O recurso real (host) está reservado por A, de outro projeto: B espera sem pedir nada ao relay.
+    expect(await requests(second.id)).toEqual([]);
+    await fixture.db.query(
+      "UPDATE connector_relay_requests SET status='done',result=$2,finished_at=$3 WHERE id=$1",
+      [requestA!.id, JSON.stringify({ message: 'Serviço reiniciado.' }), now],
+    );
+    await touchRelays();
+    await advance(1);
+    expect((await view(first.technical, a.id)).next?.nodeId).toBe('validar');
+    // A reserva mantém-se durante a validação de A (sem remediações concorrentes).
+    await touchRelays();
+    await advance(1);
+    expect(await requests(second.id)).toEqual([]);
+    expect((await lockOf(a.id)).length).toBe(1);
+    for (let minute = 0; minute < 10 && (await lockOf(a.id)).length; minute += 1) {
+      expect(await requests(second.id)).toEqual([]);
+      await touchRelays();
+      await advance(1);
+    }
+    // Sem telemetria, A termina como desconhecido (nunca saudável) e liberta o recurso; B avança.
+    expect((await path(first.technical, a.id)).find(([node]) => node === 'validar')).toEqual([
+      'validar',
+      'unknown',
+    ]);
+    expect(await lockOf(a.id)).toEqual([]);
+    if (!(await requests(second.id)).length) {
+      await touchRelays();
+      await advance(1);
+    }
+    expect((await requests(second.id)).map((row) => row.status)).toEqual(['pending']);
+    expect((await lockOf(b.id)).length).toBe(1);
+  });
+
+  it('recuperação confirmada pela sonda na janela; sem telemetria fica desconhecida mesmo com o alerta resolvido', async () => {
+    const readings: (boolean | null)[] = [];
+    const probeEngine = new FlowEngine(
+      fixture.db,
+      {
+        ...defaultFlowActions,
+        ...createIncidentActions({
+          policies: new IncidentPolicyRepository(fixture.db),
+          probe: {
+            measure: async () => {
+              const ok = readings.length ? readings.shift()! : null;
+              return { ok, detail: ok === null ? 'sem amostras recentes' : `critério ok=${ok}` };
+            },
+          },
+        }),
+      },
+      clock,
+    );
+    const tickProbe = async (minutes: number) => {
+      for (let index = 0; index < minutes; index += 1) {
+        now = new Date(now.getTime() + 60_000);
+        await probeEngine.tick(100);
+      }
+    };
+    const p = await project({
+      validation: { observationMinutes: 2, timeoutMinutes: 6, maxAttempts: 1 },
+    } as Partial<IncidentPolicy>);
+    const disk = {
+      alert: 'HostDiskFull',
+      summary: 'Disco / a 97% em web09.',
+      labels: { instance: 'web09:9100', mountpoint: '/' },
+    };
+    const report = {
+      alertComponent: 'web09:/',
+      causeComponent: 'logrotate',
+      causeConfirmed: true,
+      proposedAction: null,
+    };
+    const healthy = await incident(p, disk);
+    await investigate(healthy.id, 'Logs rodados manualmente.', report);
+    readings.push(true, true, true, true);
+    await tickProbe(4);
+    expect((await path(p.technical, healthy.id)).find(([node]) => node === 'validar')).toEqual([
+      'validar',
+      'recovered',
+    ]);
+
+    const unknown = await incident(p, disk);
+    await investigate(unknown.id, 'Sem acesso às métricas.', report);
+    await fixture.db.query("UPDATE health_incidents SET state='recovered' WHERE ticket_id=$1", [
+      unknown.id,
+    ]);
+    await tickProbe(8);
+    expect((await path(p.technical, unknown.id)).find(([node]) => node === 'validar')).toEqual([
+      'validar',
+      'unknown',
+    ]);
   });
 });

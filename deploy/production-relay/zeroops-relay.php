@@ -21,7 +21,11 @@
 
 declare(strict_types=1);
 
-const RELAY_VERSION = '1.1.0';
+const RELAY_VERSION = '1.2.0';
+/** Contrato das intervencoes (pedidos v2 trazem prazo e chave de idempotencia). */
+const INTERVENTION_CONTRACT = 'zeroops.intervention/2';
+/** Entradas do journal com mais de 7 dias sao apagadas. */
+const JOURNAL_RETENTION_SECONDS = 7 * 24 * 3600;
 const DEFAULT_CONFIG_DIR = '/etc/zeroops-relay';
 const MAX_ROWS = 201;
 const MAX_CELL = 2000;
@@ -657,6 +661,75 @@ final class InterventionTool
     }
 }
 
+/**
+ * Journal local das intervencoes: cada pedido corre no maximo uma vez neste servidor. Um pedido
+ * repetido devolve o resultado guardado; um pedido interrompido a meio (relay reiniciado) nunca e
+ * repetido e e reportado como resultado desconhecido.
+ */
+final class InterventionJournal
+{
+    /** @var string|null */
+    private $dir;
+
+    public function __construct(?string $dir)
+    {
+        $this->dir = ($dir !== null && $dir !== '' && is_dir($dir) && is_writable($dir)) ? rtrim($dir, '/') : null;
+        if ($this->dir === null) {
+            fwrite(STDERR, date('c') . ' journal de intervencoes indisponivel (StateDirectory).' . PHP_EOL);
+        }
+    }
+
+    public function available(): bool
+    {
+        return $this->dir !== null;
+    }
+
+    private function file(string $id): string
+    {
+        return $this->dir . '/' . $id . '.json';
+    }
+
+    public function get(string $id): ?array
+    {
+        if ($this->dir === null || !is_file($this->file($id))) {
+            return null;
+        }
+        $data = json_decode((string) file_get_contents($this->file($id)), true);
+        return is_array($data) ? $data : null;
+    }
+
+    public function put(string $id, array $entry): void
+    {
+        if ($this->dir === null) {
+            return;
+        }
+        $tmp = $this->file($id) . '.tmp';
+        file_put_contents($tmp, json_encode($entry), LOCK_EX);
+        rename($tmp, $this->file($id));
+    }
+
+    /** @return array<string,array> resultados ainda nao confirmados pelo ZeroOps */
+    public function unsent(): array
+    {
+        $pending = [];
+        if ($this->dir === null) {
+            return $pending;
+        }
+        foreach (glob($this->dir . '/*.json') ?: [] as $file) {
+            $id = basename($file, '.json');
+            if (filemtime($file) < time() - JOURNAL_RETENTION_SECONDS) {
+                @unlink($file);
+                continue;
+            }
+            $entry = $this->get($id);
+            if ($entry !== null && ($entry['state'] ?? '') === 'done' && empty($entry['sent'])) {
+                $pending[$id] = $entry;
+            }
+        }
+        return $pending;
+    }
+}
+
 final class Relay
 {
     /** @var ZeroOpsClient */
@@ -665,12 +738,15 @@ final class Relay
     private $tools;
     /** @var InterventionGuard|null */
     private $guard;
+    /** @var InterventionJournal */
+    private $journal;
 
-    public function __construct(ZeroOpsClient $client, array $tools, ?InterventionGuard $guard = null)
+    public function __construct(ZeroOpsClient $client, array $tools, ?InterventionGuard $guard = null, ?InterventionJournal $journal = null)
     {
         $this->client = $client;
         $this->tools = $tools;
         $this->guard = $guard;
+        $this->journal = $journal ?? new InterventionJournal(null);
     }
 
     public function loop(): void
@@ -678,6 +754,7 @@ final class Relay
         $backoff = 1;
         while (true) {
             try {
+                $this->resendResults();
                 $response = $this->client->post(
                     '/api/relay/poll',
                     ['hostname' => (string) gethostname(), 'version' => RELAY_VERSION, 'tools' => $this->announced()],
@@ -718,6 +795,24 @@ final class Relay
         return $names;
     }
 
+    /** Reenvia resultados de intervenções que o ZeroOps ainda não confirmou (sem voltar a executar). */
+    private function resendResults(): void
+    {
+        foreach ($this->journal->unsent() as $id => $entry) {
+            try {
+                $this->client->post("/api/relay/requests/$id/result", (array) ($entry['body'] ?? []), 30);
+                $entry['sent'] = true;
+            } catch (Throwable $error) {
+                // 409: o ZeroOps já não espera este resultado; não vale a pena insistir.
+                if (strpos($error->getMessage(), 'HTTP 409') === false) {
+                    continue;
+                }
+                $entry['sent'] = true;
+            }
+            $this->journal->put((string) $id, $entry);
+        }
+    }
+
     private function handle(array $request): void
     {
         $id = (string) ($request['id'] ?? '');
@@ -726,23 +821,48 @@ final class Relay
         }
         $tool = $this->tools[(string) ($request['tool'] ?? '')] ?? null;
         $payload = is_array($request['payload'] ?? null) ? $request['payload'] : [];
-        try {
-            if ($tool === null) {
-                throw new RelayError('TOOL_UNKNOWN', 'Ferramenta não suportada pelo relay.');
+        $intervention = $tool instanceof InterventionTool;
+        $ran = false;
+        $previous = $intervention ? $this->journal->get($id) : null;
+        if ($previous !== null && ($previous['state'] ?? '') === 'done') {
+            $body = (array) ($previous['body'] ?? []);
+        } elseif ($previous !== null) {
+            $body = ['ok' => false, 'code' => 'UNCERTAIN', 'message' => 'O relay foi interrompido durante a intervenção: resultado desconhecido (não repetida).'];
+        } else {
+            try {
+                if ($tool === null) {
+                    throw new RelayError('TOOL_UNKNOWN', 'Ferramenta não suportada pelo relay.');
+                }
+                if ($intervention) {
+                    $deadline = isset($payload['deadline']) ? strtotime((string) $payload['deadline']) : false;
+                    if ($deadline !== false && time() > $deadline) {
+                        throw new RelayError('DEADLINE', 'Pedido recebido fora do prazo: a intervenção não foi executada.');
+                    }
+                    $this->journal->put($id, ['state' => 'started', 'at' => time(), 'contract' => (string) ($payload['contractVersion'] ?? '')]);
+                }
+                $ran = true;
+                $body = ['ok' => true, 'result' => $tool->run($payload)];
+            } catch (RelayError $error) {
+                $body = ['ok' => false, 'code' => $error->errorCode, 'message' => $error->getMessage()];
+            } catch (Throwable $error) {
+                $body = ['ok' => false, 'code' => 'RELAY_ERROR', 'message' => 'Falha interna do relay.'];
+                fwrite(STDERR, date('c') . " pedido $id: " . $error->getMessage() . PHP_EOL);
             }
-            $body = ['ok' => true, 'result' => $tool->run($payload)];
-        } catch (RelayError $error) {
-            $body = ['ok' => false, 'code' => $error->errorCode, 'message' => $error->getMessage()];
-        } catch (Throwable $error) {
-            $body = ['ok' => false, 'code' => 'RELAY_ERROR', 'message' => 'Falha interna do relay.'];
-            fwrite(STDERR, date('c') . " pedido $id: " . $error->getMessage() . PHP_EOL);
+            if ($intervention && $ran) {
+                $this->journal->put($id, ['state' => 'done', 'at' => time(), 'body' => $body, 'sent' => false]);
+            }
         }
+        $sent = false;
         try {
             $this->client->post("/api/relay/requests/$id/result", $body, 30);
+            $sent = true;
         } catch (Throwable $error) {
             fwrite(STDERR, date('c') . " resultado $id: " . $error->getMessage() . PHP_EOL);
         }
-        if ($tool instanceof InterventionTool && !empty($body['ok'])) {
+        if ($intervention && $ran && $sent) {
+            $this->journal->put($id, ['state' => 'done', 'at' => time(), 'body' => $body, 'sent' => true]);
+        }
+        if ($intervention && $ran && !empty($body['ok'])) {
             try {
                 $tool->afterResult();
             } catch (Throwable $error) {
@@ -766,5 +886,5 @@ $relay = new Relay(new ZeroOpsClient($config), [
     'restart' => new InterventionTool($guard, 'restart'),
     'reboot' => new InterventionTool($guard, 'reboot'),
     'param' => new InterventionTool($guard, 'param'),
-], $guard);
+], $guard, new InterventionJournal(getenv('STATE_DIRECTORY') ?: '/var/lib/zeroops-relay'));
 $relay->loop();

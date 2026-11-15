@@ -5,21 +5,35 @@ import {
   decisionOptions,
   healthAlertKey,
   flowAssistantResponseSchema,
+  flowAuthoringModeSchema,
+  flowAuthoringRequestSchema,
+  flowAuthoringUndoSchema,
   flowChangeKind,
   flowDefinitionSchema,
   flowMatches,
+  flowReviewConfig,
   flowScenarioSchema,
+  flowSchemaVersion,
   flowSettingsSchema,
   healthAlertFlowCreateSchema,
   healthAlertFlowLinkSchema,
   healthAlertTypes,
+  parseRoutingPolicy,
   portLabel,
+  sameRoutingPolicy,
   selectFlow,
   simulateFlow,
   validateFlowDefinition,
+  type FlowActivationKind,
+  type FlowActivationView,
   type FlowAssistantRequestView,
+  type FlowAuthoringMode,
+  type FlowAuthoringStateView,
   type FlowDefinition,
   type FlowDetail,
+  type FlowMatch,
+  type FlowPendingChanges,
+  type FlowRoutingPolicy,
   type FlowStepOutput,
   type FlowStepView,
   type FlowSummary,
@@ -32,12 +46,20 @@ import type { Database } from '../../database/database.js';
 import { DomainError } from '../../errors.js';
 import { copilotReady } from '../agents/agent-auto-runs.js';
 import { AgentProfilesService } from '../agents/agent-profiles.service.js';
+import { activeRepositoryIds } from '../development/git-repositories.service.js';
+import { activePipelineIds } from '../delivery/pipelines.service.js';
+import {
+  linkedCapabilities,
+  pendingCapabilityDependencies,
+} from '../development/capability-gates.js';
 import { parseInput } from '../identity/identity.validation.js';
 import { ticketIncidentView } from '../incidents/incident-view.js';
-import { requireMember, requireProjectAdmin, type Queryable } from '../identity/membership.js';
+import { requireMember, type Queryable } from '../identity/membership.js';
+import { requireProjectPermission } from '../identity/project-permissions.js';
 import { HEALTH_CATALOG } from '../health/health-catalog.js';
 import { findTicket } from '../tickets/tickets.queries.js';
 import { canDecide, FlowEngine, type ExecutionRow, type StepRow } from './flow-engine.js';
+import { activationTestEvidence } from './flow-simulation.service.js';
 import {
   generalFlowTemplate,
   healthFlowTemplate,
@@ -45,12 +67,21 @@ import {
 } from './flow-templates.js';
 import {
   ensureDefaultFlows,
-  logicHash,
+  parseAlertKeys,
   parseDefinition,
+  activePolicy,
   parseMatch,
   publishedFlows,
   type FlowRow,
 } from './flow-store.js';
+import {
+  assertPinnedReferences,
+  buildFlowManifest,
+  manifestHash,
+  normalizedRouting,
+} from './flow-manifest.js';
+import { FlowAuthoringStore, recordAuthoringEvent } from './flow-authoring.js';
+import { recordJobEvent } from '../agents/job-leases.js';
 
 const idSchema = z.uuid();
 const createSchema = z.strictObject({
@@ -114,6 +145,24 @@ function flowAlertTypes() {
 const iso = (value: Date | string | null) =>
   value === null ? null : (value instanceof Date ? value : new Date(value)).toISOString();
 
+type Routing = {
+  priority: number;
+  isDefault: boolean;
+  match: FlowMatch;
+  policy?: FlowRoutingPolicy | null;
+};
+
+function sameRouting(a: Routing, b: Routing) {
+  return (
+    sameRoutingPolicy(a.policy, b.policy) &&
+    a.priority === b.priority &&
+    a.isDefault === b.isDefault &&
+    (Object.keys(a.match) as (keyof FlowMatch)[]).every(
+      (key) => [...a.match[key]].sort().join('\0') === [...b.match[key]].sort().join('\0'),
+    )
+  );
+}
+
 interface AssistantRow {
   id: string;
   scope: 'flow' | 'ticket';
@@ -128,6 +177,8 @@ interface AssistantRow {
   flow_id: string | null;
   ticket_id: string | null;
   requested_by: string;
+  session_id?: string | null;
+  authoring_mode?: FlowAuthoringMode | null;
 }
 
 function assistantView(row: AssistantRow): FlowAssistantRequestView {
@@ -143,6 +194,7 @@ function assistantView(row: AssistantRow): FlowAssistantRequestView {
     errorCode: row.error_code,
     requestedBy: row.requester,
     createdAt: iso(row.created_at)!,
+    authoringMode: row.session_id ? (row.authoring_mode ?? 'assisted') : null,
   };
 }
 
@@ -168,11 +220,13 @@ export class FlowsService {
     private readonly agentProfiles: AgentProfilesService = new AgentProfilesService(db),
   ) {}
 
+  private readonly authoring = new FlowAuthoringStore();
+
   /** Fluxos do projeto (cria os modelos por omissão na primeira visita). */
   async list(actor: User, projectId: string): Promise<FlowSummary[]> {
     return this.db.transaction(async (client) => {
-      await requireProjectAdmin(client, actor, projectId);
-      await ensureDefaultFlows(client, projectId);
+      const context = await requireProjectPermission(client, actor, projectId, 'flows.view', true);
+      if (context.isAdmin) await ensureDefaultFlows(client, projectId);
       const rows = await client.query<FlowRow>(
         'SELECT * FROM flows WHERE project_id=$1 ORDER BY is_default, priority, name',
         [projectId],
@@ -183,7 +237,7 @@ export class FlowsService {
 
   /** Fluxo com rascunho, versões, problemas de validação e membros (para os responsáveis). */
   async get(actor: User, projectId: string, flowId: string): Promise<FlowDetail> {
-    await requireProjectAdmin(this.db, actor, projectId);
+    await requireProjectPermission(this.db, actor, projectId, 'flows.view');
     return this.detail(this.db, projectId, idSchema.parse(flowId));
   }
 
@@ -191,71 +245,151 @@ export class FlowsService {
   async create(actor: User, projectId: string, raw: unknown): Promise<FlowDetail> {
     const input = parseInput(createSchema, raw);
     return this.db.transaction(async (client) => {
-      const admin = await requireProjectAdmin(client, actor, projectId, false, true);
-      await ensureDefaultFlows(client, projectId);
-      const id = await this.insertFlow(client, projectId, admin.id, input);
+      const context = await requireProjectPermission(client, actor, projectId, 'flows.edit', true);
+      await this.requireInitialized(client, projectId, context.isAdmin);
+      const id = await this.insertFlow(client, projectId, context.actor.id, input);
       return this.detail(client, projectId, id);
     });
   }
 
   /** Tipos de alerta da Saúde e o fluxo que trata os tickets de cada um. */
   async alertFlows(actor: User, projectId: string): Promise<HealthAlertFlowLink[]> {
-    await requireProjectAdmin(this.db, actor, projectId);
+    await requireProjectPermission(this.db, actor, projectId, 'flows.view');
     return this.alertLinks(this.db, projectId);
   }
 
-  /** Associa (ou retira, com `flowId: null`) o fluxo próprio de um tipo de alerta. */
+  /**
+   * Associa (ou retira, com `flowId: null`) o fluxo próprio de um tipo de alerta. Altera o que
+   * está em serviço, por isso exige `flows.activate` e fica no histórico de ativações.
+   */
   async linkAlertFlow(actor: User, projectId: string, raw: unknown) {
     const input = parseInput(healthAlertFlowLinkSchema, raw);
     const key = input.alertKey;
     return this.db.transaction(async (client) => {
-      const admin = await requireProjectAdmin(client, actor, projectId);
+      const context = await requireProjectPermission(
+        client,
+        actor,
+        projectId,
+        'flows.activate',
+        true,
+      );
+      const previous = (
+        await client.query<{ flow_id: string }>(
+          'SELECT flow_id FROM health_alert_flows WHERE project_id=$1 AND alert_key=$2 FOR UPDATE',
+          [projectId, key],
+        )
+      ).rows[0]?.flow_id;
       if (input.flowId) {
         const flow = await this.lockFlow(client, projectId, input.flowId);
         if (!flow.published_version_id)
           throw new DomainError(
             'FLOW_NOT_PUBLISHED',
-            'Publique o fluxo antes de o associar a um alerta.',
+            'Ative uma versão do fluxo antes de o associar a um alerta.',
             409,
           );
-        await this.saveAlertLink(client, projectId, key, flow.id, admin.id);
-      } else
+        if (previous === flow.id) return this.alertLinks(client, projectId);
+        await this.saveAlertLink(client, projectId, key, flow.id, context.actor.id);
+        await this.recordActivation(client, {
+          projectId,
+          flowId: flow.id,
+          kind: 'alert_link',
+          versionId: flow.published_version_id,
+          actorId: context.actor.id,
+          details: { alertKey: key, action: 'linked', previousFlowId: previous ?? null },
+        });
+      } else if (previous) {
         await client.query('DELETE FROM health_alert_flows WHERE project_id=$1 AND alert_key=$2', [
           projectId,
           key,
         ]);
+        await this.recordActivation(client, {
+          projectId,
+          flowId: previous,
+          kind: 'alert_link',
+          versionId: null,
+          actorId: context.actor.id,
+          details: { alertKey: key, action: 'unlinked' },
+        });
+      }
       return this.alertLinks(client, projectId);
     });
   }
 
   /**
-   * Cria um fluxo próprio para um tipo de alerta a partir do modelo de incidentes da Saúde,
-   * publica-o e associa-o logo (os próximos tickets desse alerta passam a usá-lo).
+   * Cria um RASCUNHO próprio para um tipo de alerta a partir do modelo de incidentes da Saúde.
+   * Não cria versão nem associação: o alerta só passa a usá-lo quando alguém com permissão o
+   * ativar («Ativar esta versão»), o que reclama o alerta na mesma transação.
    */
   async createAlertFlow(actor: User, projectId: string, raw: unknown): Promise<FlowDetail> {
     const key = parseInput(healthAlertFlowCreateSchema, raw).alertKey;
     const type = flowAlertTypes().find((item) => item.key === key);
     return this.db.transaction(async (client) => {
-      const admin = await requireProjectAdmin(client, actor, projectId, false, true);
-      await ensureDefaultFlows(client, projectId);
+      const context = await requireProjectPermission(client, actor, projectId, 'flows.edit', true);
+      await this.requireInitialized(client, projectId, context.isAdmin);
       const title = (type?.title ?? key).slice(0, 70);
-      const id = await this.insertFlow(client, projectId, admin.id, {
+      const id = await this.insertFlow(client, projectId, context.actor.id, {
         name: `Alerta: ${title}`,
         template: 'health',
         description: `Tickets abertos pelo alerta «${title}».`,
       });
-      const flow = await this.lockFlow(client, projectId, id);
-      const definition = parseDefinition(flow.flow_definition);
-      const versionId = randomUUID();
-      await client.query(
-        `INSERT INTO flow_versions(id,flow_id,project_id,number,flow_definition,logic_hash,published_by)
-         VALUES($1,$2,$3,1,$4,$5,$6)`,
-        [versionId, id, projectId, definition, logicHash(definition), admin.id],
-      );
-      await client.query('UPDATE flows SET published_version_id=$2 WHERE id=$1', [id, versionId]);
-      await this.saveAlertLink(client, projectId, key, id, admin.id);
+      await client.query('UPDATE flows SET pending_alert_keys=$2 WHERE id=$1', [
+        id,
+        JSON.stringify([key]),
+      ]);
       return this.detail(client, projectId, id);
     });
+  }
+
+  /** Administração inicializa os modelos (como rascunhos); delegados precisam disso feito. */
+  private async requireInitialized(client: Queryable, projectId: string, isAdmin: boolean) {
+    if (isAdmin) {
+      await ensureDefaultFlows(client, projectId);
+      return;
+    }
+    if (
+      !(await client.query('SELECT id FROM flows WHERE project_id=$1 LIMIT 1', [projectId]))
+        .rowCount
+    )
+      throw new DomainError(
+        'FLOW_INITIALIZATION_REQUIRED',
+        'A administração deve inicializar os fluxos do projeto antes da primeira criação.',
+        409,
+      );
+  }
+
+  private async recordActivation(
+    client: Queryable,
+    input: {
+      projectId: string;
+      flowId: string;
+      kind: FlowActivationKind;
+      versionId: string | null;
+      actorId: string;
+      baseDraftVersion?: number | null;
+      previousVersionId?: string | null;
+      manifestHash?: string | null;
+      details?: Record<string, unknown>;
+    },
+  ) {
+    const id = randomUUID();
+    await client.query(
+      `INSERT INTO flow_activations(id,project_id,flow_id,version_id,kind,actor_id,base_draft_version,
+                                    previous_version_id,manifest_hash,activation_details)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [
+        id,
+        input.projectId,
+        input.flowId,
+        input.versionId,
+        input.kind,
+        input.actorId,
+        input.baseDraftVersion ?? null,
+        input.previousVersionId ?? null,
+        input.manifestHash ?? null,
+        JSON.stringify(input.details ?? {}),
+      ],
+    );
+    return id;
   }
 
   private async saveAlertLink(
@@ -280,9 +414,25 @@ export class FlowsService {
         [projectId],
       )
     ).rows;
+    const pending = new Map<string, { id: string; name: string }>();
+    for (const flow of (
+      await client.query<{ id: string; name: string; pending_alert_keys: unknown }>(
+        'SELECT id,name,pending_alert_keys FROM flows WHERE project_id=$1 AND pending_alert_keys IS NOT NULL ORDER BY name',
+        [projectId],
+      )
+    ).rows)
+      for (const key of parseAlertKeys(flow.pending_alert_keys))
+        if (!pending.has(key)) pending.set(key, { id: flow.id, name: flow.name });
     return flowAlertTypes().map((type) => {
       const link = rows.find((row) => row.alert_key === type.key);
-      return { ...type, flowId: link?.flow_id ?? null, flowName: link?.name ?? null };
+      const draft = pending.get(type.key);
+      return {
+        ...type,
+        flowId: link?.flow_id ?? null,
+        flowName: link?.name ?? null,
+        pendingFlowId: draft?.id ?? null,
+        pendingFlowName: draft?.name ?? null,
+      };
     });
   }
 
@@ -294,15 +444,26 @@ export class FlowsService {
   ) {
     await this.assertNameFree(client, projectId, input.name, null);
     const template = input.template === 'blank' ? null : templates[input.template]();
-    const priority =
-      Number(
-        (
-          await client.query<{ top: number | null }>(
-            'SELECT MAX(priority) AS top FROM flows WHERE project_id=$1 AND NOT is_default',
-            [projectId],
-          )
-        ).rows[0]?.top ?? 0,
-      ) + 10;
+    const rows = (
+      await client.query<{ priority: number; is_default: number | boolean }>(
+        'SELECT priority,is_default FROM flows WHERE project_id=$1 FOR UPDATE',
+        [projectId],
+      )
+    ).rows;
+    const used = new Set(rows.map((row) => Number(row.priority)));
+    const top = Math.max(
+      0,
+      ...rows.filter((row) => !Number(row.is_default)).map((row) => Number(row.priority)),
+    );
+    // Depois da última regra; perto do limite usa a prioridade livre mais alta (únicas por projeto).
+    let priority = Math.min(top + 10, 998);
+    while (used.has(priority) && priority > 1) priority -= 1;
+    if (used.has(priority))
+      throw new DomainError(
+        'FLOW_PRIORITY_TAKEN',
+        'Não há prioridades livres. Reorganize as prioridades dos fluxos existentes.',
+        409,
+      );
     const id = randomUUID();
     await client.query(
       `INSERT INTO flows(id,project_id,name,description,template,priority,is_default,flow_match,flow_definition,created_by)
@@ -313,7 +474,7 @@ export class FlowsService {
         input.name,
         input.description || template?.description || '',
         template?.template ?? null,
-        Math.min(priority, 998),
+        priority,
         template?.match ?? { origins: [], categories: [], environments: [], priorities: [] },
         template?.definition ?? blankDefinition(),
         userId,
@@ -329,7 +490,7 @@ export class FlowsService {
   async saveDraft(actor: User, projectId: string, flowId: string, raw: unknown) {
     const input = parseInput(draftSchema, raw);
     return this.db.transaction(async (client) => {
-      await requireProjectAdmin(client, actor, projectId);
+      await requireProjectPermission(client, actor, projectId, 'flows.edit', true);
       const flow = await this.lockFlow(client, projectId, flowId);
       if (Number(flow.draft_version) !== input.expectedDraftVersion)
         throw new DomainError(
@@ -344,17 +505,36 @@ export class FlowsService {
         'UPDATE flows SET flow_definition=$2,draft_version=draft_version+1,updated_at=NOW(3) WHERE id=$1',
         [flow.id, input.definition],
       );
+      await recordAuthoringEvent(client, {
+        projectId,
+        flowId: flow.id,
+        actorId: actor.id,
+        type: 'draft_saved',
+        payload: { revision: Number(flow.draft_version) + 1, changeKind: kind },
+      });
       return { draftVersion: Number(flow.draft_version) + 1, changeKind: kind };
     });
   }
 
-  /** Nome, descrição e regra de seleção (prioridade única; exatamente um fluxo por omissão). */
+  /**
+   * Nome, descrição e regra de seleção do RASCUNHO (prioridade única; um fluxo por omissão no
+   * rascunho). A regra só entra em serviço quando a versão for ativada, por isso basta editar.
+   */
   async saveSettings(actor: User, projectId: string, flowId: string, raw: unknown) {
     const input = parseInput(flowSettingsSchema, raw);
     return this.db.transaction(async (client) => {
-      await requireProjectAdmin(client, actor, projectId);
+      await requireProjectPermission(client, actor, projectId, 'flows.edit', true);
       await client.query('SELECT id FROM flows WHERE project_id=$1 FOR UPDATE', [projectId]);
       const flow = await this.lockFlow(client, projectId, flowId);
+      const routingChanged = !sameRouting(
+        {
+          priority: Number(flow.priority),
+          isDefault: Boolean(flow.is_default),
+          match: parseMatch(flow.flow_match),
+          policy: parseRoutingPolicy(flow.routing_policy),
+        },
+        { ...input, policy: input.routingPolicy ?? parseRoutingPolicy(flow.routing_policy) },
+      );
       await this.assertNameFree(client, projectId, input.name, flow.id);
       const clash = (
         await client.query<{ name: string }>(
@@ -374,44 +554,74 @@ export class FlowsService {
           'Marque outro fluxo como «por omissão» em vez de retirar este.',
           409,
         );
-      if (input.isDefault && !flow.is_default) {
-        if (!flow.published_version_id)
-          throw new DomainError(
-            'FLOW_NOT_PUBLISHED',
-            'Publique o fluxo antes de o usar por omissão.',
-            409,
-          );
-        await client.query('UPDATE flows SET is_default=0 WHERE project_id=$1 AND is_default=1', [
-          projectId,
-        ]);
-      }
+      if (input.isDefault && !flow.is_default)
+        // O anterior deixa de ser o «por omissão» do rascunho: a revisão dele muda também.
+        await client.query(
+          `UPDATE flows SET is_default=0,draft_version=draft_version+1,updated_at=NOW(3)
+            WHERE project_id=$1 AND is_default=1`,
+          [projectId],
+        );
       await client.query(
-        `UPDATE flows SET name=$2,description=$3,priority=$4,is_default=$5,flow_match=$6,updated_at=NOW(3)
+        `UPDATE flows SET name=$2,description=$3,priority=$4,is_default=$5,flow_match=$6,
+                draft_version=draft_version+$7,routing_policy=COALESCE($8,routing_policy),updated_at=NOW(3)
           WHERE id=$1`,
-        [flow.id, input.name, input.description, input.priority, input.isDefault, input.match],
+        [
+          flow.id,
+          input.name,
+          input.description,
+          input.priority,
+          input.isDefault,
+          input.match,
+          routingChanged ? 1 : 0,
+          input.routingPolicy ?? null,
+        ],
       );
+      if (routingChanged)
+        await recordAuthoringEvent(client, {
+          projectId,
+          flowId: flow.id,
+          actorId: actor.id,
+          type: 'draft_saved',
+          payload: { revision: Number(flow.draft_version) + 1, changeKind: 'routing' },
+        });
       return this.detail(client, projectId, flow.id);
     });
   }
 
   /**
-   * Publica o rascunho como nova versão, depois de validar destinos, responsáveis e ações.
-   * Tickets em curso mantêm a versão com que entraram; os novos usam esta.
+   * «Ativar esta versão»: congela o rascunho (definição + encaminhamento + alertas pendentes)
+   * numa versão imutável com manifesto de dependências e põe-na em serviço para NOVOS tickets.
+   * Tickets em curso mantêm a versão com que entraram. Repetir o pedido para a mesma revisão
+   * do rascunho devolve a ativação existente, sem duplicar.
    */
   async publish(actor: User, projectId: string, flowId: string, raw: unknown) {
     const input = parseInput(publishSchema, raw);
     return this.db.transaction(async (client) => {
-      const admin = await requireProjectAdmin(client, actor, projectId);
+      const context = await requireProjectPermission(
+        client,
+        actor,
+        projectId,
+        'flows.activate',
+        true,
+      );
       const flow = await this.lockFlow(client, projectId, flowId);
-      if (Number(flow.draft_version) !== input.expectedDraftVersion)
+      const draftVersion = Number(flow.draft_version);
+      if (draftVersion !== input.expectedDraftVersion)
         throw new DomainError(
           'FLOW_DRAFT_CHANGED',
-          'O rascunho foi alterado entretanto. Recarregue antes de publicar.',
+          'O rascunho foi alterado entretanto. Recarregue antes de ativar.',
           409,
         );
+      const repeated = await client.query(
+        "SELECT id FROM flow_activations WHERE flow_id=$1 AND kind='activation' AND base_draft_version=$2",
+        [flow.id, draftVersion],
+      );
+      if (repeated.rowCount) return this.detail(client, projectId, flow.id);
       const definition = parseDefinition(flow.flow_definition);
       const issues = validateFlowDefinition(definition, {
         members: new Set((await this.members(client, projectId)).map((member) => member.id)),
+        repositories: await activeRepositoryIds(client, projectId),
+        pipelines: await activePipelineIds(client, projectId),
       });
       if (issues.length)
         throw new DomainError(
@@ -422,20 +632,52 @@ export class FlowsService {
             .join(' ')}`,
           422,
         );
-      await this.agentProfiles.validateFlowDefinition(client, projectId, definition);
-      const current = flow.published_version_id
-        ? (
-            await client.query<{ flow_definition: unknown }>(
-              'SELECT flow_definition FROM flow_versions WHERE id=$1',
-              [flow.published_version_id],
-            )
-          ).rows[0]
-        : undefined;
-      if (
-        current &&
-        flowChangeKind(parseDefinition(current.flow_definition), definition) === 'none'
-      )
-        throw new DomainError('FLOW_UNCHANGED', 'Não há alterações por publicar.', 409);
+      // P10: dependência obrigatória ainda em desenvolvimento bloqueia a ativação (não a edição).
+      const missing = await pendingCapabilityDependencies(client, flow.id);
+      if (missing.length)
+        throw new DomainError(
+          'FLOW_CAPABILITY_PENDING',
+          `Há ${missing.length} capacidade(s) obrigatória(s) ainda indisponível(is): ${missing
+            .slice(0, 3)
+            .map((item) => item.title)
+            .join('; ')}.`,
+          409,
+        );
+      const pending = await this.pendingChanges(client, flow);
+      if (!pending.definition && !pending.routing && !pending.alertKeys)
+        throw new DomainError('FLOW_UNCHANGED', 'Não há alterações por ativar.', 409);
+      if (flow.active_is_default && !flow.is_default)
+        throw new DomainError(
+          'FLOW_DEFAULT_REQUIRED',
+          'Este fluxo é o «por omissão» em serviço. Ative primeiro o fluxo que o substitui.',
+          409,
+        );
+      assertPinnedReferences(definition);
+      const dependencies = await this.agentProfiles.validateFlowDefinition(
+        client,
+        projectId,
+        definition,
+      );
+      const linked = (
+        await client.query<{ alert_key: string }>(
+          'SELECT alert_key FROM health_alert_flows WHERE flow_id=$1',
+          [flow.id],
+        )
+      ).rows.map((row) => row.alert_key);
+      const claimed = parseAlertKeys(flow.pending_alert_keys);
+      const routing = normalizedRouting({
+        priority: Number(flow.priority),
+        isDefault: Boolean(flow.is_default),
+        match: parseMatch(flow.flow_match),
+        alertKeys: [...linked, ...claimed],
+        policy: parseRoutingPolicy(flow.routing_policy),
+      });
+      const manifest = buildFlowManifest(definition, routing, dependencies, (key) =>
+        this.engine.supportsAction(key),
+      );
+      const hash = manifestHash(manifest);
+      // P07: o que foi testado para este hash exato (informativo; não é requisito de ativação).
+      const tests = await activationTestEvidence(client, flow.id, hash);
       const number =
         Number(
           (
@@ -447,21 +689,117 @@ export class FlowsService {
         ) + 1;
       const versionId = randomUUID();
       await client.query(
-        `INSERT INTO flow_versions(id,flow_id,project_id,number,flow_definition,logic_hash,published_by)
-         VALUES($1,$2,$3,$4,$5,$6,$7)`,
-        [versionId, flow.id, projectId, number, definition, logicHash(definition), admin.id],
+        `INSERT INTO flow_versions(id,flow_id,project_id,number,flow_definition,logic_hash,published_by,
+                                   schema_version,runtime_contract_version,routing,manifest,manifest_hash)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [
+          versionId,
+          flow.id,
+          projectId,
+          number,
+          definition,
+          manifest.flow.logicHash,
+          context.actor.id,
+          manifest.flow.schemaVersion,
+          manifest.flow.runtimeContractVersion,
+          routing,
+          manifest,
+          hash,
+        ],
       );
-      await client.query('UPDATE flows SET published_version_id=$2,updated_at=NOW(3) WHERE id=$1', [
-        flow.id,
+      // Ativação única por revisão do rascunho (protege repetições e pedidos concorrentes).
+      await this.recordActivation(client, {
+        projectId,
+        flowId: flow.id,
+        kind: 'activation',
         versionId,
-      ]);
+        actorId: context.actor.id,
+        baseDraftVersion: draftVersion,
+        previousVersionId: flow.published_version_id,
+        manifestHash: hash,
+        details: {
+          pending,
+          claimedAlertKeys: claimed,
+          tests,
+          capabilities: await linkedCapabilities(client, flow.id),
+        },
+      });
+      if (routing.isDefault) {
+        const previousDefault = (
+          await client.query<{ id: string; published_version_id: string | null }>(
+            'SELECT id,published_version_id FROM flows WHERE project_id=$1 AND active_is_default=1 AND id<>$2 FOR UPDATE',
+            [projectId, flow.id],
+          )
+        ).rows[0];
+        if (previousDefault) {
+          // Sem isto, o antigo «por omissão» passaria implicitamente a regra ativa (critérios
+          // vazios = qualquer ticket). Sai de serviço até ser ativado com as suas próprias regras.
+          await client.query(
+            'UPDATE flows SET active_is_default=0,active_priority=NULL,active_flow_match=NULL WHERE id=$1',
+            [previousDefault.id],
+          );
+          await this.recordActivation(client, {
+            projectId,
+            flowId: previousDefault.id,
+            kind: 'default_transfer',
+            versionId: previousDefault.published_version_id,
+            actorId: context.actor.id,
+            details: { newDefaultFlowId: flow.id, removedFromService: true },
+          });
+        }
+      }
+      await client.query(
+        `UPDATE flows SET published_version_id=$2,active_priority=$3,active_is_default=$4,
+                active_flow_match=$5,pending_alert_keys=NULL,updated_at=NOW(3)
+          WHERE id=$1`,
+        [flow.id, versionId, routing.priority, routing.isDefault, routing.match],
+      );
+      for (const key of claimed)
+        await this.saveAlertLink(client, projectId, key, flow.id, context.actor.id);
       return this.detail(client, projectId, flow.id);
     });
   }
 
+  /** O que o rascunho tem por ativar (definição, encaminhamento, alertas pendentes). */
+  private async pendingChanges(client: Queryable, row: FlowRow): Promise<FlowPendingChanges> {
+    const alertKeys = parseAlertKeys(row.pending_alert_keys).length > 0;
+    if (!row.published_version_id) return { definition: true, routing: true, alertKeys };
+    const active = (
+      await client.query<{ flow_definition: unknown; routing: unknown }>(
+        'SELECT flow_definition,routing FROM flow_versions WHERE id=$1',
+        [row.published_version_id],
+      )
+    ).rows[0];
+    return {
+      definition:
+        !active ||
+        flowChangeKind(
+          parseDefinition(active.flow_definition),
+          parseDefinition(row.flow_definition),
+        ) !== 'none',
+      routing:
+        row.active_priority === null ||
+        !sameRouting(
+          {
+            priority: Number(row.active_priority),
+            isDefault: Boolean(row.active_is_default),
+            match: parseMatch(row.active_flow_match),
+            policy: activePolicy(active?.routing),
+          },
+          {
+            priority: Number(row.priority),
+            isDefault: Boolean(row.is_default),
+            match: parseMatch(row.flow_match),
+            policy: parseRoutingPolicy(row.routing_policy),
+          },
+        ),
+      alertKeys,
+    };
+  }
+
   /** Tickets do projeto para a simulação («Experimentar com um ticket»). */
   async simulationTickets(actor: User, projectId: string) {
-    await requireProjectAdmin(this.db, actor, projectId);
+    await requireProjectPermission(this.db, actor, projectId, 'flows.simulate');
     const rows = await this.db.query<{
       id: string;
       key: string;
@@ -491,7 +829,7 @@ export class FlowsService {
    */
   async simulate(actor: User, projectId: string, flowId: string, raw: unknown) {
     const input = parseInput(simulateSchema, raw);
-    await requireProjectAdmin(this.db, actor, projectId);
+    await requireProjectPermission(this.db, actor, projectId, 'flows.simulate');
     const flow = await this.lockFlow(this.db, projectId, flowId, false);
     const definition = input.definition ?? parseDefinition(flow.flow_definition);
     let ticket: {
@@ -500,6 +838,8 @@ export class FlowsService {
       selectedFlow: string | null;
       matches: boolean;
     } | null = null;
+    let facts:
+      { origin: string; category: string; environment: string; priority: string } | undefined;
     if (input.ticketId) {
       const row = (
         await this.db.query<{
@@ -515,6 +855,12 @@ export class FlowsService {
         )
       ).rows[0];
       if (!row) throw new DomainError('TICKET_NOT_FOUND', 'Pedido não encontrado.', 404);
+      facts = {
+        origin: row.origin,
+        category: row.category,
+        environment: row.environment,
+        priority: row.priority,
+      };
       const candidates = (await publishedFlows(this.db, projectId)).filter(
         (item) => item.id !== flow.id,
       );
@@ -536,15 +882,18 @@ export class FlowsService {
     return {
       ticket,
       issues: validateFlowDefinition(definition),
-      result: simulateFlow(definition, input.scenario),
+      result: simulateFlow(definition, input.scenario, undefined, facts),
     };
   }
 
-  /** Pede ao assistente uma alteração ao fluxo (resposta assíncrona pelo Copilot). */
+  /**
+   * Novo turno da sessão de construção (P06): resposta assíncrona pelo Copilot, que altera o
+   * rascunho só pelas ferramentas de autoria. O modo fica guardado na sessão (fluxo, utilizador).
+   */
   async requestFlowAssistant(actor: User, projectId: string, flowId: string, raw: unknown) {
-    const input = parseInput(messageSchema, raw);
+    const input = parseInput(flowAuthoringRequestSchema, raw);
     return this.db.transaction(async (client) => {
-      const admin = await requireProjectAdmin(client, actor, projectId);
+      const context = await requireProjectPermission(client, actor, projectId, 'flows.edit', true);
       const flow = await this.lockFlow(client, projectId, flowId);
       if (!(await copilotReady(client, projectId)))
         throw new DomainError(
@@ -553,19 +902,174 @@ export class FlowsService {
           409,
         );
       await this.assertNoPending(client, 'flow_id', flow.id);
+      const session = await this.authoringSession(client, flow, context.actor.id, input.mode);
       const id = randomUUID();
       await client.query(
-        `INSERT INTO flow_assistant_requests(id,project_id,scope,flow_id,requested_by,message,base_draft_version)
-         VALUES($1,$2,'flow',$3,$4,$5,$6)`,
-        [id, projectId, flow.id, admin.id, input.message, flow.draft_version],
+        `INSERT INTO flow_assistant_requests(id,project_id,scope,flow_id,requested_by,message,base_draft_version,
+                                             session_id,authoring_mode,known_revision)
+         VALUES($1,$2,'flow',$3,$4,$5,$6,$7,$8,$6)`,
+        [
+          id,
+          projectId,
+          flow.id,
+          context.actor.id,
+          input.message,
+          flow.draft_version,
+          session.id,
+          session.mode,
+        ],
       );
+      await recordAuthoringEvent(client, {
+        projectId,
+        flowId: flow.id,
+        sessionId: session.id,
+        requestId: id,
+        actorId: context.actor.id,
+        type: 'turn_queued',
+        payload: {
+          message: input.message,
+          mode: session.mode,
+          revision: Number(flow.draft_version),
+        },
+      });
       return this.assistantRequest(client, id);
+    });
+  }
+
+  /** Estado persistente da construção: sessão do utilizador, operações, capacidades e cursor. */
+  async authoringState(
+    actor: User,
+    projectId: string,
+    flowId: string,
+  ): Promise<FlowAuthoringStateView> {
+    const context = await requireProjectPermission(this.db, actor, projectId, 'flows.view');
+    const flow = await this.lockFlow(this.db, projectId, flowId, false);
+    const session = (
+      await this.db.query<{ id: string; mode: FlowAuthoringMode }>(
+        'SELECT id,mode FROM flow_authoring_sessions WHERE flow_id=$1 AND created_by=$2',
+        [flow.id, context.actor.id],
+      )
+    ).rows[0];
+    return {
+      session: session ? { id: session.id, mode: session.mode } : null,
+      draftVersion: Number(flow.draft_version),
+      operations: await this.authoring.operations(this.db, flow),
+      capabilities: await this.authoring.capabilities(this.db, flow.id),
+      lastEventId: await this.authoring.lastEventId(this.db, flow.id),
+    };
+  }
+
+  /** Eventos da construção a partir do cursor `after` (replay, SSE e polling). */
+  async authoringEvents(actor: User, projectId: string, flowId: string, after: number) {
+    await requireProjectPermission(this.db, actor, projectId, 'flows.view');
+    const flow = await this.lockFlow(this.db, projectId, flowId, false);
+    return this.authoring.events(this.db, flow.id, Number.isFinite(after) ? after : 0);
+  }
+
+  /** Muda o modo da sessão (afeta os próximos turnos; o turno em curso mantém o seu). */
+  async setAuthoringMode(actor: User, projectId: string, flowId: string, raw: unknown) {
+    const input = parseInput(flowAuthoringModeSchema, raw);
+    return this.db.transaction(async (client) => {
+      const context = await requireProjectPermission(client, actor, projectId, 'flows.edit', true);
+      const flow = await this.lockFlow(client, projectId, flowId);
+      const before = (
+        await client.query<{ mode: FlowAuthoringMode }>(
+          'SELECT mode FROM flow_authoring_sessions WHERE flow_id=$1 AND created_by=$2',
+          [flow.id, context.actor.id],
+        )
+      ).rows[0];
+      const session = await this.authoringSession(client, flow, context.actor.id, input.mode);
+      if (before?.mode !== input.mode)
+        await recordAuthoringEvent(client, {
+          projectId,
+          flowId: flow.id,
+          sessionId: session.id,
+          actorId: context.actor.id,
+          type: 'mode_changed',
+          payload: { mode: input.mode },
+        });
+      return { id: session.id, mode: session.mode };
+    });
+  }
+
+  /** Desfaz uma operação aplicada com uma nova revisão auditada (não toca em versões ativas). */
+  async undoAuthoringOperation(
+    actor: User,
+    projectId: string,
+    flowId: string,
+    operationId: string,
+    raw: unknown,
+  ) {
+    const input = parseInput(flowAuthoringUndoSchema, raw);
+    return this.db.transaction(async (client) => {
+      const context = await requireProjectPermission(client, actor, projectId, 'flows.edit', true);
+      const flow = await this.lockFlow(client, projectId, flowId);
+      await this.authoring.undo(
+        client,
+        flow,
+        context.actor.id,
+        idSchema.parse(operationId),
+        input.expectedDraftVersion,
+      );
+      return this.detail(client, projectId, flow.id);
+    });
+  }
+
+  /**
+   * Cancela o turno do assistente em espera ou em curso. O pedido deixa de ter posse válida, por
+   * isso o executor para no próximo heartbeat ou chamada de ferramenta, sem mais escritas.
+   */
+  async cancelFlowAssistant(actor: User, projectId: string, flowId: string, requestId: string) {
+    return this.db.transaction(async (client) => {
+      const context = await requireProjectPermission(client, actor, projectId, 'flows.edit', true);
+      const flow = await this.lockFlow(client, projectId, flowId);
+      const request = (
+        await client.query<{
+          id: string;
+          status: string;
+          session_id: string | null;
+          attempt: number;
+          lease_epoch: number;
+          worker_id: string | null;
+        }>(
+          'SELECT id,status,session_id,attempt,lease_epoch,worker_id FROM flow_assistant_requests WHERE id=$1 AND flow_id=$2 FOR UPDATE',
+          [idSchema.parse(requestId), flow.id],
+        )
+      ).rows[0];
+      if (!request) throw new DomainError('NOT_FOUND', 'Pedido não encontrado.', 404);
+      if (request.status === 'queued' || request.status === 'running') {
+        await client.query(
+          "UPDATE flow_assistant_requests SET status='failed',error_code='cancelled',finished_at=NOW(3),lease_until=NULL WHERE id=$1",
+          [request.id],
+        );
+        await recordJobEvent(client, {
+          kind: 'flow_assistant',
+          jobId: request.id,
+          projectId,
+          attempt: Number(request.attempt),
+          epoch: Number(request.lease_epoch),
+          workerId: request.worker_id,
+          type: 'cancel_requested',
+          details: { by: context.actor.id },
+        });
+        await recordAuthoringEvent(client, {
+          projectId,
+          flowId: flow.id,
+          sessionId: request.session_id,
+          requestId: request.id,
+          actorId: context.actor.id,
+          type: 'turn_cancelled',
+          payload: {},
+          idempotencyKey: `cancel:${request.id}`,
+        });
+      }
+      return this.assistantRequest(client, request.id);
     });
   }
 
   /** Conversa do assistente sobre o fluxo (mais recentes primeiro). */
   async flowAssistantHistory(actor: User, projectId: string, flowId: string) {
-    await requireProjectAdmin(this.db, actor, projectId);
+    await requireProjectPermission(this.db, actor, projectId, 'flows.view');
     const flow = await this.lockFlow(this.db, projectId, flowId, false);
     return this.assistantList(this.db, 'flow_id', flow.id);
   }
@@ -583,7 +1087,7 @@ export class FlowsService {
   ) {
     const input = parseInput(resolutionSchema, raw);
     return this.db.transaction(async (client) => {
-      await requireProjectAdmin(client, actor, projectId);
+      await requireProjectPermission(client, actor, projectId, 'flows.edit', true);
       const flow = await this.lockFlow(client, projectId, flowId);
       const request = (
         await client.query<AssistantRow>(
@@ -595,6 +1099,42 @@ export class FlowsService {
       if (!request) throw new DomainError('NOT_FOUND', 'Proposta não encontrada.', 404);
       if (request.resolution !== 'pending' || request.status !== 'succeeded')
         throw new DomainError('FLOW_PROPOSAL_CLOSED', 'Esta proposta já não está pendente.', 409);
+      if (request.session_id) {
+        if (
+          input.resolution === 'accepted' &&
+          input.expectedDraftVersion !== undefined &&
+          input.expectedDraftVersion !== Number(flow.draft_version)
+        )
+          throw new DomainError(
+            'FLOW_DRAFT_CHANGED',
+            'O rascunho foi alterado entretanto. Recarregue antes de aceitar.',
+            409,
+          );
+        const response = flowAssistantResponseSchema.parse(request.assistant_response);
+        if (input.resolution === 'accepted')
+          try {
+            await this.authoring.acceptProposals(
+              client,
+              flow,
+              request.id,
+              actor.id,
+              response.operations,
+            );
+          } catch (error) {
+            if (error instanceof DomainError) throw error;
+            throw new DomainError(
+              'FLOW_PROPOSAL_STALE',
+              `A proposta já não se aplica ao rascunho: ${error instanceof Error ? error.message : 'erro'}`,
+              409,
+            );
+          }
+        else await this.authoring.discardProposals(client, flow, request.id, actor.id);
+        await client.query('UPDATE flow_assistant_requests SET resolution=$2 WHERE id=$1', [
+          request.id,
+          input.resolution,
+        ]);
+        return this.detail(client, projectId, flow.id);
+      }
       if (input.resolution === 'accepted') {
         if (
           input.expectedDraftVersion !== undefined &&
@@ -702,6 +1242,16 @@ export class FlowsService {
     const current = steps.rows.find((step) => step.id === execution.current_step_id);
     const currentNode = current ? node(current.node_id) : undefined;
     const active = current && ['waiting', 'active'].includes(current.status) && currentNode;
+    const reviewConfig = currentNode && !isClient ? flowReviewConfig(currentNode) : null;
+    const reviewHead = reviewConfig
+      ? ((
+          await this.db.query<{ head_sha: string | null; tests_passed: boolean | number }>(
+            `SELECT head_sha,tests_passed FROM development_workspaces WHERE ticket_id=$1 AND node_id=$2
+              ORDER BY updated_at DESC LIMIT 1`,
+            [ticket.id, reviewConfig.sourceNode],
+          )
+        ).rows[0] ?? { head_sha: null, tests_passed: false })
+      : null;
     return {
       execution: {
         id: execution.id,
@@ -755,6 +1305,14 @@ export class FlowsService {
                     : currentNode.op === 'copilot_task'
                       ? 'copilot'
                       : 'system',
+                ...(reviewHead
+                  ? {
+                      review: {
+                        headSha: reviewHead.head_sha,
+                        testsPassed: Boolean(reviewHead.tests_passed),
+                      },
+                    }
+                  : {}),
               };
             })()
           : null,
@@ -890,6 +1448,25 @@ export class FlowsService {
       throw new DomainError('FLOW_NAME_TAKEN', 'Já existe um fluxo com esse nome.', 409);
   }
 
+  private async authoringSession(
+    client: Queryable,
+    flow: FlowRow,
+    userId: string,
+    mode: FlowAuthoringMode | undefined,
+  ) {
+    await client.query(
+      `INSERT INTO flow_authoring_sessions(id,project_id,flow_id,created_by,mode) VALUES($1,$2,$3,$4,$5)
+       ON DUPLICATE KEY UPDATE mode=COALESCE($6,mode),updated_at=NOW(3)`,
+      [randomUUID(), flow.project_id, flow.id, userId, mode ?? 'assisted', mode ?? null],
+    );
+    return (
+      await client.query<{ id: string; mode: FlowAuthoringMode }>(
+        'SELECT id,mode FROM flow_authoring_sessions WHERE flow_id=$1 AND created_by=$2',
+        [flow.id, userId],
+      )
+    ).rows[0]!;
+  }
+
   private async assertNoPending(client: Queryable, column: 'flow_id' | 'ticket_id', id: string) {
     const pending = await client.query(
       `SELECT id FROM flow_assistant_requests WHERE ${column}=$1 AND status IN ('queued','running')`,
@@ -914,6 +1491,7 @@ export class FlowsService {
   }
 
   private async summary(client: Queryable, row: FlowRow): Promise<FlowSummary> {
+    const pending = await this.pendingChanges(client, row);
     const published = row.published_version_id
       ? (
           await client.query<{
@@ -921,9 +1499,9 @@ export class FlowsService {
             number: number;
             published_at: Date;
             published_by: string | null;
-            flow_definition: unknown;
+            routing: unknown;
           }>(
-            `SELECT v.id,v.number,v.published_at,u.display_name AS published_by,v.flow_definition
+            `SELECT v.id,v.number,v.published_at,u.display_name AS published_by,v.routing
                FROM flow_versions v LEFT JOIN users u ON u.id=v.published_by WHERE v.id=$1`,
             [row.published_version_id],
           )
@@ -942,14 +1520,10 @@ export class FlowsService {
       priority: Number(row.priority),
       isDefault: Boolean(row.is_default),
       match: parseMatch(row.flow_match),
+      routingPolicy: parseRoutingPolicy(row.routing_policy),
       template: row.template,
       draftVersion: Number(row.draft_version),
-      draftChanged:
-        !published ||
-        flowChangeKind(
-          parseDefinition(published.flow_definition),
-          parseDefinition(row.flow_definition),
-        ) !== 'none',
+      draftChanged: pending.definition,
       published: published
         ? {
             id: published.id,
@@ -958,6 +1532,17 @@ export class FlowsService {
             publishedBy: published.published_by,
           }
         : null,
+      active:
+        published && row.active_priority !== null
+          ? {
+              priority: Number(row.active_priority),
+              isDefault: Boolean(row.active_is_default),
+              match: parseMatch(row.active_flow_match),
+              routingPolicy: activePolicy(published.routing),
+            }
+          : null,
+      pendingChanges: pending,
+      schemaVersion: flowSchemaVersion(parseDefinition(row.flow_definition)),
       activeExecutions: Number(active?.total ?? 0),
       updatedAt: iso(row.updated_at)!,
       alertKeys: (
@@ -966,6 +1551,7 @@ export class FlowsService {
           [row.id],
         )
       ).rows.map((link) => link.alert_key),
+      pendingAlertKeys: parseAlertKeys(row.pending_alert_keys),
     };
   }
 
@@ -978,11 +1564,35 @@ export class FlowsService {
       published_at: Date;
       published_by: string | null;
       active: number;
+      schema_version: number;
+      runtime_contract_version: number;
+      manifest_hash: string | null;
     }>(
-      `SELECT v.id,v.number,v.published_at,u.display_name AS published_by,
+      `SELECT v.id,v.number,v.published_at,u.display_name AS published_by,v.schema_version,
+              v.runtime_contract_version,v.manifest_hash,
               (SELECT COUNT(*) FROM flow_executions e WHERE e.version_id=v.id AND e.status IN ('running','waiting')) AS active
          FROM flow_versions v LEFT JOIN users u ON u.id=v.published_by
         WHERE v.flow_id=$1 ORDER BY v.number DESC LIMIT 30`,
+      [row.id],
+    );
+    const activations = await client.query<{
+      id: string;
+      kind: FlowActivationKind;
+      version_id: string | null;
+      version_number: number | null;
+      previous_number: number | null;
+      manifest_hash: string | null;
+      actor: string | null;
+      activation_details: unknown;
+      created_at: Date;
+    }>(
+      `SELECT a.id,a.kind,a.version_id,v.number AS version_number,p.number AS previous_number,
+              a.manifest_hash,u.display_name AS actor,a.activation_details,a.created_at
+         FROM flow_activations a
+         LEFT JOIN flow_versions v ON v.id=a.version_id
+         LEFT JOIN flow_versions p ON p.id=a.previous_version_id
+         LEFT JOIN users u ON u.id=a.actor_id
+        WHERE a.flow_id=$1 ORDER BY a.created_at DESC, a.id LIMIT 50`,
       [row.id],
     );
     const draft = parseDefinition(row.flow_definition);
@@ -995,9 +1605,29 @@ export class FlowsService {
         publishedAt: iso(version.published_at)!,
         publishedBy: version.published_by,
         activeExecutions: Number(version.active),
+        schemaVersion: Number(version.schema_version) === 2 ? 2 : 1,
+        runtimeContractVersion: Number(version.runtime_contract_version),
+        manifestHash: version.manifest_hash,
+        active: version.id === row.published_version_id,
+      })),
+      activations: activations.rows.map((item): FlowActivationView => ({
+        id: item.id,
+        kind: item.kind,
+        versionId: item.version_id,
+        versionNumber: item.version_number === null ? null : Number(item.version_number),
+        previousVersionNumber: item.previous_number === null ? null : Number(item.previous_number),
+        manifestHash: item.manifest_hash,
+        actor: item.actor,
+        details:
+          item.activation_details && typeof item.activation_details === 'object'
+            ? (item.activation_details as Record<string, unknown>)
+            : {},
+        createdAt: iso(item.created_at)!,
       })),
       issues: validateFlowDefinition(draft, {
         members: new Set(members.map((member) => member.id)),
+        repositories: await activeRepositoryIds(client, projectId),
+        pipelines: await activePipelineIds(client, projectId),
       }),
       members,
       copilotReady: await copilotReady(client, projectId),

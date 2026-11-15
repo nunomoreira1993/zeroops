@@ -26,6 +26,10 @@ const statusLabels: Record<string, { pt: string; en: string }> = {
   refused: { pt: 'recusada', en: 'refused' },
   cancelled: { pt: 'cancelada', en: 'cancelled' },
   simulated: { pt: 'simulada', en: 'simulated' },
+  uncertain: {
+    pt: 'resultado incerto — a reconciliar, sem repetir',
+    en: 'uncertain — reconciling, not retried',
+  },
 };
 
 const criterionLabels: Record<string, { pt: string; en: string }> = {
@@ -116,9 +120,13 @@ export function IncidentStepBlock({ incident, lang }: { incident: IncidentOutput
           </summary>
           <ul className="content-list incident-measurements">
             {incident.measurements.map((item, index) => (
-              <li key={index} className={item.ok ? 'is-ok' : 'is-fail'}>
+              <li
+                key={index}
+                className={item.unknown ? 'is-unknown' : item.ok ? 'is-ok' : 'is-fail'}
+              >
                 <time dateTime={item.at}>{new Date(item.at).toLocaleTimeString()}</time>{' '}
-                {item.ok ? '✓' : '✗'} {item.detail}
+                {item.unknown ? `? ${t('desconhecido', 'unknown')}:` : item.ok ? '✓' : '✗'}{' '}
+                {item.detail}
               </li>
             ))}
           </ul>

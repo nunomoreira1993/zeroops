@@ -1,4 +1,4 @@
-import type { InstanceProject } from '@zeroops/contracts';
+import type { ProjectPermissionAccess } from '@zeroops/contracts';
 import { Loading, Notice, PageHeader, ResourceError } from '../../components/ui';
 import { useResource } from '../../lib/hooks';
 import { useIdentityLocale } from '../../lib/identity';
@@ -16,8 +16,12 @@ export function parseFlowsRoute(route: string): string | null {
 /** Fluxos de resolução do projeto ativo, acessíveis a partir do menu lateral. */
 export function FlowsPage({ projectId, flowId }: { projectId: string; flowId: string | null }) {
   const { t } = useIdentityLocale();
-  const resource = useResource<InstanceProject>(`/project-admin/${encodeURIComponent(projectId)}`);
-  const project = resource.data;
+  const resource = useResource<ProjectPermissionAccess>(
+    `/projects/${encodeURIComponent(projectId)}/access`,
+    15000,
+  );
+  const access = resource.data;
+  const project = access?.project;
   return (
     <div className="stack flows-page">
       {!flowId && (
@@ -33,10 +37,10 @@ export function FlowsPage({ projectId, flowId }: { projectId: string; flowId: st
         <Loading label={t('A carregar projeto…', 'Loading project…')} />
       ) : resource.error ? (
         <ResourceError error={resource.error} retry={resource.reload} />
-      ) : !project || project.id !== projectId ? (
+      ) : !project || project.id !== projectId || !access.permissions.includes('flows.view') ? (
         <Notice>{t('Projeto indisponível.', 'Project unavailable.')}</Notice>
       ) : (
-        <ProjectAdminProvider key={project.id} project={project}>
+        <ProjectAdminProvider key={project.id} project={project} permissions={access.permissions}>
           <FlowsTab basePath={FLOWS_ROUTE} flowId={flowId} />
         </ProjectAdminProvider>
       )}

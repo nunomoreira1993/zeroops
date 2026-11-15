@@ -65,8 +65,13 @@ describe('relay de Produção', () => {
       result: { columns: ['um'], rows: [[1]], truncated: false },
     });
     expect(await pending).toEqual({ columns: ['um'], rows: [[1]], truncated: false });
+    // P09: repetir o mesmo resultado (resposta perdida pelo relay) é idempotente; um resultado
+    // contraditório continua a ser recusado.
     await expect(
       service.complete(auth, requests[0]!.id, { ok: true, result: null }),
+    ).resolves.toEqual({ status: 'accepted', duplicate: true });
+    await expect(
+      service.complete(auth, requests[0]!.id, { ok: false, code: 'X', message: 'Contraditório.' }),
     ).rejects.toMatchObject({ status: 409 });
 
     const failing = queue.execute(admin.projectId, null, 'log', { type: 'api' });

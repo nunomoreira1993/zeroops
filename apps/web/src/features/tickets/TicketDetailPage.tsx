@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react';
-import { preExecutionStatuses, type TicketDetail, type TicketFlowView } from '@zeroops/contracts';
+import {
+  preExecutionStatuses,
+  type TicketDetail,
+  type TicketFlowView,
+  type TicketRoutingView,
+} from '@zeroops/contracts';
 import { Icon } from '../../components/Icon';
 import { MarkdownContent } from '../../components/MarkdownContent';
 import {
@@ -14,6 +19,8 @@ import { useResource } from '../../lib/hooks';
 import { useIdentityLocale } from '../../lib/identity';
 import { useSession } from '../../lib/session';
 import { FlowNextActionPanel, TicketFlowSection } from '../flows/TicketFlowPanel';
+import { TicketDevelopmentPanel } from '../flows/TicketDevelopmentPanel';
+import { TicketRoutingPanel } from '../flows/TicketRoutingPanel';
 import { ConversationPanel } from './ConversationPanel';
 import { DecisionPanel } from './DecisionPanel';
 import { ProposalPanel } from './ProposalPanel';
@@ -27,6 +34,11 @@ import { formatDateTime, ticketLabels } from './labels';
 export function TicketDetailPage({ id }: { id: string }) {
   const resource = useResource<TicketDetail>(`/tickets/${id}`, 10000);
   const flowResource = useResource<{ flow?: TicketFlowView | null }>(`/tickets/${id}/flow`, 10000);
+  const routingResource = useResource<{ routing?: TicketRoutingView | null }>(
+    `/tickets/${id}/flow/routing`,
+    10000,
+  );
+  const routing = routingResource.data?.routing ?? null;
   const [flowOverride, setFlowOverride] = useState<{ value: TicketFlowView | null } | null>(null);
   const flow = flowOverride ? flowOverride.value : (flowResource.data?.flow ?? null);
   useEffect(() => {
@@ -35,9 +47,10 @@ export function TicketDetailPage({ id }: { id: string }) {
   const flowChanged = () => {
     resource.reload();
     flowResource.reload();
+    routingResource.reload();
   };
   // Pedidos anteriores aos fluxos (sem execução) mantêm os painéis de decisão originais.
-  const legacy = !flow && !flowResource.loading && flowOverride === null;
+  const legacy = !flow && !routing && !flowResource.loading && flowOverride === null;
   const { session } = useSession();
   const { locale, t } = useIdentityLocale();
   const {
@@ -186,7 +199,19 @@ export function TicketDetailPage({ id }: { id: string }) {
                 </>
               )}
               {section === 'flow' && (
-                <TicketFlowSection ticketId={ticket.id} flow={flow} onChanged={flowChanged} />
+                <>
+                  {routing && (
+                    <TicketRoutingPanel
+                      ticketId={ticket.id}
+                      routing={routing}
+                      onChanged={flowChanged}
+                    />
+                  )}
+                  <TicketFlowSection ticketId={ticket.id} flow={flow} onChanged={flowChanged} />
+                  {session?.user.role !== 'client' && (
+                    <TicketDevelopmentPanel ticketId={ticket.id} />
+                  )}
+                </>
               )}
               {section === 'conversation' && (
                 <>
@@ -362,6 +387,15 @@ export function TicketDetailPage({ id }: { id: string }) {
                 key={`assignments-${ticket.version}`}
                 ticket={ticket}
                 assignments={detail.assignments}
+                flowRoles={
+                  flow
+                    ? flow.definition.nodes.flatMap((node) =>
+                        node.assignee?.kind === 'role' ? [node.assignee.role] : [],
+                      )
+                    : legacy
+                      ? null
+                      : []
+                }
                 onChanged={changed}
               />
               {legacy && (

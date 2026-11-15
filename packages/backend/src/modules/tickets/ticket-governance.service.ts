@@ -16,6 +16,7 @@ import { parseInput } from '../identity/identity.validation.js';
 import { findTicket } from './tickets.queries.js';
 import { appendHumanComment } from './ticket-comments.js';
 import { invalidateTicketDependencies } from './ticket-dependencies.js';
+import { rejectWhenFlowManaged } from './flow-authority.js';
 
 /** Gere participantes, resoluções sem código e invalidações auditadas do ticket. */
 export class TicketGovernanceService {
@@ -213,6 +214,7 @@ export class TicketGovernanceService {
       if (!['technical', 'admin'].includes(member.role))
         throw new DomainError('FORBIDDEN', 'Só a equipa pode propor uma resolução.', 403);
       const ticket = await findTicket(client, member, ticketId, true);
+      await rejectWhenFlowManaged(client, ticketId);
       if (ticket.version !== input.expectedVersion)
         throw new DomainError('STALE_VERSION', 'O pedido mudou. Recarregue a página.');
       if (!preExecutionStatuses.includes(ticket.status))
@@ -269,6 +271,7 @@ export class TicketGovernanceService {
     await this.db.transaction(async (client) => {
       const member = await requireMember(client, actor, true);
       const ticket = await findTicket(client, member, ticketId, true);
+      await rejectWhenFlowManaged(client, ticketId);
       if (ticket.version !== input.expectedVersion)
         throw new DomainError('STALE_VERSION', 'O pedido mudou. Recarregue a página.');
       if (ticket.status !== 'awaiting_confirmation')

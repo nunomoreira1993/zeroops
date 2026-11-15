@@ -134,7 +134,7 @@ describe('conectores de leitura', () => {
       environment: 'production',
       priority: 'medium',
     });
-    const run = await runs.request(technical, ticket.id, {});
+    await runs.request(technical, ticket.id, {});
     const context = await runs.claimNext();
     const token = context?.connectorToken ?? '';
     const gateway = new ConnectorGateway(
@@ -158,7 +158,7 @@ describe('conectores de leitura', () => {
     expect((await gateway.call(token, 'echo', { other: 1 })).status).toBe(400);
     expect((await gateway.call(token, 'echo', { text: 'excesso' })).status).toBe(429);
 
-    await runs.complete(run.id, { summary: 'Feito.', replyDraft: null, evidence: [] });
+    await runs.complete(context!.lease, { summary: 'Feito.', replyDraft: null, evidence: [] });
     expect((await gateway.call(token, 'echo', { text: 'depois' })).status).toBe(401);
     const [done] = await runs.list(technical, ticket.id);
     const calls = done?.toolCalls.map((call) => [call.request, call.outcome, call.errorCode]);

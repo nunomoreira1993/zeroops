@@ -193,39 +193,15 @@ export function DashboardPage() {
       <section className="kt-card process-panel">
         <div className="kt-card-header">
           <div>
-            <h2 className="kt-card-title">{t('Fluxo de aprovação', 'Approval flow')}</h2>
+            <h2 className="kt-card-title">{t('Etapas e aprovações', 'Stages and approvals')}</h2>
             <p className="card-subtitle">
               {t(
-                'Cada pedido passa por estas decisões até à publicação',
-                'Each request goes through these decisions until publication',
+                'As etapas e aprovações dependem do fluxo associado a cada pedido. Consulte o pedido para acompanhar o seu percurso.',
+                'Stages and approvals depend on the flow associated with each request. Open a request to follow its progress.',
               )}
             </p>
           </div>
         </div>
-        <ol className="kt-card-content process-stages">
-          {[
-            ['1', t('Cliente', 'Client'), t('Aprova a proposta', 'Approves the proposal')],
-            ['2', t('Técnica', 'Technical'), t('Valida a execução', 'Validates the work')],
-            ['3', 'QA', t('Verifica a qualidade', 'Checks the quality')],
-            ['4', 'Release', t('Autoriza a publicação', 'Authorises publication')],
-            [
-              '5',
-              t('Publicação', 'Publication'),
-              t(
-                'Automática, quando a infraestrutura o permite',
-                'Automatic, when the infrastructure allows it',
-              ),
-            ],
-          ].map(([step, title, description]) => (
-            <li key={step}>
-              <span className="process-number">{step}</span>
-              <div>
-                <strong>{title}</strong>
-                <span>{description}</span>
-              </div>
-            </li>
-          ))}
-        </ol>
       </section>
 
       {metrics.data && metrics.data.tickets.length > 0 && (

@@ -15,6 +15,7 @@ import { ticketPurgeProtocol, type TicketPurgeReadiness } from './ticket-purge-r
 import { TicketsService } from './tickets.service.js';
 import { healthOccurrenceSuppressed } from './ticket-purge-health.js';
 import { FlowEngine } from '../flows/flow-engine.js';
+import { FlowsService } from '../flows/flows.service.js';
 import { HealthRepository } from '../health/health.repository.js';
 import { HealthTickets } from '../health/health-tickets.js';
 import { HealthMonitor } from '../health/health-monitor.js';
@@ -265,6 +266,14 @@ describe('isolated project ticket purge', () => {
   it('cleans real flow execution history while retaining published flow configuration', async () => {
     const { actor, target, confirm } = await scenario();
     const engine = new FlowEngine(fixture.db);
+    // P02: os modelos iniciais são rascunhos; o fluxo por omissão tem de ser ativado.
+    const flowsService = new FlowsService(fixture.db, engine);
+    const defaultFlow = (await flowsService.list(actor, actor.projectId)).find(
+      (flow) => flow.isDefault,
+    )!;
+    await flowsService.publish(actor, actor.projectId, defaultFlow.id, {
+      expectedDraftVersion: defaultFlow.draftVersion,
+    });
     const flowTickets = new TicketsService(fixture.db, [], [engine.onTicketCreated]);
     await flowTickets.create(actor, {
       title: 'Flow ticket purge fixture',

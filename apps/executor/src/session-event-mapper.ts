@@ -236,6 +236,38 @@ export function mapSessionEvent(
       return null;
     case 'session.error':
       return { type: 'error', message: safe(data.message, 500) ?? 'Erro do agente.' };
+    case 'skill.invoked': {
+      const name = text(data.name);
+      if (!name) return null;
+      return {
+        type: 'capability',
+        kind: 'skill',
+        name: clip(name, 100),
+        phase: 'invoked',
+        detail: safe(data.trigger, 100),
+      };
+    }
+    case 'subagent.started':
+    case 'subagent.completed':
+    case 'subagent.failed': {
+      const name = text(data.agentName);
+      if (!name) return null;
+      const toolCallId = text(data.toolCallId);
+      const phase = event.type.slice('subagent.'.length) as 'started' | 'completed' | 'failed';
+      return {
+        type: 'capability',
+        kind: 'specialist',
+        name: clip(name, 100),
+        phase,
+        ...(toolCallId ? { toolCallId } : {}),
+        detail:
+          phase === 'failed'
+            ? safe(data.error, 500)
+            : phase === 'completed' && data.cancelled === true
+              ? 'cancelado'
+              : null,
+      };
+    }
     default:
       return null;
   }

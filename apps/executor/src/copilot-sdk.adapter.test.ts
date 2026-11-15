@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SessionConfig } from '@github/copilot-sdk';
@@ -340,6 +340,221 @@ describe('Copilot interativo via SDK', () => {
     expect(result.summary).toBe('Atualizada');
   });
 
+  it('configura especialistas e skills nativos e recusa no hook o que nao foi fixado', async () => {
+    const directory = await workspace();
+    const store = new MemoryStore();
+    const conversation = new AgentRunConversation('run-cap', store, { flushMs: 5, pollMs: 5 });
+    const runAgent = (name: string) => ({
+      name,
+      displayName: name,
+      description: name,
+      profileId: '00000000-0000-4000-8000-000000000001',
+      version: 1,
+      definitionHash: 'a'.repeat(64),
+      prompt: `Missao ${name}`,
+      connectorTools: [],
+      model: null,
+    });
+    const decisions: unknown[] = [];
+    const { factory, seen } = fakeFactory([
+      async (config) => {
+        const hook = config.hooks!.onPreToolUse!;
+        const invocation = { sessionId: 's' };
+        const call = (toolName: string, toolArgs: unknown, toolCallId: string) =>
+          hook(
+            {
+              toolName,
+              toolArgs,
+              toolCallId,
+              timestamp: new Date(0),
+              sessionId: 's',
+            } as unknown as Parameters<typeof hook>[0],
+            invocation,
+          );
+        decisions.push(await call('skill', { skill: 'registos' }, 'c1'));
+        decisions.push(await call('skill', { skill: 'outra' }, 'c2'));
+        decisions.push(await call('task', { agent_type: 'intruso' }, 'c3'));
+        await report(directory, 'Feito');
+      },
+    ]);
+    conversation.start();
+    await new CopilotSdkAdapter(factory).execute({
+      ...base,
+      workspace: directory,
+      conversation,
+      capabilities: {
+        manifest: {
+          format: 1,
+          agent: runAgent('principal'),
+          skills: [
+            {
+              skillId: 's1',
+              versionId: 'v1',
+              version: 1,
+              name: 'registos',
+              description: 'd',
+              bundleHash: 'b'.repeat(64),
+              files: [],
+              requiredTools: [],
+            },
+          ],
+          delegates: [runAgent('leitor')],
+          delegation: { maxConcurrency: 1, maxDepth: 1 },
+        },
+        skillDirectory: join(directory, 'skills'),
+      },
+    });
+    await conversation.close();
+    expect(seen.config).toMatchObject({
+      agent: 'principal',
+      enableSkills: true,
+      skillDirectories: [join(directory, 'skills')],
+    });
+    expect(seen.config?.availableTools).toEqual(expect.arrayContaining(['skill', 'task']));
+    expect(seen.config?.customAgents?.map((custom) => custom.name)).toEqual([
+      'principal',
+      'leitor',
+    ]);
+    expect(decisions[0]).toBeUndefined();
+    expect(decisions[1]).toMatchObject({ permissionDecision: 'deny' });
+    expect(decisions[2]).toMatchObject({ permissionDecision: 'deny' });
+    expect(
+      store.events.filter((event) => event.type === 'permission' && event.decision === 'denied'),
+    ).toHaveLength(2);
+  });
+
+  it('regista ferramentas proprias de autoria, aprova so essas e recusa sem posse', async () => {
+    const directory = await workspace();
+    let active = true;
+    const calls: string[] = [];
+    const outcomes: unknown[] = [];
+    const { factory, seen } = fakeFactory([
+      async (config) => {
+        const tool = config.tools!.find((item) => item.name === 'flow_apply_operations')!;
+        const invocation = { toolCallId: 't1', sessionId: 's', toolName: tool.name, arguments: {} };
+        outcomes.push(await tool.handler!({ operations: [] }, invocation as never));
+        outcomes.push(
+          config.onPermissionRequest!(
+            { kind: 'custom-tool', toolName: 'flow_apply_operations' } as never,
+            { sessionId: 's' },
+          ),
+        );
+        outcomes.push(
+          config.onPermissionRequest!({ kind: 'custom-tool', toolName: 'outra' } as never, {
+            sessionId: 's',
+          }),
+        );
+        active = false;
+        outcomes.push(await tool.handler!({ operations: [] }, invocation as never));
+        await report(directory, 'Feito');
+      },
+    ]);
+    await new CopilotSdkAdapter(factory).execute({
+      ...base,
+      workspace: directory,
+      isActive: () => active,
+      tools: [
+        {
+          name: 'flow_apply_operations',
+          description: 'Aplica operações',
+          parameters: { type: 'object' },
+          async handler(_args, { toolCallId }) {
+            calls.push(toolCallId);
+            return { ok: false, text: 'Operação rejeitada' };
+          },
+        },
+      ],
+    });
+    expect(seen.config?.tools?.map((tool) => tool.name)).toEqual(['flow_apply_operations']);
+    expect(seen.config?.availableTools).toContain('flow_apply_operations');
+    expect(calls).toEqual(['t1']);
+    expect(outcomes[0]).toMatchObject({ resultType: 'failure' });
+    expect(outcomes[1]).toEqual({ kind: 'approve-once' });
+    expect(outcomes[2]).toMatchObject({ kind: 'reject' });
+    expect(outcomes[3]).toMatchObject({ resultType: 'denied' });
+  });
+
+  it('o transporte CLI recusa ferramentas proprias em vez de as ignorar', async () => {
+    const adapter = new CopilotCliAdapter({
+      async run() {
+        return { exitCode: 0, interrupted: false };
+      },
+    });
+    await expect(
+      adapter.execute({
+        ...base,
+        workspace: await workspace(),
+        tools: [
+          {
+            name: 'flow_get_draft',
+            description: 'x',
+            parameters: {},
+            handler: async () => ({ ok: true, text: '' }),
+          },
+        ],
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('com politica efetiva aprova o plano sem pedir nova aprovacao humana', async () => {
+    const directory = await workspace();
+    const store = new MemoryStore();
+    const conversation = new AgentRunConversation('run-4', store, { flushMs: 5, pollMs: 5 });
+    let plan: unknown;
+    const { factory } = fakeFactory([
+      async (config) => {
+        plan = await config.onExitPlanModeRequest!(
+          {
+            summary: 'Plano',
+            actions: ['autopilot', 'interactive'],
+            recommendedAction: 'autopilot',
+          },
+          { sessionId: 's' },
+        );
+        await report(directory, 'Feito');
+      },
+    ]);
+    conversation.start();
+    await new CopilotSdkAdapter(factory).execute({
+      ...base,
+      workspace: directory,
+      conversation,
+      planApproval: 'auto',
+    });
+    await conversation.close();
+    expect(plan).toEqual({ approved: true, selectedAction: 'autopilot' });
+    expect(store.events.some((event) => event.type === 'question')).toBe(false);
+  });
+
+  it('o timeout de uma pergunta de plano nunca equivale a aprovacao humana', async () => {
+    const directory = await workspace();
+    const store = new MemoryStore();
+    const conversation = new AgentRunConversation('run-5', store, {
+      flushMs: 5,
+      pollMs: 5,
+      questionTimeoutMs: 20,
+    });
+    let plan: { approved?: boolean } | undefined;
+    const { factory } = fakeFactory([
+      async (config) => {
+        plan = await config.onExitPlanModeRequest!(
+          { summary: 'Plano', actions: ['autopilot'], recommendedAction: 'autopilot' },
+          { sessionId: 's' },
+        );
+        await report(directory, 'Sem plano');
+      },
+    ]);
+    conversation.start();
+    await new CopilotSdkAdapter(factory).execute({
+      ...base,
+      workspace: directory,
+      conversation,
+      planApproval: 'human',
+    });
+    await conversation.close();
+    expect(plan?.approved).toBe(false);
+  });
+
   it('sem resposta da equipa o agente continua e o tempo de espera nao conta no timeout', async () => {
     const store = new MemoryStore();
     const conversation = new AgentRunConversation('run-3', store, {
@@ -481,6 +696,79 @@ describe('politica de permissoes e redacao', () => {
       policy.decide({ kind: 'mcp', serverName: 'db', toolName: 'w', readOnly: false }).approved,
     ).toBe(false);
     expect(policy.decide({ kind: 'url', url: 'https://example.com' }).approved).toBe(false);
+  });
+
+  it('autoriza apply_patch do relatorio, mas nega se algum ficheiro do patch nao for autorizado', () => {
+    const root = join(tmpdir(), 'ws');
+    const report = join(root, '.zeroops-result.json');
+    const edit = (path: string) => ({ after: { path, content: '{}' } });
+    expect(
+      policy.decide({ kind: 'write', fileName: report, fileEdits: [edit(report)] }).approved,
+    ).toBe(true);
+    expect(
+      policy.decide({
+        kind: 'write',
+        fileName: report,
+        fileEdits: [edit(report), edit(join(root, 'index.php'))],
+      }).approved,
+    ).toBe(false);
+    expect(
+      policy.decide({
+        kind: 'write',
+        fileName: report,
+        fileEdits: [{ before: { path: join(root, 'index.php'), content: 'x' } }],
+      }).approved,
+    ).toBe(false);
+    expect(policy.decide({ kind: 'write' }).approved).toBe(false);
+  });
+
+  it('resolve ligacoes simbolicas antes de autorizar leituras', async () => {
+    const root = await workspace();
+    const outside = await workspace();
+    await writeFile(join(outside, 'segredo.txt'), 'x');
+    await mkdir(join(root, 'dentro'));
+    await symlink(outside, join(root, 'atalho'), 'junction');
+    const local = new PermissionPolicy({ root, mode: 'investigate', shell: null });
+    expect(local.decide({ kind: 'read', path: join(root, 'dentro', 'a.txt') }).approved).toBe(true);
+    expect(local.decide({ kind: 'read', path: join(root, 'atalho', 'segredo.txt') }).approved).toBe(
+      false,
+    );
+    expect(
+      local.decide({ kind: 'write', fileName: join('atalho', '.zeroops-result.json') }).approved,
+    ).toBe(false);
+  });
+
+  it('em implementacao permite escrever no checkout, mas nunca nos metadados .git', () => {
+    const root = join(tmpdir(), 'ws');
+    const implement = new PermissionPolicy({ root, mode: 'implement', shell: null });
+    expect(implement.decide({ kind: 'write', fileName: join(root, 'app.js') }).approved).toBe(true);
+    expect(implement.decide({ kind: 'write', fileName: join(root, '.git') }).approved).toBe(false);
+    expect(
+      implement.decide({ kind: 'write', fileName: join(root, '.git', 'config') }).approved,
+    ).toBe(false);
+    expect(
+      implement.decide({ kind: 'write', fileName: join(root, '.github', 'ci.yml') }).approved,
+    ).toBe(true);
+  });
+
+  it('nega tudo quando a tentativa perde a posse do run', () => {
+    let active = true;
+    const fenced = new PermissionPolicy({
+      root: join(tmpdir(), 'ws'),
+      mode: 'investigate',
+      shell: { tool: 'bash', commands: ['zo-sql'] },
+      isActive: () => active,
+    });
+    const call = () =>
+      fenced.decide({
+        kind: 'shell',
+        fullCommandText: 'zo-sql',
+        commands: [{ identifier: 'zo-sql' }],
+      });
+    expect(call().approved).toBe(true);
+    active = false;
+    expect(call()).toMatchObject({ approved: false });
+    expect(fenced.decide({ kind: 'write', fileName: '.zeroops-result.json' }).approved).toBe(false);
   });
 
   it('remove segredos e ignora mensagens de subagentes', () => {

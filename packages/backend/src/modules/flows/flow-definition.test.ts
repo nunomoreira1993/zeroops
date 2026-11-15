@@ -3,13 +3,13 @@ import {
   applyFlowOperations,
   flowChangeKind,
   selectFlow,
-  simulateFlow,
   toBinaryFlow,
   validateFlowDefinition,
   type FlowCandidate,
   type FlowDefinition,
   type FlowMatch,
 } from '../../../../contracts/src/flows.js';
+import { simulateFlow } from '../../../../contracts/src/flow-transitions.js';
 import { healthFlowTemplate, maintenanceFlowTemplate } from './flow-templates.js';
 
 const anyMatch: FlowMatch = { origins: [], categories: [], environments: [], priorities: [] };

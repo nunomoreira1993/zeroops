@@ -51,6 +51,32 @@ export function investigationPrompt(
         ),
       ].join('\n\n')
     : '';
+  const capabilities = context.capabilities?.manifest;
+  const capabilitySection = capabilities
+    ? [
+        '## Skills e especialistas autorizados nesta etapa',
+        capabilities.skills.length
+          ? [
+              'Skills (carrega com a ferramenta `skill` apenas as relevantes para o pedido):',
+              ...capabilities.skills.map(
+                (skill) => `- ${skill.name} (v${skill.version}): ${skill.description}`,
+              ),
+            ].join('\n')
+          : '',
+        capabilities.delegates.length
+          ? [
+              `Especialistas (delegação com a ferramenta \`task\`, só leitura; máximo ${capabilities.delegation.maxConcurrency} em simultâneo; não podem delegar):`,
+              ...capabilities.delegates.map(
+                (delegate) =>
+                  `- ${delegate.name} — ${delegate.displayName} (v${delegate.version}): ${delegate.description}`,
+              ),
+            ].join('\n')
+          : '',
+        'As skills e os especialistas não concedem ferramentas, credenciais nem permissões além das desta etapa.',
+      ]
+        .filter(Boolean)
+        .join('\n\n')
+    : '';
   return [
     identity(context.project),
     'Investiga o pedido abaixo e prepara a informação para a equipa técnica decidir.',
@@ -66,6 +92,7 @@ export function investigationPrompt(
       ? `## Instruções do projeto\n\n${context.projectInstructions}`
       : '',
     profileSection,
+    capabilitySection,
     repositorySection,
     context.repositorySnapshotHash
       ? `Hash SHA-256 do snapshot de conteúdos técnicos carregados neste run (não é revisão nem commit SVN): ${context.repositorySnapshotHash}.`

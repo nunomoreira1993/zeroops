@@ -1,7 +1,21 @@
 import { z } from 'zod';
 import { repositoryResourceReferenceSchema } from './agent-profiles.js';
+import {
+  capabilityDelegateRefSchema,
+  capabilityDelegationSchema,
+  capabilitySkillRefSchema,
+} from './capabilities.js';
 import { alertRuleCatalog, alertRuleGroups } from './alert-rules.js';
+import { deliveryConfigIssues } from './delivery.js';
+import { developmentConfigIssues } from './development.js';
+import {
+  conditionBranches,
+  conditionConfigIssues,
+  FLOW_CONDITION_OTHERWISE,
+  FLOW_RESERVED_PORTS,
+} from './flow-conditions.js';
 import type { TicketIncidentView } from './incidents.js';
+import { flowRoutingPolicySchema, type FlowRoutingPolicy } from './flow-routing-policy.js';
 
 /**
  * Fluxos de resolução de tickets por projeto. A definição é partilhada pelo editor visual, pelo
@@ -9,8 +23,23 @@ import type { TicketIncidentView } from './incidents.js';
  * ligações (`edges`); `layout` guarda apenas a posição das etapas no ecrã.
  */
 
-export const flowOperationKeys = ['action', 'copilot_task', 'human_decision', 'end'] as const;
+export const flowOperationKeys = [
+  'action',
+  'copilot_task',
+  'human_decision',
+  'condition',
+  'end',
+] as const;
 export type FlowOperationKey = (typeof flowOperationKeys)[number];
+
+/**
+ * Versão do contrato da definição. V1 (ausente) mantém sucesso/erro por etapa; V2 acrescenta
+ * etapas `condition` declarativas e decisões com várias opções nomeadas.
+ */
+export const flowSchemaVersions = [1, 2] as const;
+export type FlowSchemaVersion = (typeof flowSchemaVersions)[number];
+/** Contratos de execução que este motor sabe executar (igual à versão do schema por agora). */
+export const SUPPORTED_FLOW_RUNTIME_CONTRACTS: readonly number[] = [1, 2];
 
 export const ticketOrigins = ['portal_client', 'portal_team', 'health', 'api'] as const;
 export type TicketOrigin = (typeof ticketOrigins)[number];
@@ -44,6 +73,11 @@ export const flowAgentProfileConfigSchema = z
     agentProfileId: z.uuid().optional(),
     agentProfileVersion: z.number().int().min(1).optional(),
     repositoryResources: z.array(repositoryResourceReferenceSchema).max(40).optional(),
+    /** Skills fixadas da etapa (P04); exigem um perfil de agente. */
+    skills: z.array(capabilitySkillRefSchema).max(12).optional(),
+    /** Especialistas delegáveis (outros perfis fixados) da etapa (P04). */
+    delegates: z.array(capabilityDelegateRefSchema).max(4).optional(),
+    delegation: capabilityDelegationSchema.optional(),
   })
   .superRefine((config, context) => {
     if ((config.agentProfileId === undefined) !== (config.agentProfileVersion === undefined))
@@ -51,8 +85,37 @@ export const flowAgentProfileConfigSchema = z
         code: 'custom',
         message: 'A referência ao perfil exige identificador e versão.',
       });
+    const usesCapabilities =
+      (config.skills?.length ?? 0) > 0 ||
+      (config.delegates?.length ?? 0) > 0 ||
+      config.delegation !== undefined;
+    if (usesCapabilities && config.agentProfileId === undefined)
+      context.addIssue({
+        code: 'custom',
+        message: 'Skills e especialistas exigem um perfil de agente na etapa.',
+      });
+    if (config.skills && new Set(config.skills.map((s) => s.skillId)).size !== config.skills.length)
+      context.addIssue({ code: 'custom', message: 'Skill repetida na etapa.' });
+    if (
+      config.delegates &&
+      new Set(config.delegates.map((d) => d.profileId)).size !== config.delegates.length
+    )
+      context.addIssue({ code: 'custom', message: 'Especialista repetido na etapa.' });
+    if (config.delegates?.some((d) => d.profileId === config.agentProfileId))
+      context.addIssue({
+        code: 'custom',
+        message: 'O perfil principal não pode ser também especialista delegado.',
+      });
   });
 export type FlowAgentProfileConfig = z.infer<typeof flowAgentProfileConfigSchema>;
+const FLOW_AGENT_PROFILE_CONFIG_KEYS = [
+  'agentProfileId',
+  'agentProfileVersion',
+  'repositoryResources',
+  'skills',
+  'delegates',
+  'delegation',
+] as const;
 
 export const flowNodeSchema = z.strictObject({
   id: idSchema,
@@ -78,15 +141,12 @@ export const flowNodeSchema = z.strictObject({
     .record(z.string(), z.unknown())
     .default({})
     .superRefine((config, context) => {
-      const subset = {
-        ...(config.agentProfileId !== undefined ? { agentProfileId: config.agentProfileId } : {}),
-        ...(config.agentProfileVersion !== undefined
-          ? { agentProfileVersion: config.agentProfileVersion }
-          : {}),
-        ...(config.repositoryResources !== undefined
-          ? { repositoryResources: config.repositoryResources }
-          : {}),
-      };
+      const subset = Object.fromEntries(
+        FLOW_AGENT_PROFILE_CONFIG_KEYS.filter((key) => config[key] !== undefined).map((key) => [
+          key,
+          config[key],
+        ]),
+      );
       const parsed = flowAgentProfileConfigSchema.safeParse(subset);
       if (!parsed.success)
         for (const issue of parsed.error.issues)
@@ -104,6 +164,7 @@ export const flowEdgeSchema = z.strictObject({
 export type FlowEdge = z.infer<typeof flowEdgeSchema>;
 
 export const flowDefinitionSchema = z.strictObject({
+  schemaVersion: z.union([z.literal(1), z.literal(2)]).optional(),
   start: idSchema,
   nodes: z.array(flowNodeSchema).min(1).max(60),
   edges: z.array(flowEdgeSchema).max(200),
@@ -152,6 +213,7 @@ const successResults = new Set([
   'resolve',
   'replied',
   'confirmed',
+  'published',
 ]);
 
 /** Saída (sucesso/erro) correspondente a um resultado detalhado ou a uma porta antiga. */
@@ -315,6 +377,31 @@ export const flowActionCatalog: Record<string, FlowActionDescriptor> = {
     },
     simulationPort: 'success',
   },
+  deliver: {
+    key: 'deliver',
+    label: { pt: 'Entrega por pipeline', en: 'Pipeline delivery' },
+    description: {
+      pt: 'Integra o commit revisto na branch de destino (revalidando-o sobre a base atual) e publica-o pela pipeline do projeto. Só avança com o review válido para esse commit; alterações materiais ou conflitos voltam ao desenvolvimento.',
+      en: 'Integrates the reviewed commit into the target branch (revalidating it on the current base) and releases it through the project pipeline. Only proceeds with a valid review for that commit; material changes or conflicts go back to development.',
+    },
+    ports: FLOW_PORTS,
+    results: ['published', 'blocked', 'conflict', 'rework', 'failed', 'uncertain', 'cancelled'],
+    fields: [
+      {
+        key: 'pipelineId',
+        label: { pt: 'Pipeline do projeto', en: 'Project pipeline' },
+        kind: 'text',
+        required: true,
+      },
+      {
+        key: 'reviewNode',
+        label: { pt: 'Etapa de review exigida', en: 'Required review step' },
+        kind: 'text',
+        required: true,
+      },
+    ],
+    simulationPort: 'success',
+  },
   incident_intake: {
     key: 'incident_intake',
     label: { pt: 'Receber alerta', en: 'Receive alert' },
@@ -364,7 +451,7 @@ export const flowActionCatalog: Record<string, FlowActionDescriptor> = {
       en: 'Runs the authorised action (restart service, reboot server or change parameter) through the audited channel, storing the previous value and how to roll back.',
     },
     ports: FLOW_PORTS,
-    results: ['done', 'no_action', 'failed', 'forbidden'],
+    results: ['done', 'no_action', 'failed', 'forbidden', 'uncertain'],
     fields: [],
     simulationPort: 'success',
   },
@@ -492,17 +579,14 @@ export function copilotStepModel(node: Pick<FlowNode, 'config'>): CopilotStepMod
 
 /** Perfil ZeroOps e recursos técnicos opcionais de uma etapa Copilot. */
 export function flowAgentProfileConfig(node: Pick<FlowNode, 'config'>): FlowAgentProfileConfig {
-  return flowAgentProfileConfigSchema.parse({
-    ...(node.config.agentProfileId !== undefined
-      ? { agentProfileId: node.config.agentProfileId }
-      : {}),
-    ...(node.config.agentProfileVersion !== undefined
-      ? { agentProfileVersion: node.config.agentProfileVersion }
-      : {}),
-    ...(node.config.repositoryResources !== undefined
-      ? { repositoryResources: node.config.repositoryResources }
-      : {}),
-  });
+  return flowAgentProfileConfigSchema.parse(
+    Object.fromEntries(
+      FLOW_AGENT_PROFILE_CONFIG_KEYS.filter((key) => node.config[key] !== undefined).map((key) => [
+        key,
+        node.config[key],
+      ]),
+    ),
+  );
 }
 
 export const copilotTaskModes = ['analysis', 'develop', 'report'] as const;
@@ -512,8 +596,25 @@ export const flowOperationLabels: Record<FlowOperationKey, FlowText> = {
   action: { pt: 'Executar ação', en: 'Run action' },
   copilot_task: { pt: 'Pedir trabalho ao Copilot', en: 'Ask Copilot' },
   human_decision: { pt: 'Decisão humana', en: 'Human decision' },
+  condition: { pt: 'Condição (V2)', en: 'Condition (V2)' },
   end: { pt: 'Terminar', en: 'Finish' },
 };
+
+/** Versão do schema de uma definição (ausente = V1). */
+export function flowSchemaVersion(
+  definition: Pick<FlowDefinition, 'schemaVersion'>,
+): FlowSchemaVersion {
+  return definition.schemaVersion === 2 ? 2 : 1;
+}
+
+/** Contrato de execução que o runtime tem de suportar para executar a definição. */
+export function flowRuntimeContractVersion(definition: Pick<FlowDefinition, 'schemaVersion'>) {
+  return flowSchemaVersion(definition);
+}
+
+export function flowRuntimeSupported(version: number) {
+  return SUPPORTED_FLOW_RUNTIME_CONTRACTS.includes(version);
+}
 
 export const flowPortLabels: Record<string, FlowText> = {
   success: { pt: 'sucesso', en: 'success' },
@@ -605,6 +706,11 @@ export function nodePorts(node: Pick<FlowNode, 'op' | 'config'>): string[] {
       return [...FLOW_PORTS];
     case 'human_decision':
       return decisionOptions(node).map((option) => option.port);
+    case 'condition':
+      return [
+        ...conditionBranches(node.config).map((branch) => branch.port),
+        FLOW_CONDITION_OTHERWISE,
+      ];
     case 'end':
       return [];
   }
@@ -619,6 +725,11 @@ export function portLabel(
   if (node?.op === 'human_decision') {
     const option = decisionOptions(node).find((item) => item.port === port);
     if (option) return option.label;
+  }
+  if (node?.op === 'condition') {
+    if (port === FLOW_CONDITION_OTHERWISE) return locale === 'en' ? 'otherwise' : 'caso contrário';
+    const branch = conditionBranches(node.config).find((item) => item.port === port);
+    if (branch) return branch.label ?? branch.port;
   }
   return flowPortLabels[port]?.[locale] ?? port;
 }
@@ -642,7 +753,11 @@ export interface FlowIssue {
  */
 export function validateFlowDefinition(
   input: unknown,
-  options: { members?: ReadonlySet<string> } = {},
+  options: {
+    members?: ReadonlySet<string>;
+    repositories?: ReadonlySet<string>;
+    pipelines?: ReadonlySet<string>;
+  } = {},
 ): FlowIssue[] {
   const parsed = flowDefinitionSchema.safeParse(input);
   if (!parsed.success)
@@ -656,6 +771,7 @@ export function validateFlowDefinition(
       },
     ];
   const definition = parsed.data;
+  const version = flowSchemaVersion(definition);
   const issues: FlowIssue[] = [];
   const nodes = new Map<string, FlowNode>();
   for (const node of definition.nodes) {
@@ -728,7 +844,8 @@ export function validateFlowDefinition(
             });
     }
     if (node.op === 'human_decision') {
-      if (!node.assignee)
+      // Num review de desenvolvimento quem decide são os revisores de config.review.
+      if (!node.assignee && node.config.review === undefined)
         issues.push({
           code: 'missing_assignee',
           message: `«${node.label}» não tem responsável.`,
@@ -748,6 +865,7 @@ export function validateFlowDefinition(
           ...at,
         });
       if (
+        version === 1 &&
         decisionPorts.length &&
         (decisionPorts.length !== 2 ||
           !decisionPorts.includes(FLOW_SUCCESS) ||
@@ -758,6 +876,36 @@ export function validateFlowDefinition(
           message: `«${node.label}» tem de ter exatamente duas opções: uma de sucesso e uma de erro.`,
           ...at,
         });
+      if (version === 2 && decisionPorts.length) {
+        if (decisionPorts.length < 2 || decisionPorts.length > 6)
+          issues.push({
+            code: 'invalid_options',
+            message: `«${node.label}» tem de ter entre duas e seis opções.`,
+            ...at,
+          });
+        if (decisionPorts.some((port) => (FLOW_RESERVED_PORTS as readonly string[]).includes(port)))
+          issues.push({
+            code: 'reserved_port',
+            message: `«${node.label}» usa uma opção com nome reservado.`,
+            ...at,
+          });
+        if (decisionOnlyWhen(node).length && !decisionPorts.includes(FLOW_SUCCESS))
+          issues.push({
+            code: 'invalid_options',
+            message: `«${node.label}» é condicional e precisa de uma opção de sucesso.`,
+            ...at,
+          });
+      }
+    }
+    if (node.op === 'condition') {
+      if (version === 1)
+        issues.push({
+          code: 'unsupported_operation',
+          message: `«${node.label}»: as condições exigem um fluxo V2.`,
+          ...at,
+        });
+      for (const message of conditionConfigIssues(node.config))
+        issues.push({ code: 'invalid_condition', message: `«${node.label}»: ${message}`, ...at });
     }
     if (
       node.assignee?.kind === 'user' &&
@@ -769,6 +917,10 @@ export function validateFlowDefinition(
         message: `O responsável de «${node.label}» não é membro ativo do projeto.`,
         ...at,
       });
+    for (const message of developmentConfigIssues(node, nodes, options))
+      issues.push({ code: 'invalid_development', message: `«${node.label}»: ${message}`, ...at });
+    for (const message of deliveryConfigIssues(node, nodes, options))
+      issues.push({ code: 'invalid_delivery', message: `«${node.label}»: ${message}`, ...at });
     for (const port of nodePorts(node))
       if (!outgoing.has(`${node.id}:${port}`))
         issues.push({
@@ -813,7 +965,12 @@ export function flowLogic(definition: FlowDefinition) {
   const edges = [...definition.edges]
     .sort((a, b) => `${a.source}:${a.port}`.localeCompare(`${b.source}:${b.port}`))
     .map((edge) => ({ source: edge.source, port: edge.port, target: edge.target }));
-  return JSON.stringify({ start: definition.start, nodes, edges });
+  // V1 mantém exatamente a serialização anterior (hashes de modelos e versões existentes).
+  return JSON.stringify(
+    definition.schemaVersion === 2
+      ? { schemaVersion: 2, start: definition.start, nodes, edges }
+      : { start: definition.start, nodes, edges },
+  );
 }
 
 function sortKeys(value: unknown): unknown {
@@ -1035,6 +1192,8 @@ export const flowSettingsSchema = z.strictObject({
   priority: z.number().int().min(1).max(999),
   isDefault: z.boolean(),
   match: flowMatchSchema,
+  /** Encaminhamento semântico (P05); ausente mantém a política atual do rascunho. */
+  routingPolicy: flowRoutingPolicySchema.optional(),
 });
 export type FlowSettings = z.infer<typeof flowSettingsSchema>;
 
@@ -1073,137 +1232,6 @@ export function maxVisits(node: Pick<FlowNode, 'config'>) {
   return Number.isInteger(value) && value >= 1 && value <= 50 ? value : DEFAULT_MAX_VISITS;
 }
 
-function defaultPort(node: FlowNode): string | null {
-  switch (node.op) {
-    case 'action':
-      return flowActionCatalog[actionKey(node)]?.simulationPort ?? null;
-    case 'copilot_task':
-      return FLOW_SUCCESS;
-    case 'human_decision':
-      return decisionOptions(node)[0]?.port ?? null;
-    case 'end':
-      return null;
-  }
-}
-
-function simulatedEffect(node: FlowNode): FlowText {
-  switch (node.op) {
-    case 'action': {
-      const descriptor = flowActionCatalog[actionKey(node)];
-      const name = descriptor?.label ?? { pt: 'Ação', en: 'Action' };
-      return {
-        pt: `${name.pt} — não executada na simulação.`,
-        en: `${name.en} — not executed in the simulation.`,
-      };
-    }
-    case 'copilot_task':
-      return {
-        pt: `Pedido ao Copilot (${copilotMode(node)}) — não enviado na simulação.`,
-        en: `Copilot request (${copilotMode(node)}) — not sent in the simulation.`,
-      };
-    case 'human_decision':
-      return { pt: 'Decisão humana simulada.', en: 'Simulated human decision.' };
-    case 'end':
-      return { pt: `Fim: ${endOutcome(node)}.`, en: `End: ${endOutcome(node)}.` };
-  }
-}
-
-/**
- * Percorre o fluxo sem efeitos. O cenário indica, por etapa, a porta a seguir em cada visita
- * (`wait` = fica à espera nessa visita); visitas além do cenário usam a porta por omissão.
- */
-export function simulateFlow(
-  definition: FlowDefinition,
-  scenario: FlowScenario = {},
-  limit = 80,
-): SimulationResult {
-  const nodes = new Map(definition.nodes.map((node) => [node.id, node]));
-  const visits = new Map<string, number>();
-  const steps: SimulatedStep[] = [];
-  let current = nodes.get(definition.start);
-  const stop = (
-    outcome: SimulationResult['outcome'],
-    node: FlowNode | undefined,
-    message: FlowText,
-  ): SimulationResult => ({
-    steps,
-    outcome,
-    stoppedAt: node
-      ? { nodeId: node.id, label: node.label, assignee: node.assignee ?? null }
-      : null,
-    endOutcome: outcome === 'ended' && node ? endOutcome(node) : null,
-    message,
-  });
-  while (current) {
-    if (steps.length >= limit)
-      return stop('loop_limit', current, {
-        pt: 'Simulação interrompida: demasiadas etapas.',
-        en: 'Simulation stopped: too many steps.',
-      });
-    const attempt = (visits.get(current.id) ?? 0) + 1;
-    visits.set(current.id, attempt);
-    if (attempt > maxVisits(current))
-      return stop('loop_limit', current, {
-        pt: `«${current.label}» excedeu ${maxVisits(current)} visitas: o motor bloqueia o pedido para revisão da equipa.`,
-        en: `«${current.label}» exceeded ${maxVisits(current)} visits: the engine blocks the ticket for team review.`,
-      });
-    const planned = scenario[current.id]?.[attempt - 1];
-    if (current.op === 'end') {
-      steps.push({
-        nodeId: current.id,
-        label: current.label,
-        op: current.op,
-        attempt,
-        port: null,
-        assignee: null,
-        effect: simulatedEffect(current),
-      });
-      return stop('ended', current, {
-        pt: `Pedido terminado (${endOutcome(current)}).`,
-        en: `Ticket finished (${endOutcome(current)}).`,
-      });
-    }
-    if (planned === 'wait') {
-      steps.push({
-        nodeId: current.id,
-        label: current.label,
-        op: current.op,
-        attempt,
-        port: null,
-        assignee: current.assignee ?? null,
-        effect: simulatedEffect(current),
-      });
-      return stop('waiting', current, {
-        pt: `O pedido fica em «${current.label}».`,
-        en: `The ticket stays at «${current.label}».`,
-      });
-    }
-    const port =
-      planned && nodePorts(current).includes(planned)
-        ? planned
-        : planned && nodePorts(current).includes(resultPort(planned))
-          ? resultPort(planned)
-          : defaultPort(current);
-    steps.push({
-      nodeId: current.id,
-      label: current.label,
-      op: current.op,
-      attempt,
-      port,
-      assignee: current.assignee ?? null,
-      effect: simulatedEffect(current),
-    });
-    const edge = definition.edges.find((item) => item.source === current!.id && item.port === port);
-    if (!edge)
-      return stop('invalid', current, {
-        pt: `A saída «${port ?? '—'}» de «${current.label}» não tem destino.`,
-        en: `Output «${port ?? '—'}» of «${current.label}» has no target.`,
-      });
-    current = nodes.get(edge.target);
-  }
-  return stop('invalid', undefined, { pt: 'Destino inexistente.', en: 'Missing target.' });
-}
-
 // ---------------------------------------------------------------------------------------------
 // Migração de fluxos antigos (várias saídas por etapa) para sucesso/erro.
 
@@ -1228,7 +1256,10 @@ export function toBinaryFlow(source: FlowDefinition): {
   changed: boolean;
 } {
   const definition: FlowDefinition = structuredClone(source);
-  if (definition.nodes.every((node) => isBinaryNode(node, definition.edges)))
+  if (
+    flowSchemaVersion(source) === 2 ||
+    definition.nodes.every((node) => isBinaryNode(node, definition.edges))
+  )
     return { definition: source, changed: false };
   const nodes = new Map(definition.nodes.map((node) => [node.id, node]));
   const originalEdges = definition.edges;
@@ -1360,17 +1391,41 @@ export interface FlowSummary {
   id: string;
   name: string;
   description: string;
+  /** Encaminhamento do rascunho (só entra em serviço com «Ativar esta versão»). */
   priority: number;
   isDefault: boolean;
   match: FlowMatch;
+  /** Política semântica do rascunho (P05). */
+  routingPolicy: FlowRoutingPolicy;
   template: string | null;
   draftVersion: number;
   draftChanged: boolean;
+  /** Versão ativa para novos tickets (nome mantido por compatibilidade da API). */
   published: { id: string; number: number; publishedAt: string; publishedBy: string | null } | null;
+  /** Encaminhamento em serviço (null se o fluxo nunca foi ativado). */
+  active: FlowActiveRouting | null;
+  /** O que mudou no rascunho em relação ao que está ativo. */
+  pendingChanges: FlowPendingChanges;
+  schemaVersion: FlowSchemaVersion;
   activeExecutions: number;
   updatedAt: string;
   /** Tipos de alerta da Saúde que abrem tickets neste fluxo (só entra por essa associação). */
   alertKeys: string[];
+  /** Alertas a associar quando o rascunho for ativado. */
+  pendingAlertKeys: string[];
+}
+
+export interface FlowActiveRouting {
+  priority: number;
+  isDefault: boolean;
+  match: FlowMatch;
+  routingPolicy: FlowRoutingPolicy | null;
+}
+
+export interface FlowPendingChanges {
+  definition: boolean;
+  routing: boolean;
+  alertKeys: boolean;
 }
 
 /**
@@ -1408,6 +1463,9 @@ export const healthAlertTypes: readonly HealthAlertType[] = [
 export interface HealthAlertFlowLink extends HealthAlertType {
   flowId: string | null;
   flowName: string | null;
+  /** Fluxo em rascunho que reclama este alerta quando for ativado. */
+  pendingFlowId: string | null;
+  pendingFlowName: string | null;
 }
 
 export const healthAlertFlowLinkSchema = z.strictObject({
@@ -1422,11 +1480,32 @@ export interface FlowVersionInfo {
   publishedAt: string;
   publishedBy: string | null;
   activeExecutions: number;
+  schemaVersion: FlowSchemaVersion;
+  runtimeContractVersion: number;
+  manifestHash: string | null;
+  /** Versão atualmente ativa para novos tickets. */
+  active: boolean;
+}
+
+export type FlowActivationKind = 'activation' | 'migration' | 'alert_link' | 'default_transfer';
+
+/** Registo imutável de quem pôs em serviço que versão (ou alterou uma associação de alerta). */
+export interface FlowActivationView {
+  id: string;
+  kind: FlowActivationKind;
+  versionId: string | null;
+  versionNumber: number | null;
+  previousVersionNumber: number | null;
+  manifestHash: string | null;
+  actor: string | null;
+  details: Record<string, unknown>;
+  createdAt: string;
 }
 
 export interface FlowDetail extends FlowSummary {
   draft: FlowDefinition;
   versions: FlowVersionInfo[];
+  activations: FlowActivationView[];
   issues: FlowIssue[];
   members: { id: string; displayName: string; role: string }[];
   copilotReady: boolean;
@@ -1464,6 +1543,8 @@ export interface FlowAssistantRequestView {
   errorCode: string | null;
   requestedBy: string;
   createdAt: string;
+  /** P06: modo de construção (null nos pedidos anteriores e nos do ticket). */
+  authoringMode: 'assisted' | 'auto' | null;
 }
 
 export interface FlowStepView {
@@ -1501,7 +1582,28 @@ export interface FlowStepOutput {
   external?: string | null;
   feedback?: string | null;
   errorCode?: string | null;
-  /** Evidência das etapas de incidente (decisão, intervenção, validação, e-mail). */
+  /** P08: artefacto Git produzido por uma etapa `develop` com repositório. */
+  development?: {
+    workspaceId: string;
+    branch: string;
+    baseSha: string;
+    headSha: string;
+    diffSha256: string;
+    scopeHash: string;
+    testsPassed: boolean;
+    files: number;
+  } | null;
+  /** P08: decisões de review registadas na etapa (aprovações parciais e invalidações). */
+  review?: { approvals: number; required: number; headSha: string } | null;
+  /** P09: entrega por pipeline (candidato, combinação integrada e artefacto publicado). */
+  delivery?: {
+    deliveryId: string;
+    state: string;
+    headSha: string;
+    integratedSha: string | null;
+    artifactDigest: string | null;
+    externalId: string | null;
+  } | null;
   incident?: {
     resource?: {
       kind: string;
@@ -1524,7 +1626,8 @@ export interface FlowStepOutput {
     newValue?: string | null;
     rollback?: string | null;
     criterion?: string | null;
-    measurements?: { at: string; ok: boolean; detail: string }[];
+    /** `unknown`: sem telemetria recente para o critério (nunca conta como recuperado). */
+    measurements?: { at: string; ok: boolean; unknown?: boolean; detail: string }[];
     attempts?: number;
     recipients?: string[];
     template?: string | null;
@@ -1563,6 +1666,8 @@ export interface TicketFlowView {
     options: FlowDecisionOption[];
     canAct: boolean;
     waitingFor: 'person' | 'copilot' | 'system';
+    /** P08: commit em revisão (só a equipa); a decisão envia-o como `artifactSha`. */
+    review?: { headSha: string | null; testsPassed: boolean } | null;
   } | null;
   /** Saídas possíveis a partir da etapa atual. */
   paths: { port: string; label: string; target: string; targetLabel: string }[];
@@ -1576,5 +1681,10 @@ export const flowDecisionInputSchema = z.strictObject({
   port: portSchema,
   comment: z.string().trim().max(8000).optional(),
   idempotencyKey: z.string().trim().min(8).max(80),
+  /** P08: commit revisto; obrigatório nas etapas com review (tem de ser o head atual). */
+  artifactSha: z
+    .string()
+    .regex(/^[a-f0-9]{40}$/)
+    .optional(),
 });
 export type FlowDecisionInput = z.infer<typeof flowDecisionInputSchema>;

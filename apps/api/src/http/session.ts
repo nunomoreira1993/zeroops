@@ -63,7 +63,8 @@ export function sessionMiddleware(
           path === '/api/monitoring/agent-config' ||
           path === '/api/monitoring/alertmanager' ||
           path === '/api/monitoring/remote-write' ||
-          path.startsWith('/api/relay/')) &&
+          path.startsWith('/api/relay/') ||
+          /^\/api\/pipelines\/[^/]+\/callbacks$/.test(path)) &&
         request.method === 'POST';
       if (tokenEndpoint) {
         const remoteWrite = path === '/api/monitoring/remote-write';
@@ -79,7 +80,13 @@ export function sessionMiddleware(
           )
           .digest('hex');
         // Relay (long-poll) e remote write (lotes a cada ~30s) têm mais pedidos que o agente/webhook.
-        const limit = path.startsWith('/api/relay/') ? 1200 : remoteWrite ? 600 : 120;
+        const limit = path.startsWith('/api/relay/')
+          ? 1200
+          : remoteWrite
+            ? 600
+            : path.startsWith('/api/pipelines/')
+              ? 300
+              : 120;
         // Com a BD em baixo o pedido segue para o serviço (fila em disco), limitado em memória.
         const count = await countIdentityRequest(db, key).catch((error: unknown) => {
           if (error instanceof DomainError) throw error;

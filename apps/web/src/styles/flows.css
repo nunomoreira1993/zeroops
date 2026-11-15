@@ -527,6 +527,23 @@
   color: #1e40af;
 }
 
+.flow-chip-active {
+  margin-left: 0.35rem;
+  background: #dcfce7;
+  color: #166534;
+}
+
+.flow-hash {
+  font-size: 0.75rem;
+  color: var(--muted-foreground, #52525b);
+}
+
+.flow-condition-branch {
+  padding: 0.6rem;
+  border: 1px solid var(--border, #e4e4e7);
+  border-radius: 0.5rem;
+}
+
 .flow-table {
   width: 100%;
   border-collapse: collapse;
@@ -546,6 +563,26 @@
 }
 
 /* Assistente */
+/* Capacidades em falta (P10): factos do processo e histórico persistido. */
+.flow-capability-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.flow-capability-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.flow-capability-history {
+  margin: 0.25rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.8rem;
+}
+
 .flow-assistant-history {
   display: grid;
   gap: 0.75rem;
@@ -581,6 +618,48 @@
   background: #fffbeb;
 }
 
+/* Construção por conversa (P06): progresso do turno e alterações aplicadas */
+.flow-authoring-progress {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0;
+  padding: 0 0 0 0.9rem;
+  font-size: 0.8rem;
+  color: var(--muted-foreground, #52525b);
+}
+
+.flow-authoring-progress .flow-authoring-operation_applied,
+.flow-authoring-progress .flow-authoring-proposal_accepted {
+  color: #166534;
+}
+
+.flow-authoring-progress .flow-authoring-operation_proposed {
+  color: #1e40af;
+}
+
+.flow-authoring-progress .flow-authoring-operation_rejected,
+.flow-authoring-progress .flow-authoring-operation_conflict,
+.flow-authoring-progress .flow-authoring-turn_failed,
+.flow-authoring-progress .flow-authoring-capability_missing {
+  color: #92400e;
+}
+
+.flow-authoring-operations {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.82rem;
+}
+
+.flow-authoring-operations > li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
 /* Simulação */
 .flow-simulation-result {
   display: grid;
@@ -597,6 +676,71 @@
   margin: 0;
   padding-left: 1.25rem;
   font-size: 0.85rem;
+}
+
+/* Simulador partilhado (P07): execuções, veredicto, desatualização */
+.flow-sim-runs {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.flow-sim-run {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: transparent;
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.flow-sim-runs .is-selected .flow-sim-run {
+  border-color: var(--primary, #2563eb);
+  background: var(--accent-soft);
+}
+
+.flow-sim-run .flow-chip {
+  margin-left: 0.25rem;
+}
+
+.flow-sim-verdict-passed {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.flow-sim-verdict-failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.flow-sim-stale {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.flow-sim-routing {
+  font-size: 0.85rem;
+}
+
+.flow-radio {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  font-size: 0.85rem;
+}
+
+.flow-json {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
 }
 
 /* Acompanhamento no pedido */
@@ -739,4 +883,57 @@
     grid-template-columns: 1fr;
     gap: 0;
   }
+}
+
+/* P08 — desenvolvimento e review */
+.development-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.development-header h2,
+.development-header h3 {
+  margin: 0;
+}
+.development-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 0;
+}
+.development-facts dt {
+  font-weight: 600;
+}
+.development-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.development-files,
+.development-tests {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+.development-file-A,
+.development-pass {
+  color: #15803d;
+  font-weight: 600;
+}
+.development-file-D,
+.development-fail {
+  color: #b91c1c;
+  font-weight: 600;
+}
+.development-file-M,
+.development-file-R,
+.development-file-T {
+  color: #b45309;
+  font-weight: 600;
+}
+.development-invalidated {
+  text-decoration: line-through;
+  opacity: 0.7;
 }

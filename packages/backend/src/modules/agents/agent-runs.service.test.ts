@@ -136,8 +136,8 @@ describe('AgentRunsService', () => {
     expect(context?.runId).toBe(run.id);
     expect(context?.ticket.key).toBe(ticket.key);
     expect(context?.conversation.map((message) => message.body)).toContain('Informação adicional.');
-    await runs.reportProgress(run.id, 'A consultar');
-    await runs.complete(run.id, {
+    await runs.reportProgress(context!.lease, 'A consultar');
+    await runs.complete(context!.lease, {
       summary: 'Encomenda confirmada.',
       replyDraft: 'Bom dia, confirmámos a encomenda.',
       evidence: [{ source: 'BD do site', detail: 'Encomenda paga.' }],
@@ -162,22 +162,27 @@ describe('AgentRunsService', () => {
     const { technical, ticket } = await scenario();
     await fixture.db.query("UPDATE agent_runs SET status='cancelled' WHERE status='queued'");
     const run = await runs.request(technical, ticket.id, {});
-    await runs.claimNext();
+    const claimed = await runs.claimNext();
     expect(await runs.cancel(technical, ticket.id, run.id)).toMatchObject({
       status: 'running',
       cancelRequested: true,
     });
     expect(await runs.isCancelRequested(run.id)).toBe(true);
-    await runs.fail(run.id, 'cancelled');
+    await runs.fail(claimed!.lease, 'cancelled');
     expect((await runs.list(technical, ticket.id))[0]?.status).toBe('cancelled');
     const second = await runs.request(technical, ticket.id, {});
     await runs.claimNext();
-    expect(await runs.failInterrupted()).toBe(1);
+    // Lease expirado no m?ximo de tentativas: a recupera??o falha o run (n?o o repete).
+    await fixture.db.query(
+      'UPDATE agent_runs SET lease_until=DATE_SUB(NOW(3),INTERVAL 1 SECOND) WHERE id=$1',
+      [second.id],
+    );
+    expect(await runs.recoverExpired(1)).toMatchObject({ failed: 1, requeued: 0 });
     const [last] = await runs.list(technical, ticket.id);
     expect(last).toMatchObject({
       id: second.id,
       status: 'failed',
-      errorCode: 'executor_interrupted',
+      errorCode: 'lease_expired',
     });
   });
 
@@ -220,7 +225,7 @@ describe('AgentRunsService', () => {
     expect(run).toMatchObject({ model: 'gpt-5', reasoningEffort: 'high' });
     const context = await runs.claimNext();
     expect(context).toMatchObject({ runId: run.id, model: 'gpt-5', reasoningEffort: 'high' });
-    await runs.complete(run.id, { summary: 'Feito.', replyDraft: null, evidence: [] });
+    await runs.complete(context!.lease, { summary: 'Feito.', replyDraft: null, evidence: [] });
     const detail = await tickets.detail(technical, ticket.id);
     expect(detail.comments.find((comment) => comment.agentRunId === run.id)).toBeDefined();
   });
@@ -229,7 +234,7 @@ describe('AgentRunsService', () => {
     async function runWithQuestions(ticketId: string, questions: string[]) {
       const context = await runs.claimNext();
       expect(context).not.toBeNull();
-      await runs.complete(context!.runId, {
+      await runs.complete(context!.lease, {
         summary: 'Falta o número da encomenda.',
         replyDraft: null,
         evidence: [],

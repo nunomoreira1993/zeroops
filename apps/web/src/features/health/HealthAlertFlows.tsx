@@ -99,6 +99,17 @@ export function HealthCheckFlowAction({
     >
       {t('Editar fluxo', 'Edit flow')}
     </a>
+  ) : association?.pendingFlowId ? (
+    <a
+      className="button button-secondary"
+      href={`#flows/${encodeURIComponent(association.pendingFlowId)}`}
+      title={t(
+        'O alerta só passa a usar este fluxo quando a versão for ativada.',
+        'The alert only uses this flow once its version is activated.',
+      )}
+    >
+      {t('Rascunho por ativar', 'Draft pending activation')}
+    </a>
   ) : (
     <button
       type="button"

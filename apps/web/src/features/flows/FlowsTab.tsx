@@ -3,7 +3,7 @@ import type { FlowDetail, FlowSummary } from '@zeroops/contracts';
 import { EmptyState, Loading, Notice, ResourceError } from '../../components/ui';
 import { useMutation, useResource } from '../../lib/hooks';
 import { useIdentityLocale } from '../../lib/identity';
-import { useProjectSession } from '../../lib/project-admin';
+import { useProjectPermission, useProjectSession } from '../../lib/project-admin';
 import { FlowEditor } from './FlowEditor';
 import { originLabels } from './flow-labels';
 
@@ -39,6 +39,7 @@ function FlowList({ onOpen }: { onOpen: (id: string) => void }) {
   const { locale, t } = useIdentityLocale();
   const lang: 'pt' | 'en' = locale === 'en' ? 'en' : 'pt';
   const { request } = useProjectSession();
+  const canEdit = useProjectPermission('flows.edit');
   const flows = useResource<FlowSummary[]>('/flows');
   const [name, setName] = useState('');
   const [template, setTemplate] = useState<(typeof templates)[number]['id']>('blank');
@@ -46,26 +47,35 @@ function FlowList({ onOpen }: { onOpen: (id: string) => void }) {
   if (flows.loading) return <Loading label={t('A carregar fluxos…', 'Loading flows…')} />;
   if (flows.error) return <ResourceError error={flows.error} retry={flows.reload} />;
   const list = [...(flows.data ?? [])].sort(
-    (a, b) => Number(b.isDefault) - Number(a.isDefault) || a.priority - b.priority,
+    (a, b) =>
+      Number(Boolean(b.active?.isDefault)) - Number(Boolean(a.active?.isDefault)) ||
+      (a.active?.priority ?? a.priority) - (b.active?.priority ?? b.priority),
   );
   const rule = (flow: FlowSummary) => {
-    if (flow.isDefault) return t('Por omissão (sem outra regra)', 'Default (no other rule)');
+    const routing = flow.active ?? flow;
+    if (routing.isDefault) return t('Por omissão (sem outra regra)', 'Default (no other rule)');
     const parts = [
-      ...flow.match.origins.map((origin) => originLabels[origin]?.[lang] ?? origin),
-      ...flow.match.categories,
-      ...flow.match.environments,
-      ...flow.match.priorities,
+      ...routing.match.origins.map((origin) => originLabels[origin]?.[lang] ?? origin),
+      ...routing.match.categories,
+      ...routing.match.environments,
+      ...routing.match.priorities,
     ];
-    return parts.length ? parts.join(', ') : t('Qualquer ticket', 'Any ticket');
+    const semantic = flow.active
+      ? flow.active.routingPolicy?.instructions
+      : flow.routingPolicy.instructions;
+    const base = parts.length ? parts.join(', ') : t('Qualquer ticket', 'Any ticket');
+    return semantic ? `${base} · ${t('semântico', 'semantic')}` : base;
   };
+  const pending = (flow: FlowSummary) =>
+    flow.pendingChanges.definition || flow.pendingChanges.routing || flow.pendingChanges.alertKeys;
   return (
     <div className="stack flows-list">
       <section className="panel stack">
         <h2>{t('Fluxos de resolução', 'Resolution flows')}</h2>
         <p className="muted">
           {t(
-            'Cada ticket novo entra no fluxo publicado cuja regra coincide (menor prioridade primeiro) ou no fluxo por omissão, e fica associado a essa versão até terminar.',
-            'Each new ticket enters the published flow whose rule matches (lowest priority first) or the default flow, and stays on that version until it ends.',
+            'Cada ticket novo entra no fluxo ativo cuja regra coincide (menor prioridade primeiro) ou no fluxo por omissão, e fica associado a essa versão até terminar. Alterações ao rascunho só entram em serviço com «Ativar esta versão».',
+            'Each new ticket enters the active flow whose rule matches (lowest priority first) or the default flow, and stays on that version until it ends. Draft changes only apply after «Activate this version».',
           )}
         </p>
         {list.length ? (
@@ -75,7 +85,7 @@ function FlowList({ onOpen }: { onOpen: (id: string) => void }) {
                 <th>{t('Fluxo', 'Flow')}</th>
                 <th>{t('Aplica-se a', 'Applies to')}</th>
                 <th>{t('Prioridade', 'Priority')}</th>
-                <th>{t('Versão publicada', 'Published version')}</th>
+                <th>{t('Versão ativa', 'Active version')}</th>
                 <th>{t('Tickets em curso', 'Tickets in progress')}</th>
               </tr>
             </thead>
@@ -86,9 +96,9 @@ function FlowList({ onOpen }: { onOpen: (id: string) => void }) {
                     <button type="button" className="link-button" onClick={() => onOpen(flow.id)}>
                       {flow.name}
                     </button>
-                    {flow.draftChanged && (
+                    {pending(flow) && (
                       <span className="flow-chip">
-                        {t('rascunho por publicar', 'unpublished draft')}
+                        {t('alterações por ativar', 'changes pending activation')}
                       </span>
                     )}
                   </td>
@@ -100,8 +110,12 @@ function FlowList({ onOpen }: { onOpen: (id: string) => void }) {
                         )
                       : rule(flow)}
                   </td>
-                  <td>{flow.isDefault ? '—' : flow.priority}</td>
-                  <td>{flow.published ? `v${flow.published.number}` : t('nenhuma', 'none')}</td>
+                  <td>{(flow.active ?? flow).isDefault ? '—' : (flow.active ?? flow).priority}</td>
+                  <td>
+                    {flow.published && flow.active
+                      ? `v${flow.published.number}`
+                      : t('nenhuma', 'none')}
+                  </td>
                   <td>{flow.activeExecutions}</td>
                 </tr>
               ))}
@@ -113,48 +127,50 @@ function FlowList({ onOpen }: { onOpen: (id: string) => void }) {
           </EmptyState>
         )}
       </section>
-      <form
-        className="panel stack"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void mutation.run(async () => {
-            const created = await request<FlowDetail>('/flows', {
-              method: 'POST',
-              body: { name: name.trim(), template },
+      {canEdit && (
+        <form
+          className="panel stack"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void mutation.run(async () => {
+              const created = await request<FlowDetail>('/flows', {
+                method: 'POST',
+                body: { name: name.trim(), template },
+              });
+              onOpen(created.id);
             });
-            onOpen(created.id);
-          });
-        }}
-      >
-        <h3>{t('Novo fluxo', 'New flow')}</h3>
-        <label>
-          {t('Nome', 'Name')}
-          <input
-            value={name}
-            minLength={2}
-            maxLength={80}
-            required
-            onChange={(event) => setName(event.target.value)}
-          />
-        </label>
-        <label>
-          {t('Começar a partir de', 'Start from')}
-          <select
-            value={template}
-            onChange={(event) => setTemplate(event.target.value as typeof template)}
-          >
-            {templates.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item[lang]}
-              </option>
-            ))}
-          </select>
-        </label>
-        {mutation.error && <Notice>{mutation.error}</Notice>}
-        <button className="button button-primary align-start" disabled={mutation.busy}>
-          {t('Criar fluxo', 'Create flow')}
-        </button>
-      </form>
+          }}
+        >
+          <h3>{t('Novo fluxo', 'New flow')}</h3>
+          <label>
+            {t('Nome', 'Name')}
+            <input
+              value={name}
+              minLength={2}
+              maxLength={80}
+              required
+              onChange={(event) => setName(event.target.value)}
+            />
+          </label>
+          <label>
+            {t('Começar a partir de', 'Start from')}
+            <select
+              value={template}
+              onChange={(event) => setTemplate(event.target.value as typeof template)}
+            >
+              {templates.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item[lang]}
+                </option>
+              ))}
+            </select>
+          </label>
+          {mutation.error && <Notice>{mutation.error}</Notice>}
+          <button className="button button-primary align-start" disabled={mutation.busy}>
+            {t('Criar fluxo', 'Create flow')}
+          </button>
+        </form>
+      )}
     </div>
   );
 }

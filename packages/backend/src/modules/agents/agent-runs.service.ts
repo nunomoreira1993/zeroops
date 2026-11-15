@@ -27,12 +27,33 @@ import { pendingQuestions, runUsage } from './agent-run-events.service.js';
 import { currentAgentInstructions } from './agent-instructions.service.js';
 import { publishClientQuestions } from './agent-client-channel.js';
 import { AgentModelsService } from './agent-models.service.js';
+import { skillVersionFiles } from './capability-catalog.js';
+import type { CapabilityRunManifest } from '../../../../contracts/src/capabilities.js';
+import {
+  DEFAULT_MAX_ATTEMPTS,
+  LOCAL_WORKER,
+  OWNED_BY,
+  recordJobEvent,
+  validateWorker,
+  type FencedOutcome,
+  type HeartbeatState,
+  type JobEventType,
+  type JobLease,
+  type WorkerIdentity,
+} from './job-leases.js';
 
 export type { AgentEvidence, AgentRun, AgentRunStatus, AgentToolCall };
+
+/** Limite inicial conservador de runs simultâneos por projeto (todos os executores). */
+export const DEFAULT_PROJECT_RUN_LIMIT = 2;
 
 /** Contexto genérico entregue ao agente: o pedido e a conversa, sem lógica por tipo de ticket. */
 export interface InvestigationContext {
   runId: string;
+  /** Posse da tentativa: todas as escritas do executor apresentam este lease. */
+  lease: JobLease;
+  /** Número da tentativa (1 na primeira execução, >1 após recuperação de um lease expirado). */
+  attempt: number;
   /** `implement`: o Copilot propõe uma alteração (diff) sem a publicar. */
   mode: 'investigate' | 'implement';
   /** Projeto do ticket; define as integrações (conectores, Copilot) usadas no run. */
@@ -60,7 +81,17 @@ export interface InvestigationContext {
   repositorySnapshotHash?: string | null;
   repositoryResources?: RepositoryResourceSnapshot[];
   allowedTools?: string[] | null;
+  /**
+   * Skills e especialistas fixados no run (P04) e o conteúdo das versões de skill; o executor
+   * verifica os hashes antes de os materializar. `null`/ausente em runs sem capacidades.
+   */
+  capabilities?: {
+    manifest: CapabilityRunManifest;
+    files: Record<string, { path: string; content: string; sha256: string }[]>;
+  } | null;
   effectiveTools?: string[] | null;
+  /** Workspace Git persistente (etapa de desenvolvimento com repositório, P08). */
+  developmentWorkspaceId?: string | null;
   /** Instruções do projeto (ambientes, fontes, regras), editáveis em Integrações > Agente. */
   projectInstructions: string;
   conversation: {
@@ -111,8 +142,11 @@ interface AgentRunRow {
   repository_snapshot_hash: string | null;
   repository_resources: RepositoryResourceSnapshot[] | null;
   allowed_tools: string[] | null;
+  capability_manifest?: CapabilityRunManifest | null;
+  capability_manifest_hash?: string | null;
   effective_tools: string[] | null;
   effective_model: string | null;
+  attempt?: number | null;
   created_at: Date;
   started_at: Date | null;
   finished_at: Date | null;
@@ -189,8 +223,25 @@ function toRun(
       }),
     ),
     allowedTools: row.allowed_tools ?? null,
+    capabilities: row.capability_manifest
+      ? {
+          manifestHash: row.capability_manifest_hash ?? null,
+          skills: row.capability_manifest.skills.map(({ name, version, bundleHash }) => ({
+            name,
+            version,
+            bundleHash,
+          })),
+          specialists: row.capability_manifest.delegates.map(({ name, displayName, version }) => ({
+            name,
+            displayName,
+            version,
+          })),
+          maxConcurrency: row.capability_manifest.delegation.maxConcurrency,
+        }
+      : null,
     effectiveTools: row.effective_tools ?? null,
     effectiveModel: row.effective_model ?? null,
+    attempt: Number(row.attempt ?? 0),
     requestedBy: {
       id: row.requested_by,
       displayName: row.requester_name,
@@ -232,6 +283,16 @@ export interface FinishedRun {
   project_id: string;
   run_trigger: AgentRunTrigger;
 }
+
+type RunningRow = FinishedRun & {
+  requested_by: string;
+  cancel_requested: boolean;
+  client_questions_allowed: boolean;
+  flow_step_id?: string | null;
+  worker_id?: string | null;
+  lease_epoch?: number;
+  attempt?: number;
+};
 
 /** Reação ao fim de um run, na mesma transação (ex.: fecho do incidente da Saúde). */
 export type RunFinishedHook = (
@@ -380,8 +441,15 @@ export class AgentRunsService {
       const member = await requireTeam(client, actor);
       const ticket = await findTicket(client, actor, ticketId);
       const run = (
-        await client.query<FinishedRun & { status: AgentRunStatus }>(
-          'SELECT id,ticket_id,project_id,run_trigger,status FROM agent_runs WHERE id=$1 AND ticket_id=$2 FOR UPDATE',
+        await client.query<
+          FinishedRun & {
+            status: AgentRunStatus;
+            worker_id: string | null;
+            lease_epoch: number;
+            attempt: number;
+          }
+        >(
+          'SELECT id,ticket_id,project_id,run_trigger,status,worker_id,lease_epoch,attempt FROM agent_runs WHERE id=$1 AND ticket_id=$2 FOR UPDATE',
           [runId, ticket.id],
         )
       ).rows[0];
@@ -392,45 +460,110 @@ export class AgentRunsService {
           [runId],
         );
         await this.notifyFinished(client, run, 'cancelled');
-      } else if (run.status === 'running')
+      } else if (run.status === 'running') {
         await client.query('UPDATE agent_runs SET cancel_requested=1 WHERE id=$1', [runId]);
-      else throw new DomainError('AGENT_RUN_FINISHED', 'A execução já terminou.', 409);
+        await this.event(client, run, 'cancel_requested', { actorId: member.id });
+      } else throw new DomainError('AGENT_RUN_FINISHED', 'A execução já terminou.', 409);
       await audit(client, member.id, ticket.id, 'agent.run_cancel_requested', { runId });
       return this.find(client, runId);
     });
   }
 
-  /** Reclama o run mais antigo em fila. Um único executor ativo por instância (sem SKIP LOCKED). */
-  async claimNext(): Promise<InvestigationContext | null> {
+  /**
+   * Reclama atomicamente o run mais antigo em fila para `worker`. O claim só é aceite se o run
+   * continuar `queued` no `UPDATE` (dois executores nunca recebem a mesma tentativa), respeita a
+   * manutenção do projeto e o limite de runs simultâneos por projeto, e incrementa a época do lease.
+   * Não usa `SKIP LOCKED` (MariaDB 10.3); os candidatos são lidos sem bloqueio e confirmados no `UPDATE`.
+   */
+  async claimNext(
+    worker: WorkerIdentity = LOCAL_WORKER,
+    limits: { perProject?: number } = {},
+  ): Promise<InvestigationContext | null> {
+    validateWorker(worker);
+    const perProject = Math.max(1, limits.perProject ?? DEFAULT_PROJECT_RUN_LIMIT);
+    const candidates = await this.db.query<{ id: string; project_id: string }>(
+      `SELECT r.id, r.project_id FROM agent_runs r
+       WHERE r.status='queued'
+         AND NOT EXISTS(SELECT 1 FROM ticket_purge_maintenance p WHERE p.project_id=r.project_id AND p.lease_until>NOW(3))
+         AND (SELECT COUNT(*) FROM agent_runs c WHERE c.project_id=r.project_id AND c.status='running') < $1
+       ORDER BY r.created_at LIMIT 10`,
+      [perProject],
+    );
+    for (const candidate of candidates.rows) {
+      const context = await this.tryClaim(candidate, worker, perProject);
+      if (context) return context;
+    }
+    return null;
+  }
+
+  private async tryClaim(
+    candidate: { id: string; project_id: string },
+    worker: WorkerIdentity,
+    perProject: number,
+  ): Promise<InvestigationContext | null> {
     return this.db.transaction(async (client) => {
+      // Mesma ordem de bloqueio que a suspensão da Saúde (projeto antes dos runs).
+      await client.query('SELECT id FROM projects WHERE id=$1 FOR UPDATE', [candidate.project_id]);
+      if (await ticketWorkPaused(client, candidate.project_id)) return null;
+      const running = await client.query<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM agent_runs WHERE project_id=$1 AND status='running' LOCK IN SHARE MODE",
+        [candidate.project_id],
+      );
+      if (Number(running.rows[0]?.total ?? 0) >= perProject) return null;
+      const connectorToken = randomBytes(32).toString('base64url');
+      const claimed = await client.query(
+        `UPDATE agent_runs SET status='running', worker_id=$2, lease_epoch=lease_epoch+1,
+           attempt=attempt+1, lease_until=TIMESTAMPADD(SECOND,$3,NOW(3)), heartbeat_at=NOW(3),
+           started_at=COALESCE(started_at,NOW(3)), progress='A preparar contexto',
+           connector_token_hash=$4
+         WHERE id=$1 AND status='queued'`,
+        [candidate.id, worker.workerId, worker.leaseSeconds, connectorTokenHash(connectorToken)],
+      );
+      if (!claimed.rowCount) return null;
       const run = (
         await client.query<{
           id: string;
           ticket_id: string;
           project_id: string;
+          flow_step_id: string | null;
+          lease_epoch: number;
+          attempt: number;
           instructions: string | null;
           model: string | null;
           reasoning_effort: string | null;
           execution_mode: AgentExecutionMode;
           fusion_tier: AgentFusionTier | null;
           mode: 'investigate' | 'implement';
-          agent_profile_id: string | null;
-          agent_profile_version: number | null;
           agent_profile_snapshot: AgentProfileRunSnapshot | null;
           repository_snapshot_hash: string | null;
           repository_resources: RepositoryResourceSnapshot[] | null;
           allowed_tools: string[] | null;
+          capability_manifest: CapabilityRunManifest | null;
+          development_workspace_id: string | null;
         }>(
-          "SELECT id,ticket_id,project_id,instructions,model,reasoning_effort,execution_mode,fusion_tier,mode,agent_profile_id,agent_profile_version,agent_profile_snapshot,repository_snapshot_hash,repository_resources,allowed_tools FROM agent_runs WHERE status='queued' AND NOT EXISTS(SELECT 1 FROM ticket_purge_maintenance p WHERE p.project_id=agent_runs.project_id AND p.lease_until>NOW(3)) ORDER BY created_at LIMIT 1 FOR UPDATE",
+          'SELECT id,ticket_id,project_id,flow_step_id,lease_epoch,attempt,instructions,model,reasoning_effort,execution_mode,fusion_tier,mode,agent_profile_snapshot,repository_snapshot_hash,repository_resources,allowed_tools,capability_manifest,development_workspace_id FROM agent_runs WHERE id=$1',
+          [candidate.id],
         )
       ).rows[0];
-      if (!run) return null;
-      if (await ticketWorkPaused(client, run.project_id)) return null;
-      const connectorToken = randomBytes(32).toString('base64url');
-      await client.query(
-        "UPDATE agent_runs SET status='running', started_at=NOW(3), progress='A preparar contexto', connector_token_hash=$2 WHERE id=$1",
-        [run.id, connectorTokenHash(connectorToken)],
-      );
+      if (!run) throw new Error('Run reclamado inexistente.');
+      const lease: JobLease = {
+        jobId: run.id,
+        workerId: worker.workerId,
+        epoch: Number(run.lease_epoch),
+        leaseSeconds: worker.leaseSeconds,
+      };
+      await recordJobEvent(client, {
+        kind: 'agent_run',
+        jobId: run.id,
+        projectId: run.project_id,
+        ticketId: run.ticket_id,
+        flowStepId: run.flow_step_id,
+        attempt: Number(run.attempt),
+        epoch: lease.epoch,
+        workerId: worker.workerId,
+        type: 'claimed',
+        details: { leaseSeconds: worker.leaseSeconds },
+      });
       const ticket = (
         await client.query<InvestigationContext['ticket']>(
           'SELECT `key`,title,description,category,environment,priority,status FROM tickets WHERE id=$1',
@@ -463,6 +596,8 @@ export class AgentRunsService {
       );
       return {
         runId: run.id,
+        lease,
+        attempt: Number(run.attempt),
         mode: run.mode === 'implement' ? 'implement' : 'investigate',
         projectId: run.project_id,
         connectorToken,
@@ -477,6 +612,19 @@ export class AgentRunsService {
         repositorySnapshotHash: run.repository_snapshot_hash ?? null,
         repositoryResources: run.repository_resources ?? [],
         allowedTools: run.allowed_tools ?? null,
+        developmentWorkspaceId: run.development_workspace_id ?? null,
+        capabilities: run.capability_manifest
+          ? {
+              manifest: run.capability_manifest,
+              files: Object.fromEntries(
+                await skillVersionFiles(
+                  client,
+                  run.project_id,
+                  run.capability_manifest.skills.map((skill) => skill.versionId),
+                ),
+              ),
+            }
+          : null,
         projectInstructions: await currentAgentInstructions(client, run.project_id),
         conversation: comments.rows.map((row) => ({
           author: row.author,
@@ -490,20 +638,51 @@ export class AgentRunsService {
     });
   }
 
-  /** Atualiza o progresso visível do run, limitado para evitar payloads extensos. */
-  async reportProgress(runId: string, progress: string) {
-    await this.db.query("UPDATE agent_runs SET progress=$2 WHERE id=$1 AND status='running'", [
-      runId,
+  /**
+   * Renova o lease da tentativa. Devolve `owned=false` se a posse se perdeu (lease expirado,
+   * recuperado por outro executor ou run terminado): o executor tem de parar sem novos efeitos.
+   */
+  async heartbeat(lease: JobLease): Promise<HeartbeatState> {
+    const renewed = await this.db.query(
+      `UPDATE agent_runs SET lease_until=TIMESTAMPADD(SECOND,$4,NOW(3)), heartbeat_at=NOW(3)
+       WHERE ${OWNED_BY()}`,
+      [lease.jobId, lease.workerId, lease.epoch, lease.leaseSeconds],
+    );
+    if (!renewed.rowCount) {
+      await this.rejectStale(this.db, lease, 'lease_lost');
+      return { owned: false, cancelRequested: true };
+    }
+    return { owned: true, cancelRequested: await this.isCancelRequested(lease.jobId) };
+  }
+
+  /** Indica se a tentativa ainda detém um lease válido (usado antes de efeitos externos). */
+  async ownsLease(lease: JobLease) {
+    const result = await this.db.query(`SELECT id FROM agent_runs WHERE ${OWNED_BY()}`, [
+      lease.jobId,
+      lease.workerId,
+      lease.epoch,
+    ]);
+    return Boolean(result.rowCount);
+  }
+
+  /** Atualiza o progresso visível do run, apenas pela tentativa que detém o lease. */
+  async reportProgress(lease: JobLease, progress: string) {
+    const result = await this.db.query(`UPDATE agent_runs SET progress=$4 WHERE ${OWNED_BY()}`, [
+      lease.jobId,
+      lease.workerId,
+      lease.epoch,
       clip(progress, 200),
     ]);
+    return Boolean(result.rowCount);
   }
 
   /** Regista as ferramentas realmente disponibilizadas após intersectar perfil e conectores ativos. */
-  async recordEffectiveTools(runId: string, tools: string[]) {
-    await this.db.query(
-      "UPDATE agent_runs SET effective_tools=$2 WHERE id=$1 AND status='running'",
-      [runId, [...new Set(tools)].slice(0, 16)],
+  async recordEffectiveTools(lease: JobLease, tools: string[]) {
+    const result = await this.db.query(
+      `UPDATE agent_runs SET effective_tools=$4 WHERE ${OWNED_BY()}`,
+      [lease.jobId, lease.workerId, lease.epoch, JSON.stringify([...new Set(tools)].slice(0, 16))],
     );
+    return Boolean(result.rowCount);
   }
 
   /** Indica se foi pedido o cancelamento do run. */
@@ -515,23 +694,28 @@ export class AgentRunsService {
     return Boolean(result.rows[0]?.cancel_requested);
   }
 
-  /** Guarda o resultado; a nota interna fica na conversa, a resposta ao cliente fica em rascunho. */
-  async complete(runId: string, result: InvestigationResult) {
-    await this.db.transaction(async (client) => {
+  /**
+   * Guarda o resultado; a nota interna fica na conversa, a resposta ao cliente fica em rascunho.
+   * Só a tentativa com o lease atual conclui; a repetição da mesma conclusão é `duplicate` e uma
+   * tentativa antiga é `stale`, sem efeitos.
+   */
+  async complete(lease: JobLease, result: InvestigationResult): Promise<FencedOutcome> {
+    return this.db.transaction(async (client) => {
       // Mesma ordem de bloqueio que a resposta do cliente (ticket antes do run).
       const owner = (
         await client.query<{ ticket_id: string }>('SELECT ticket_id FROM agent_runs WHERE id=$1', [
-          runId,
+          lease.jobId,
         ])
       ).rows[0];
       if (owner)
         await client.query('SELECT id FROM tickets WHERE id=$1 FOR UPDATE', [owner.ticket_id]);
-      const run = await this.lockRunning(client, runId);
-      if (!run) return;
+      const run = await this.lockOwned(client, lease);
+      if (!run) return this.rejectStale(client, lease, 'stale_attempt_rejected', 'succeeded');
       if (run.cancel_requested) {
         await this.finish(client, run, 'cancelled', null);
-        return;
+        return 'accepted';
       }
+      const runId = run.id;
       // A análise pós-incidente e as etapas do fluxo sem perguntas nunca perguntam ao cliente.
       const questions =
         run.run_trigger === 'incident_review' || !run.client_questions_allowed
@@ -540,7 +724,7 @@ export class AgentRunsService {
       const clientMessageId = await publishClientQuestions(client, run, questions);
       await client.query(
         `UPDATE agent_runs SET status='succeeded', finished_at=NOW(3), progress=NULL,
-           connector_token_hash=NULL, summary=$2, reply_draft=$3, evidence=$4,
+           connector_token_hash=NULL, lease_until=NULL, summary=$2, reply_draft=$3, evidence=$4,
            client_questions=$5, client_message_id=$6, patch=$7, proposed_tests=$8 WHERE id=$1`,
         [
           runId,
@@ -576,52 +760,187 @@ export class AgentRunsService {
         clientQuestions: questions.length,
         sentToClient: Boolean(clientMessageId),
       });
+      await this.event(client, run, 'completed');
       await this.notifyFinished(client, run, 'succeeded');
+      return 'accepted';
     });
   }
 
-  /** Regista falha ou cancelamento apenas se o run ainda estiver ativo. */
-  async fail(runId: string, errorCode: string) {
-    await this.db.transaction(async (client) => {
-      const run = await this.lockRunning(client, runId);
-      if (run)
-        await this.finish(client, run, run.cancel_requested ? 'cancelled' : 'failed', errorCode);
+  /** Regista falha ou cancelamento apenas pela tentativa que detém o lease. */
+  async fail(lease: JobLease, errorCode: string): Promise<FencedOutcome> {
+    return this.db.transaction(async (client) => {
+      const run = await this.lockOwned(client, lease);
+      if (!run) return this.rejectStale(client, lease, 'stale_attempt_rejected', 'failed');
+      await this.finish(client, run, run.cancel_requested ? 'cancelled' : 'failed', errorCode);
+      return 'accepted';
     });
   }
 
-  /** Runs deixados em execução por um executor interrompido não podem ser retomados em segurança. */
-  async failInterrupted() {
-    const result = await this.db.query(
-      "UPDATE agent_runs SET status='failed', error_code='executor_interrupted', finished_at=NOW(3), progress=NULL, connector_token_hash=NULL WHERE status='running'",
-    );
-    return result.rowCount;
-  }
-
-  private async lockRunning(client: Queryable, runId: string) {
-    const result = await client.query<
-      FinishedRun & {
-        requested_by: string;
-        cancel_requested: boolean;
-        client_questions_allowed: boolean;
+  /**
+   * Devolve a tentativa à fila sem a contar como falhada (paragem ordenada do executor). Os runs
+   * só produzem efeitos externos na conclusão transacional, por isso a repetição é segura.
+   */
+  async release(lease: JobLease, reason = 'shutdown'): Promise<FencedOutcome> {
+    return this.db.transaction(async (client) => {
+      const run = await this.lockOwned(client, lease);
+      if (!run) return this.rejectStale(client, lease, 'stale_attempt_rejected');
+      if (run.cancel_requested) {
+        await this.finish(client, run, 'cancelled', null);
+        return 'accepted';
       }
-    >(
-      "SELECT id,ticket_id,project_id,run_trigger,requested_by,cancel_requested,client_questions_allowed FROM agent_runs WHERE id=$1 AND status='running' FOR UPDATE",
-      [runId],
+      await client.query(
+        `UPDATE agent_runs SET status='queued', worker_id=NULL, lease_until=NULL, heartbeat_at=NULL,
+           connector_token_hash=NULL, attempt=GREATEST(attempt-1,0), progress='Em fila (retomado)'
+         WHERE id=$1`,
+        [run.id],
+      );
+      await this.event(client, run, 'released', { reason });
+      return 'accepted';
+    });
+  }
+
+  /**
+   * Reconciliação por lease (substitui a falha global no arranque): só toca em runs `running` com
+   * lease expirado ou sem lease (legado). Cancelados terminam; com tentativas disponíveis voltam à
+   * fila com nova época; esgotadas falham com `lease_expired`. Jobs vivos de outros executores não
+   * são afetados.
+   */
+  async recoverExpired(maxAttempts = DEFAULT_MAX_ATTEMPTS) {
+    const outcome = { requeued: 0, failed: 0, cancelled: 0 };
+    const expired = await this.db.query<{ id: string; ticket_id: string }>(
+      "SELECT id,ticket_id FROM agent_runs WHERE status='running' AND (lease_until IS NULL OR lease_until<=NOW(3)) ORDER BY started_at LIMIT 50",
+    );
+    for (const candidate of expired.rows) {
+      await this.db.transaction(async (client) => {
+        await client.query('SELECT id FROM tickets WHERE id=$1 FOR UPDATE', [candidate.ticket_id]);
+        const run = (
+          await client.query<
+            RunningRow & { worker_id: string | null; lease_epoch: number; attempt: number }
+          >(
+            `SELECT id,ticket_id,project_id,run_trigger,requested_by,cancel_requested,client_questions_allowed,
+                    flow_step_id,worker_id,lease_epoch,attempt
+             FROM agent_runs WHERE id=$1 AND status='running'
+               AND (lease_until IS NULL OR lease_until<=NOW(3)) FOR UPDATE`,
+            [candidate.id],
+          )
+        ).rows[0];
+        if (!run) return;
+        if (run.cancel_requested) {
+          await this.finish(client, run, 'cancelled', null);
+          await this.event(client, run, 'lease_expired_cancelled');
+          outcome.cancelled += 1;
+        } else if (Number(run.attempt) < maxAttempts) {
+          await client.query(
+            `UPDATE agent_runs SET status='queued', worker_id=NULL, lease_until=NULL, heartbeat_at=NULL,
+               connector_token_hash=NULL, progress='Em fila (executor interrompido)' WHERE id=$1`,
+            [run.id],
+          );
+          await this.event(client, run, 'lease_expired_requeued', {
+            previousWorker: run.worker_id,
+          });
+          outcome.requeued += 1;
+        } else {
+          await this.finish(client, run, 'failed', 'lease_expired');
+          await this.event(client, run, 'lease_expired_failed', { previousWorker: run.worker_id });
+          outcome.failed += 1;
+        }
+      });
+    }
+    return outcome;
+  }
+
+  private async lockOwned(client: Queryable, lease: JobLease) {
+    const result = await client.query<RunningRow>(
+      `SELECT id,ticket_id,project_id,run_trigger,requested_by,cancel_requested,client_questions_allowed,
+              flow_step_id,attempt,lease_epoch,worker_id
+       FROM agent_runs WHERE ${OWNED_BY()} FOR UPDATE`,
+      [lease.jobId, lease.workerId, lease.epoch],
     );
     return result.rows[0];
   }
 
+  /** Regista a rejeição de uma tentativa sem posse; distingue a repetição da conclusão já aceite. */
+  private async rejectStale(
+    client: Queryable,
+    lease: JobLease,
+    type: JobEventType,
+    terminal?: AgentRunStatus,
+  ): Promise<FencedOutcome> {
+    const row = (
+      await client.query<{
+        project_id: string;
+        ticket_id: string;
+        flow_step_id: string | null;
+        status: AgentRunStatus;
+        worker_id: string | null;
+        lease_epoch: number;
+        attempt: number;
+      }>(
+        'SELECT project_id,ticket_id,flow_step_id,status,worker_id,lease_epoch,attempt FROM agent_runs WHERE id=$1',
+        [lease.jobId],
+      )
+    ).rows[0];
+    if (!row) return 'stale';
+    if (
+      terminal &&
+      row.status === terminal &&
+      row.worker_id === lease.workerId &&
+      Number(row.lease_epoch) === lease.epoch
+    )
+      return 'duplicate';
+    await recordJobEvent(client, {
+      kind: 'agent_run',
+      jobId: lease.jobId,
+      projectId: row.project_id,
+      ticketId: row.ticket_id,
+      flowStepId: row.flow_step_id,
+      attempt: Number(row.attempt),
+      epoch: lease.epoch,
+      workerId: lease.workerId,
+      type,
+      details: { currentEpoch: Number(row.lease_epoch), currentStatus: row.status },
+    });
+    return 'stale';
+  }
+
+  private async event(
+    client: Queryable,
+    run: FinishedRun & {
+      flow_step_id?: string | null;
+      worker_id?: string | null;
+      lease_epoch?: number;
+      attempt?: number;
+    },
+    type: JobEventType,
+    details?: Record<string, unknown>,
+  ) {
+    await recordJobEvent(client, {
+      kind: 'agent_run',
+      jobId: run.id,
+      projectId: run.project_id,
+      ticketId: run.ticket_id,
+      flowStepId: run.flow_step_id ?? null,
+      attempt: Number(run.attempt ?? 0),
+      epoch: Number(run.lease_epoch ?? 0),
+      workerId: run.worker_id ?? null,
+      type,
+      details,
+    });
+  }
+
   private async finish(
     client: Queryable,
-    run: FinishedRun,
+    run: RunningRow,
     status: 'failed' | 'cancelled',
     errorCode: string | null,
   ) {
     await client.query(
-      'UPDATE agent_runs SET status=$2, error_code=$3, finished_at=NOW(3), progress=NULL, connector_token_hash=NULL WHERE id=$1',
+      'UPDATE agent_runs SET status=$2, error_code=$3, finished_at=NOW(3), progress=NULL, connector_token_hash=NULL, lease_until=NULL WHERE id=$1',
       [run.id, status, errorCode],
     );
     await audit(client, null, run.ticket_id, `agent.run_${status}`, { runId: run.id, errorCode });
+    if (status === 'failed' && errorCode !== 'lease_expired')
+      await this.event(client, run, 'failed', { errorCode });
     await this.notifyFinished(client, run, status);
   }
 

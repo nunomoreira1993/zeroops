@@ -21,9 +21,15 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/apps/web/dist ./apps/web/dist
 COPY --from=build /app/sql ./sql
+# P08: git para verificar repositorios (API) e para os workspaces de desenvolvimento (executor).
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git \
+  && rm -rf /var/lib/apt/lists/*
 # Fila em disco dos alertas (volume nomeado herda o dono node na primeira montagem).
 RUN mkdir -p /var/lib/zeroops/alert-spool /var/lib/zeroops/prometheus-rules \
   && chown node:node /var/lib/zeroops/alert-spool /var/lib/zeroops/prometheus-rules
+# Workspaces Git (P08): volume do executor, gerido como root e entregue ao uid do agente por tentativa.
+RUN mkdir -p /var/lib/zeroops/workspaces
 USER node
 CMD ["node", "dist/apps/api/src/main.js"]
 

@@ -72,8 +72,17 @@ export interface AgentRun {
     selectionReason?: RepositoryResourceSelectionReason;
   }[];
   allowedTools?: string[] | null;
+  /** Skills e especialistas fixados no run (P04); `null`/ausente sem capacidades. */
+  capabilities?: {
+    manifestHash: string | null;
+    skills: { name: string; version: number; bundleHash: string }[];
+    specialists: { name: string; displayName: string; version: number }[];
+    maxConcurrency: number;
+  } | null;
   effectiveTools?: string[] | null;
   effectiveModel?: string | null;
+  /** Tentativa atual (>1 quando o run foi retomado após perda do lease do executor). */
+  attempt?: number;
   requestedBy: { id: string; displayName: string; avatarVersion?: number | null };
   createdAt: string;
   startedAt: string | null;
@@ -353,6 +362,15 @@ export type AgentRunEventPayload =
     }
   | ({ type: 'usage' } & AgentModelCall)
   | ({ type: 'quota' } & AgentQuota)
+  | {
+      /** Uso efetivo de skills e especialistas (P04), correlacionado com a chamada `task`. */
+      type: 'capability';
+      kind: 'skill' | 'specialist';
+      name: string;
+      phase: 'invoked' | 'started' | 'completed' | 'failed';
+      toolCallId?: string;
+      detail?: string | null;
+    }
   | { type: 'error'; message: string };
 
 export type AgentRunEventType = AgentRunEventPayload['type'];

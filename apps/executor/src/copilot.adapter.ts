@@ -1,5 +1,6 @@
 import { isAbsolute } from 'node:path';
 import type { AgentRunConversation } from './run-conversation.js';
+import type { CompiledCapabilities } from './capability-bundle.js';
 import {
   prepareWorkspace,
   readAgentReport,
@@ -39,6 +40,41 @@ export interface CopilotExecuteInput {
   env?: Record<string, string>;
   /** Conversa ao vivo com a equipa (streaming, perguntas e mensagens de seguimento). */
   conversation?: AgentRunConversation;
+  /**
+   * Posse atual da tentativa (atualizada pelo heartbeat). Quando devolve false, todos os pedidos de
+   * permissão são negados: uma tentativa sem lease não produz novos efeitos.
+   */
+  isActive?: () => boolean;
+  /**
+   * Aprovação do plano (`exit_plan_mode`): `auto` aprova a ação recomendada sem perguntar (as
+   * ferramentas continuam limitadas pela política); `human` pergunta à equipa e, sem resposta,
+   * rejeita — a ausência de resposta nunca é aprovação. Por omissão `human`.
+   */
+  planApproval?: 'auto' | 'human';
+  /**
+   * Agente, skills e especialistas fixados no run (P04), já materializados e verificados. Só o
+   * adaptador SDK os suporta; o CLI recusa o run em vez de os ignorar.
+   */
+  capabilities?: CompiledCapabilities;
+  /**
+   * Ferramentas próprias do ZeroOps expostas ao modelo (P06: autoria de fluxos). O handler corre no
+   * executor e delega no backend, que valida, autoriza e fenca cada chamada. Só no SDK.
+   */
+  tools?: AgentTool[];
+  /**
+   * Checkout Git do ZeroOps (P08): o diff e os ficheiros vêm do Git, por isso a lista de ficheiros
+   * do relatório é ignorada e o relatório não entra no commit.
+   */
+  gitWorkspace?: boolean;
+}
+
+/** Ferramenta própria registada na sessão Copilot. */
+export interface AgentTool {
+  name: string;
+  description: string;
+  /** JSON Schema dos argumentos (a validação definitiva é feita no backend). */
+  parameters: Record<string, unknown>;
+  handler(args: unknown, context: { toolCallId: string }): Promise<{ ok: boolean; text: string }>;
 }
 
 export interface CopilotAgent {
@@ -53,6 +89,10 @@ export class CopilotCliAdapter implements CopilotAgent {
 
   async execute(input: CopilotExecuteInput) {
     validateExecutionInput(input);
+    if (input.capabilities)
+      throw new Error('Skills e especialistas exigem o transporte SDK do Copilot (não o CLI).');
+    if (input.tools?.length)
+      throw new Error('Ferramentas de autoria exigem o transporte SDK do Copilot (não o CLI).');
     const { root, resultPath } = await prepareWorkspace(input.workspace);
     const shell = validateShell(input.shell);
     const args = [
@@ -62,8 +102,8 @@ export class CopilotCliAdapter implements CopilotAgent {
       ...(input.env?.COPILOT_MODEL === 'fusion' && input.env.COPILOT_FUSION_TIER
         ? ['--fusion-tier', input.env.COPILOT_FUSION_TIER]
         : []),
-      // `create` is required for the report file; writes stay limited by --allow-tool=write(...).
-      `--available-tools=${['view', 'grep', 'glob', 'create', 'edit', ...(shell ? [shell.tool] : [])].join(',')}`,
+      // `create`/`apply_patch` (modelos GPT) gravam o relatório; a escrita fica limitada por --allow-tool=write(...).
+      `--available-tools=${['view', 'grep', 'glob', 'create', 'edit', 'apply_patch', ...(shell ? [shell.tool] : [])].join(',')}`,
       ...(shell
         ? shell.commands.map((command) => `--allow-tool=shell(${command}:*)`)
         : ['--deny-tool=shell']),
@@ -81,7 +121,7 @@ export class CopilotCliAdapter implements CopilotAgent {
     const processResult = await this.sandbox.run({
       workspace: root,
       arguments: args,
-      stdin: input.prompt + reportInstruction(input.mode, shell),
+      stdin: input.prompt + reportInstruction(input.mode, shell, input.gitWorkspace),
       timeoutMs: input.timeoutMs,
       outputLimitBytes: input.outputLimitBytes,
       signal: input.signal,
@@ -89,6 +129,6 @@ export class CopilotCliAdapter implements CopilotAgent {
     });
     if (processResult.interrupted || processResult.exitCode !== 0)
       throw new Error('Copilot interrompido ou com falha; requer reconciliacao.');
-    return readAgentReport(root, resultPath, input.mode);
+    return readAgentReport(root, resultPath, input.mode, { gitWorkspace: input.gitWorkspace });
   }
 }

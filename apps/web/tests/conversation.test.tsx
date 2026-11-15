@@ -542,4 +542,62 @@ describe('Conversa do incidente', () => {
     });
     expect(onChanged).toHaveBeenCalledOnce();
   });
+
+  it('em tickets geridos por fluxo só mostra os papéis usados pelas etapas e preserva os ocultos', async () => {
+    user.role = 'admin';
+    const qa: ManagedUser = {
+      ...user,
+      id: '10000000-0000-4000-8000-000000000003',
+      role: 'qa',
+      disabled: false,
+      lockedUntil: null,
+      mfaEnabled: true,
+    };
+    request.mockImplementation(async (path) => (path === '/users' ? [qa] : {}));
+    const assignments: TicketAssignments = {
+      client: null,
+      technical: { userId: '10000000-0000-4000-8000-000000000002', displayName: 'Tiago' },
+      qa: null,
+      release: null,
+    } as TicketAssignments;
+    const onChanged = vi.fn();
+    render(
+      <TicketAssignmentsPanel
+        ticket={detail.ticket}
+        assignments={assignments}
+        flowRoles={['qa']}
+        onChanged={onChanged}
+      />,
+    );
+    fireEvent.change(await screen.findByLabelText('Qualidade / QA'), {
+      target: { value: qa.id },
+    });
+    expect(screen.queryByLabelText('Responsável de release')).toBeNull();
+    expect(screen.queryByLabelText('Cliente responsável')).toBeNull();
+    expect(screen.getByLabelText('Responsável técnico')).toBeTruthy();
+    expect(screen.queryByText(/Cada etapa exige/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Guardar responsáveis' }));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledOnce());
+    const body = request.mock.calls.find(
+      ([path, options]) => path === '/tickets/ticket-1/assignments' && options?.method === 'POST',
+    )?.[1]?.body;
+    expect(body).toMatchObject({
+      clientUserId: null,
+      technicalUserId: '10000000-0000-4000-8000-000000000002',
+      qaUserId: qa.id,
+      releaseUserId: null,
+    });
+  });
+
+  it('em tickets geridos por fluxo sem papéis nem atribuições não mostra o painel', () => {
+    const { container } = render(
+      <TicketAssignmentsPanel
+        ticket={detail.ticket}
+        assignments={{ client: null, technical: null, qa: null, release: null }}
+        flowRoles={[]}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(container.querySelector('section')).toBeNull();
+  });
 });

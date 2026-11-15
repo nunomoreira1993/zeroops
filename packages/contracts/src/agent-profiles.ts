@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { CapabilitySource } from './capabilities.js';
 
 export const copilotToolKeys = ['sql', 'db2', 'log', 'loki', 'prom'] as const;
 export type CopilotToolKey = (typeof copilotToolKeys)[number];
@@ -22,6 +23,8 @@ export const agentProfileDefinitionSchema = z.strictObject({
     .nullable(),
   fusionTier: z.enum(['standard', 'high', 'max']).nullable(),
   reasoningEffort: z.string().trim().min(1).max(32).nullable(),
+  /** Instruções do especialista (ex.: corpo de um `.agent.md` importado). Opcional (P04). */
+  instructions: z.string().trim().min(1).max(20000).optional(),
 });
 export type AgentProfileDefinition = z.infer<typeof agentProfileDefinitionSchema>;
 
@@ -65,6 +68,8 @@ export interface AgentProfileVersion {
   definition: AgentProfileDefinition;
   createdAt: string;
   createdBy: string | null;
+  /** Proveniência da versão (importação `.agent.md` ou adoção por partilha). */
+  source?: CapabilitySource | null;
 }
 
 export interface AgentProfile {

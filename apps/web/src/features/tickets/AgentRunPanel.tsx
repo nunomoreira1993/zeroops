@@ -25,6 +25,10 @@ export const failureText: Record<string, [string, string]> = {
     'O executor foi reiniciado durante a investigação. Peça uma nova investigação.',
     'The runner was restarted during the investigation. Request a new investigation.',
   ],
+  lease_expired: [
+    'O executor deixou de responder e a investigação esgotou as tentativas. Peça uma nova investigação.',
+    'The runner stopped responding and the investigation ran out of attempts. Request a new investigation.',
+  ],
   cancelled: ['A investigação foi cancelada.', 'The investigation was cancelled.'],
   agent_failed: [
     'O agente não conseguiu concluir a investigação. Consulte os logs do executor.',
