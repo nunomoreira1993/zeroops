@@ -2448,7 +2448,8 @@ existente foi preservado, sem reescrever commits nem o ticket.
    repetir os cenários A–E na versão final. Não instalar no host partilhado
    com o instalador atual.
 
-O percurso real de desenvolvimento no site, a validação autenticada do
-browser, o relay 1.2.0 e a intervenção Health real continuam bloqueados.
+O percurso real de desenvolvimento no site, a validação do simulador e da
+ativação no browser, o relay 1.2.0 e a intervenção Health real continuam
+bloqueados.
 P11 permanece parcial; não declarar o produto concluído nem pronto para
 Produção.
