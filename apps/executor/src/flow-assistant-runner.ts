@@ -156,7 +156,29 @@ export class FlowAssistantRunner {
     }
     const owner = identity ? ownerOf(identity) : this.options.workspaceOwner;
     const { lease } = request;
-    const workspace = await mkdtemp(join(this.options.workspaceRoot, 'assistant-'));
+    let workspace: string;
+    try {
+      workspace = await mkdtemp(join(this.options.workspaceRoot, 'assistant-'));
+    } catch (error) {
+      this.log({
+        event: 'flow_assistant.workspace_failed',
+        requestId: request.id,
+        type: error instanceof Error ? error.name : 'UnknownError',
+        message: error instanceof Error ? error.message.slice(0, 300) : undefined,
+      });
+      try {
+        await this.queue.fail(lease, 'workspace_unavailable');
+      } finally {
+        await identity?.release().catch((releaseError: unknown) =>
+          this.log({
+            event: 'flow_assistant.identity_release_failed',
+            requestId: request.id,
+            message: releaseError instanceof Error ? releaseError.message.slice(0, 300) : undefined,
+          }),
+        );
+      }
+      return true;
+    }
     const abort = new AbortController();
     let leaseLost = false;
     let stopping = false;

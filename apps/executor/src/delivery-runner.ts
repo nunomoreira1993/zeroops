@@ -38,6 +38,7 @@ export type PipelineTransport = (input: {
   headers: Record<string, string>;
   body?: string;
   timeoutMs: number;
+  signal?: AbortSignal;
 }) => Promise<PipelineResponse>;
 
 /** Transporte real (fetch com timeout; corpo JSON quando existir). */
@@ -47,12 +48,15 @@ export const fetchTransport: PipelineTransport = async ({
   headers,
   body,
   timeoutMs,
+  signal,
 }) => {
   const response = await fetch(url, {
     method,
     headers,
     ...(body === undefined ? {} : { body }),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+      : AbortSignal.timeout(timeoutMs),
     redirect: 'error',
   });
   const text = await response.text();
@@ -208,17 +212,30 @@ export class DeliveryRunner {
     const gates = await this.store.revalidate(job.lease);
     accepted(gates);
     if (gates === 'stale') return null;
-    if (gates.ok) return undefined;
-    await this.store.recordRunnerEvent(job.lease, 'effect_blocked', {
-      effect,
-      reason: gates.reason,
-    });
-    return this.block(
-      job,
-      from,
-      'cancelled' in gates ? 'cancelled' : gates.rework ? 'rework' : 'blocked',
-      gates.reason,
-    );
+    if (!gates.ok) {
+      await this.store.recordRunnerEvent(job.lease, 'effect_blocked', {
+        effect,
+        reason: gates.reason,
+      });
+      return this.block(
+        job,
+        from,
+        'cancelled' in gates ? 'cancelled' : gates.rework ? 'rework' : 'blocked',
+        gates.reason,
+      );
+    }
+    if (effect === 'start') {
+      const publish = await this.store.publishGate(job.lease);
+      accepted(publish);
+      if (publish !== 'stale' && !publish.ok) {
+        await this.store.recordRunnerEvent(job.lease, 'effect_blocked', {
+          effect,
+          reason: publish.reason,
+        });
+        return this.block(job, from, 'blocked', publish.reason);
+      }
+    }
+    return undefined;
   }
 
   private async integrate(job: DeliveryJob): Promise<number | null> {
@@ -596,13 +613,19 @@ export class DeliveryRunner {
     if (!pipelineEndpointAllowed(base, this.options.allowedOrigins))
       throw new Error('O endpoint da pipeline não pertence a uma origem autorizada.');
     const body = payload === undefined ? '' : JSON.stringify(payload);
-    return this.transport({
-      method,
-      url: `${base}${path}`,
-      headers: this.headers(job.pipeline.secret, body),
-      ...(payload === undefined ? {} : { body }),
-      timeoutMs: this.requestTimeoutMs,
-    }).catch(() => null);
+    return this.guarded(job, [], (signal) =>
+      this.transport({
+        method,
+        url: `${base}${path}`,
+        headers: this.headers(job.pipeline.secret, body),
+        ...(payload === undefined ? {} : { body }),
+        timeoutMs: this.requestTimeoutMs,
+        signal,
+      }),
+    ).catch((error: unknown) => {
+      if (error instanceof DeliveryStale) throw error;
+      return null;
+    });
   }
 
   private async start(job: DeliveryJob): Promise<number | null> {

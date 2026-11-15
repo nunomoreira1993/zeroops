@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   PIPELINE_SIGNATURE_HEADER,
   PIPELINE_TIMESTAMP_HEADER,
@@ -792,6 +792,54 @@ describe('Entrega A — integridade da execução', { timeout: 240_000 }, () => 
     expect(statuses.filter((status) => status === 'start_sent')).toHaveLength(1);
   });
 
+  it('F01: o gate de publicação de capacidades é revalidado antes do POST', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'Gate de capacidade');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'capability.txt'), 'C\n'));
+    await approve(p.qa, t.id, head);
+    const publishGate = vi.spyOn(app.deliveries, 'publishGate').mockResolvedValue({
+      ok: false,
+      pending: true,
+      reason: 'A autorização de publicação foi revogada.',
+    });
+
+    await drive(1);
+
+    expect(publishGate).toHaveBeenCalledTimes(1);
+    const blocked = (await deliveryOf(t.id))!;
+    expect(blocked.state).toBe('blocked');
+    expect(blocked.state_reason).toMatch(/autorização de publicação foi revogada/);
+    expect(provider.posts.filter((post) => post.deliveryId === blocked.id)).toEqual([]);
+    publishGate.mockRestore();
+  });
+
+  it('F01: o gate de publicação de capacidades é revalidado no retry após 404', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'Retry do gate de capacidade');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'capability-retry.txt'), 'C\n'));
+    await approve(p.qa, t.id, head);
+    provider.loseNextRequest = true;
+    const publishGate = vi
+      .spyOn(app.deliveries, 'publishGate')
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({
+        ok: false,
+        pending: true,
+        reason: 'A autorização de publicação foi revogada.',
+      });
+
+    await drive(1);
+    expect((await deliveryOf(t.id))!.state).toBe('uncertain');
+    await drive(1);
+
+    expect(publishGate).toHaveBeenCalledTimes(2);
+    const blocked = (await deliveryOf(t.id))!;
+    expect(blocked.state).toBe('blocked');
+    expect(blocked.state_reason).toMatch(/autorização de publicação foi revogada/);
+    expect(provider.posts.filter((post) => post.deliveryId === blocked.id)).toEqual([]);
+    publishGate.mockRestore();
+  });
+
   it('F01: revogação durante os testes da combinação impede o push', async () => {
     const p = await project();
     const a = await ticket(p.client, 'Base A');
@@ -935,6 +983,53 @@ describe('Entrega A — integridade da execução', { timeout: 240_000 }, () => 
     expect(await isAncestor(p.origin.dir, headB, resumed.integrated_sha!)).toBe(true);
     await finishPublishing(b.id);
   });
+
+  it('F04: interrompe o pedido externo quando perde o lease', async () => {
+    const p = await project();
+    const t = await ticket(p.client, 'Pedido F04');
+    const head = await develop(t.id, (dir) => writeFile(join(dir, 'f04.txt'), 'F04\n'));
+    await approve(p.qa, t.id, head);
+    const d = (await deliveryOf(t.id))!;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let transportAborted = false;
+    const runner = new DeliveryRunner(app.deliveries, app.manager, {
+      workerId: 'executor-f04-http',
+      allowedOrigins: [PIPELINE_ORIGIN],
+      publicUrl: 'https://zeroops.test',
+      heartbeatMs: 20,
+      requestTimeoutMs: 5000,
+      transport: async ({ method, signal }) => {
+        if (method !== 'POST') return { status: 404, body: null };
+        if (!signal) throw new Error('Transporte sem sinal de cancelamento.');
+        markStarted();
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              transportAborted = true;
+              reject(new Error('Pedido interrompido.'));
+            },
+            { once: true },
+          );
+        });
+      },
+    });
+
+    expect(await runner.runOnce()).toBe(true);
+    const running = runner.runOnce();
+    await started;
+    await fixture.db.query('UPDATE delivery_runs SET lease_epoch=lease_epoch+1 WHERE id=$1', [
+      d.id,
+    ]);
+    await running;
+
+    expect(transportAborted).toBe(true);
+    expect((await deliveryOf(t.id))!.state).toBe('starting');
+  });
+
   it('F03: mudar o URL do repositório depois de criada a entrega bloqueia a integração', async () => {
     const p = await project();
     const t = await ticket(p.client, 'URL alterado');

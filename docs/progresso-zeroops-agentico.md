@@ -2549,27 +2549,32 @@ Produção.
 - **F01 — gates junto dos efeitos:** `DeliveryRunner` revalida o fluxo,
   ticket, revisão, aprovações, candidato/testes e gate de publicação antes da
   integração, antes do push e imediatamente antes de cada POST de publicação,
-  incluindo o retry após 404. Os bloqueios ficam registados como
-  `effect_blocked`. O gate e o efeito remoto continuam sujeitos a uma janela
-  TOCTOU curta; o endpoint e a origem Git são revalidados, mas não há transação
-  distribuída com o fornecedor.
+  incluindo o retry após 404. O gate específico de publicação de capacidades
+  (`capabilities.publish`) também é executado em cada POST. Os bloqueios ficam
+  registados como `effect_blocked`. O gate e o efeito remoto continuam sujeitos
+  a uma janela TOCTOU curta; o endpoint e a origem Git são revalidados, mas não
+  há transação distribuída com o fornecedor.
 - **F02 — isolamento de jobs:** pool de UIDs exclusivos, home privada por job,
   configuração e temporários separados, permissões por proprietário em
   workspaces/worktrees, subprocessos sob UID próprio e limpeza antes de
   reutilizar a identidade. Falhas de limpeza mantêm o UID reservado
   (fail-closed). O pool em memória pressupõe um único executor e intervalos
   UID não sobrepostos; a rede do host e `/sources` em leitura continuam
-  partilhados. O executor Docker/Linux e as permissões reais não foram
-  exercitados neste Windows.
+  partilhados. No QA, um container Docker descartável sem rede e com UID de
+  teste fora do pool operacional confirmou escrita na home própria, negação de
+  leitura da home de outro UID e limpeza das homes.
 - **F03 — locks canónicos:** novas chaves derivadas do repositório + branch e
   do recurso de publicação (`targetKey` explícito, ou endpoint + ambiente).
   `targetKey` é configurável pela API/UI; a FIFO partilha a chave de integração
   entre configurações distintas. Para migrar com segurança, não podem existir
   entregas ativas detidas por versões anteriores que ainda usem chaves legadas.
 - **F04 — heartbeat/fencing:** a entrega renova lease e lock durante integração,
-  fetch e testes; erro de heartbeat ou perda de época aborta o processo e
-  impede efeitos seguintes. O `runCommand` termina também a árvore de processos
-  em Windows/Linux.
+  fetch, testes e pedidos HTTP demorados; erro de heartbeat ou perda de época
+  aborta o processo/sinal HTTP e impede efeitos seguintes. O `runCommand`
+  termina também a árvore de processos em Windows/Linux.
+- Falha ao criar o workspace após reclamar um run/pedido fica registada como
+  `workspace_unavailable`, termina a tentativa e liberta a identidade; não
+  deixa o lease reservado até expirar.
 - Acrescentados testes de regressão para revalidação/retry, isolamento entre
   projetos no mesmo recurso, alteração do URL, concorrência/lock, perda de
   lease e de lock, limpeza da identidade, cancelamento de processos e UI do
@@ -2580,32 +2585,66 @@ Produção.
 ### Validação local
 
 - Typecheck, ESLint e build: passaram; ESLint global deixou de ter o aviso
-  preexistente `portKey` não usado.
-- Testes já concluídos: entrega e sandbox 16/16; runners/workspaces adjacentes
-  34/34; UI de pipelines 1/1. Incluem MariaDB descartável e Git bare local;
-  o fornecedor de pipeline é simulado.
+  preexistente `portKey` não usado. Build mantém o aviso já existente de bundle
+  web acima de 500 kB.
+- Validação focalizada após os últimos ajustes: regressões F01 (gate geral no
+  retry 404, gate de publicação inicial e no retry, e F04 (perda de lease
+  durante pedido HTTP), 4 passaram; sandbox e runners, 22 passaram; migration
+  047 e UI de pipelines, 2 passaram. Total desta ronda: 28 testes; MariaDB
+  descartável, Git bare local e fornecedor de pipeline simulado.
+- Vitest web: 22 ficheiros / 137 testes passaram com
+  `--maxWorkers=1 --testTimeout=15000`. A execução com configuração normal
+  teve falhas intermitentes em testes existentes de identidade/conversa; cada
+  caso observado passou isoladamente ou na execução com timeout maior. Os 13
+  testes Node do workspace web passaram.
 - `npm run format:check` continua a falhar em 35 ficheiros, incluindo código e
   documentação histórica que já estavam fora do formato. Os ficheiros
   TypeScript/TSX de código desta entrega passaram `prettier --check`; o
   histórico não foi reformatado para evitar alterações alheias. SQL não é
   reconhecido pelo parser Prettier configurado.
-- Suite integral `npm test`: em execução; o resultado será atualizado antes da
-  conclusão. Build web mantém o aviso já existente de bundle acima de 500 kB.
-- Não validado: isolamento real em Linux/root/Docker, falhas sob filesystem
-  concorrente em QA, Copilot/CI reais, nem deploy desta versão. Não houve
-  migration ou alteração em QA/Produção nesta fase.
+- Testes arquiteturais: 3/6 passaram; as mesmas três classes de dívida do
+  baseline permanecem (allowlist/ciclos do domínio `incidents` e 8 lacunas de
+  JSDoc em APIs existentes). As verificações de dependência entre aplicações,
+  contratos e backend passaram; não foram encontrados novos limites
+  arquiteturais violados pela Entrega A.
+- Suite integral `npm test` não concluiu: a execução raiz ficou sem progresso
+  observável durante mais de 19 minutos e foi interrompida. Os testes focados
+  da raiz e a suite web foram executados separadamente.
+- Não validados: falhas sob filesystem concorrente com vários executores e
+  integrações reais Copilot/CI. Produção não foi acedida.
 
-### Próximos passos e limites de publicação
+### Publicação autorizada em QA — 2026-11-15
 
-1. Concluir a suite completa e repetir os testes focados depois dos ajustes
-   finais; rever todos os diffs e verificar a migration contra a base de testes.
-2. Criar uma branch própria a partir do histórico interno aprovado, versionar
-   só os ficheiros desta entrega e enviar uma ref explícita diferente de
-   `main`. Preservar os untracked preexistentes.
-3. Antes do deploy autorizado em QA, verificar que não existem entregas
-   ativas usando locks legados; aplicar a migration apenas no deploy controlado
-   e confirmar `VERSION`, health, executor e smoke. Produção fica fora do
-   âmbito.
-4. Documentar como limitações a janela TOCTOU, a rede ainda acessível aos jobs,
-   `/sources` partilhado em leitura, a suposição de um executor por intervalo
-   de UIDs e a ausência de validação Linux/QA desta entrega.
+- O pré-flight somente de leitura confirmou a versão anterior
+  `8401110cc2122a10ce4c0c330a3a048e76d729f8`, API/conectores `ready`, zero
+  entregas com lease ativo, zero locks legados ativos e espaço disponível.
+- O bare `/opt/zeroops/repo.git` tem hook `post-receive` que só publica
+- O commit `b837b1629bd61ebb7fdea15c1baa038ef769e000` foi enviado para
+  `qa/feat/entrega-a-integridade-execucao`. O hook confirmou que a branch foi
+  recebida sem deploy; `main` não foi alterada. O bare e o checkout local
+  preservam as refs e os ficheiros não relacionados.
+- Executado uma única vez o script existente
+  `deploy/qa/deploy-from-git.sh <SHA>` para o SHA exato. O ficheiro no servidor
+  não tem bit executável; foi invocado via `bash`, sem alterar permissões.
+  Drenagem terminou com zero jobs ativos; migração, arranque e health terminaram
+  com sucesso. API reporta o SHA integral; conectores `ready`; serviços ZeroOps
+  e observabilidade estavam `Up`. Imagens `gb837b1629bd6`/`latest`.
+- Migration `047_canonical_resource_locks.sql` consta no journal com checksum
+  `447a9b434beab652a26863132b139ae73227d8e330dab6f3a713e4f7ad69520c`, igual
+  ao ficheiro local; ambas as colunas novas foram confirmadas no schema.
+- Backup do deploy:
+  `/var/backups/zeroops/zeroops-20261115T130350-gb837b1629bd6.sql.gz`;
+  `gzip -t` passou e SHA-256
+  `53897eff736903e97fcbbdf11232564bf55c66bfd032c8e7a118072561e3eb63`.
+- Smoke Docker F02 executado num container temporário `--network none`, com
+  imagem publicada, limites de recursos e UIDs de teste isolados (65000–65001):
+  leitura cruzada negada, escrita na home própria permitida e ambas as homes
+  removidas na libertação. Não foram criadas entregas ou dados sintéticos na BD
+  QA; regressões de F01/F03/F04 foram executadas na BD descartável local.
+- A aplicação e a migration foram verificadas em QA. O commit do código
+  publicado é o acima; a atualização posterior deste registo será apenas
+  documental e não requer novo deploy. Produção não foi tocada.
+- Limitações a manter na entrega: janela TOCTOU, rede ainda acessível aos jobs,
+  `/sources` partilhado em leitura e pressuposto de um executor por intervalo
+  de UIDs. Não foram validados testes reais de integração Copilot/CI nem vários
+  executores simultâneos.

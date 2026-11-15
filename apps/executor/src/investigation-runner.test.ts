@@ -347,6 +347,46 @@ describe('InvestigationRunner', () => {
     await rm(opts.workspaceRoot, { recursive: true });
   });
 
+  it('falha o run e liberta a identidade se não conseguir criar o workspace', async () => {
+    const { value, calls } = queue();
+    const opts = await options();
+    opts.workspaceRoot = join(opts.workspaceRoot, 'missing-parent');
+    let identityReleased = false;
+    const events: Record<string, unknown>[] = [];
+    const runner = new InvestigationRunner(
+      value,
+      {
+        async execute() {
+          throw new Error('não devia correr');
+        },
+      },
+      {
+        ...opts,
+        identities: {
+          async acquire() {
+            return {
+              uid: 61_000,
+              gid: 61_000,
+              home: '/home/zeroops/jobs/61000',
+              private: true,
+              exclusive: true,
+              async release() {
+                identityReleased = true;
+              },
+            };
+          },
+        },
+      },
+      (event) => events.push(event),
+    );
+
+    expect(await runner.runOnce()).toBe(true);
+    expect(calls.failed).toBe('workspace_unavailable');
+    expect(identityReleased).toBe(true);
+    expect(events[0]).toMatchObject({ event: 'agent.run_workspace_failed', runId: 'run-1' });
+    await rm(join(opts.workspaceRoot, '..'), { recursive: true, force: true });
+  });
+
   it('cancela o processo quando a equipa pede cancelamento', async () => {
     const { value, calls } = queue(true);
     const opts = await options();

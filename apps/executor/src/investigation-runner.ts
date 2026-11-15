@@ -120,7 +120,29 @@ export class InvestigationRunner {
     }
     const owner = identity ? ownerOf(identity) : this.options.workspaceOwner;
     const { runId, lease } = context;
-    const workspace = await mkdtemp(join(this.options.workspaceRoot, 'run-'));
+    let workspace: string;
+    try {
+      workspace = await mkdtemp(join(this.options.workspaceRoot, 'run-'));
+    } catch (error) {
+      this.log({
+        event: 'agent.run_workspace_failed',
+        runId,
+        type: error instanceof Error ? error.name : 'UnknownError',
+        message: error instanceof Error ? error.message.slice(0, 300) : undefined,
+      });
+      try {
+        await this.queue.fail(lease, 'workspace_unavailable');
+      } finally {
+        await identity?.release().catch((releaseError: unknown) =>
+          this.log({
+            event: 'agent.identity_release_failed',
+            runId,
+            message: releaseError instanceof Error ? releaseError.message.slice(0, 300) : undefined,
+          }),
+        );
+      }
+      return true;
+    }
     const abort = new AbortController();
     let leaseLost = false;
     let stopping = false;

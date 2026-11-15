@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { ClaimedAssistantRequest } from '../../../packages/backend/src/modules/flows/flow-assistant.js';
 import type { CopilotAgent, CopilotExecuteInput } from './copilot.adapter.js';
 import { AUTHORING_TOOL_SPECS, FlowAssistantRunner } from './flow-assistant-runner.js';
+import type { JobIdentity } from './job-sandbox.js';
 
 const EMPTY = {
   files: [],
@@ -113,5 +114,62 @@ describe('Runner do assistente de fluxos (P06)', () => {
     expect(activeAfter).toBe(false);
     expect(outcome.completed).toBeUndefined();
     expect(outcome.failed).toBeUndefined();
+  });
+
+  it('falha o pedido e liberta a identidade se não conseguir criar o workspace', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'zeroops-assistant-failure-'));
+    directories.push(parent);
+    let identityReleased = false;
+    let failed: string | undefined;
+    const request = claimed(false);
+    const identity: JobIdentity = {
+      uid: 61_000,
+      gid: 61_000,
+      home: '/home/zeroops/jobs/61000',
+      private: true,
+      exclusive: true,
+      async release() {
+        identityReleased = true;
+      },
+    };
+    const events: Record<string, unknown>[] = [];
+    const instance = new FlowAssistantRunner(
+      {
+        async claimNext() {
+          return request;
+        },
+        async complete() {
+          return 'accepted';
+        },
+        async fail(_lease, code) {
+          failed = code;
+          return 'accepted';
+        },
+      },
+      {
+        async execute() {
+          throw new Error('não devia correr');
+        },
+      },
+      {
+        workspaceRoot: join(parent, 'missing-parent'),
+        timeoutMs: 5000,
+        outputLimitBytes: 10000,
+        identities: {
+          async acquire() {
+            return identity;
+          },
+        },
+      },
+      (event) => events.push(event),
+    );
+
+    expect(await instance.runOnce()).toBe(true);
+    expect(failed).toBe('workspace_unavailable');
+    expect(identityReleased).toBe(true);
+    expect(events[0]).toMatchObject({
+      event: 'flow_assistant.workspace_failed',
+      requestId: 'req-1',
+    });
   });
 });
