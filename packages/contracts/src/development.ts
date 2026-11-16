@@ -299,6 +299,8 @@ export interface DevelopmentReviewDecisionView {
   scopeHash: string;
   comment: string | null;
   override: boolean;
+  /** Administrador autor, autorizado pelos revisores da versão publicada (não é review independente). */
+  administrativeAuthor?: boolean;
   invalidatedAt: string | null;
   invalidationReason: string | null;
   createdAt: string;
@@ -332,6 +334,8 @@ export interface DevelopmentWorkspaceView {
     approvals: number;
     reviewers: { id: string; displayName: string }[];
     canDecide: boolean;
+    /** A decisão deste membro é uma aprovação administrativa do autor, não independente. */
+    administrativeAuthor?: boolean;
   } | null;
   /** Entregas por pipeline (P09) deste workspace; `available=false` sem etapa de entrega. */
   pipeline: { available: boolean; reason: string | null; deliveries: DeliveryRunView[] };

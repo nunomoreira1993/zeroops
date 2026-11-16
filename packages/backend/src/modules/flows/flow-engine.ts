@@ -52,6 +52,7 @@ import {
   reviewArtifact,
   reviewDecisionRight,
   scopeHash,
+  validReviewApprovals,
 } from '../development/development.store.js';
 import { incidentInstructionContext } from '../incidents/incident-instructions.js';
 import { closeHealthIncident, type IncidentDelegate } from '../health/health-incident-lifecycle.js';
@@ -655,6 +656,8 @@ export class FlowEngine {
         409,
       );
     const right = reviewDecisionRight(member, review, run.ticket.created_by);
+    if (!right.allowed)
+      throw new DomainError('FORBIDDEN', 'Não é revisor autorizado por esta etapa.', 403);
     if (port === FLOW_SUCCESS && !artifact.workspace.tests_passed)
       throw new DomainError(
         'REVIEW_TESTS_FAILED',
@@ -668,12 +671,14 @@ export class FlowEngine {
     );
     if (repeated.rowCount)
       throw new DomainError('REVIEW_ALREADY_DECIDED', 'Já decidiu sobre este commit.', 409);
+    const decisionId = randomUUID();
+    const administrativeAuthor = member.role === 'admin' && member.id === run.ticket.created_by;
     await run.client.query(
       `INSERT INTO development_review_decisions(id,ticket_id,step_id,workspace_id,head_sha,scope_hash,
-         actor_id,port,comment_body,idempotency_key,override_used)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+         actor_id,port,comment_body,idempotency_key,override_used,administrative_author)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [
-        randomUUID(),
+        decisionId,
         run.ticket.id,
         step.id,
         artifact.workspace.id,
@@ -684,6 +689,7 @@ export class FlowEngine {
         input.comment,
         input.idempotencyKey,
         right.override,
+        administrativeAuthor,
       ],
     );
     const eligible = await eligibleReviewers(
@@ -693,15 +699,16 @@ export class FlowEngine {
       run.ticket.created_by,
     );
     const required = requiredApprovals(review, eligible.length);
-    const approvals = Number(
-      (
-        await run.client.query<{ total: number }>(
-          `SELECT COUNT(DISTINCT actor_id) AS total FROM development_review_decisions
-            WHERE step_id=$1 AND head_sha=$2 AND port=$3 AND invalidated_at IS NULL`,
-          [step.id, artifact.headSha, FLOW_SUCCESS],
-        )
-      ).rows[0]?.total ?? 0,
-    );
+    const approvals = (
+      await validReviewApprovals(run.client, {
+        projectId: run.ticket.project_id,
+        stepId: step.id,
+        headSha: artifact.headSha,
+        scopeHash: artifact.scopeHash,
+        authorId: run.ticket.created_by,
+        review,
+      })
+    ).length;
     const output = { approvals, required, headSha: artifact.headSha };
     await this.event(run, step.id, 'review_decision_recorded', member.id, {
       port,
@@ -710,6 +717,10 @@ export class FlowEngine {
       approvals,
       required,
       override: right.override,
+      decisionId,
+      administrativeAuthor,
+      separationOfDuties: review.separationOfDuties,
+      reviewers: review.reviewers,
     });
     return {
       complete: port !== FLOW_SUCCESS || approvals >= required,

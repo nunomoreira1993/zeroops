@@ -16,6 +16,7 @@ import {
   eligibleReviewers,
   requiredApprovals,
   reviewArtifact,
+  validReviewApprovals,
   type WorkspaceRow,
 } from '../development/development.store.js';
 import {
@@ -202,39 +203,20 @@ export async function evaluateDeliveryGates(
     return { ok: false, reason: 'Os testes finais do candidato não passaram.' };
   if (artifact.workspace.repository_id !== pipeline.repository_id)
     return { ok: false, reason: 'A pipeline pertence a outro repositório do projeto.' };
-  const decisions = await client.query<{
-    actor_id: string;
-    display_name: string;
-    override_used: boolean;
-    admin: number;
-  }>(
-    `SELECT d.actor_id,u.display_name,d.override_used,
-            EXISTS(SELECT 1 FROM project_memberships m WHERE m.project_id=$3 AND m.user_id=d.actor_id
-                      AND m.role='admin' AND NOT m.disabled AND NOT u.disabled) AS admin
-       FROM development_review_decisions d JOIN users u ON u.id=d.actor_id
-      WHERE d.step_id=$1 AND d.head_sha=$2 AND d.port=$4 AND d.invalidated_at IS NULL
-      ORDER BY d.created_at`,
-    [reviewStep.id, artifact.headSha, input.projectId, FLOW_SUCCESS],
-  );
+  const approvals = await validReviewApprovals(client, {
+    projectId: input.projectId,
+    stepId: reviewStep.id,
+    headSha: artifact.headSha,
+    scopeHash: artifact.scopeHash,
+    authorId: ticket.created_by,
+    review,
+  });
   const eligible = await eligibleReviewers(client, input.projectId, review, ticket.created_by);
-  const eligibleIds = new Set(eligible.map((item) => item.id));
-  const approvals = new Map<string, DeliveryApproval>();
-  for (const row of decisions.rows) {
-    const valid = row.override_used
-      ? review.adminOverride && Boolean(Number(row.admin)) && row.actor_id !== ticket.created_by
-      : eligibleIds.has(row.actor_id);
-    if (valid)
-      approvals.set(row.actor_id, {
-        actorId: row.actor_id,
-        displayName: row.display_name,
-        override: Boolean(row.override_used),
-      });
-  }
   const required = requiredApprovals(review, eligible.length);
-  if (approvals.size < required)
+  if (approvals.length < required)
     return {
       ok: false,
-      reason: `Faltam aprovações válidas sobre ${artifact.headSha.slice(0, 12)} (${approvals.size}/${required}).`,
+      reason: `Faltam aprovações válidas sobre ${artifact.headSha.slice(0, 12)} (${approvals.length}/${required}).`,
     };
   // P10: tickets de desenvolvimento de capacidade exigem também autorização de publicação.
   const capability = await capabilityPublishGate(client, {
@@ -250,7 +232,7 @@ export async function evaluateDeliveryGates(
     headSha: artifact.headSha,
     scopeHash: artifact.scopeHash,
     reviewStepId: reviewStep.id,
-    approvals: [...approvals.values()],
+    approvals,
     required,
   };
 }

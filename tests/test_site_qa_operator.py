@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 MODULE = Path(__file__).parents[1] / "deploy" / "qa" / "site-qa-operator.py"
 SPEC = importlib.util.spec_from_file_location("site_operator", MODULE)
@@ -39,6 +39,10 @@ PHP = (
     'require_once ($dir_admin . "/include/rodape.inc.php");\n'
 ).encode("utf-8")
 MARKER = b"ZeroOps E2E check\n"
+APPROVED_FILES = {
+    "adm/zeroops-server-check.php": "a40980e147102402877abb5d8bdd5d25a198040c32566d9729062f54edf96170",
+    "zeroops-check.txt": "8208ab3838ba2f0f5a8f937ef8472d953d90b1679230fe74e35bb9ae0a15e6e3",
+}
 
 
 def git(*args, cwd=None):
@@ -151,9 +155,10 @@ class SiteQaTests(unittest.TestCase):
         return payload
 
     def run_delivery(self, **changes):
-        self.assertEqual(self.operator.submit(self.payload(**changes))[0], 202)
-        self.operator.run(KEY)
-        return self.operator.load(KEY)
+        payload = self.payload(**changes)
+        self.assertEqual(self.operator.submit(payload)[0], 202)
+        self.operator.run(payload["idempotencyKey"])
+        return self.operator.load(payload["idempotencyKey"])
 
     def test_publishes_exact_sha_preserves_untracked_and_returns_checked_callback(self):
         record = self.run_delivery()
@@ -162,6 +167,8 @@ class SiteQaTests(unittest.TestCase):
         self.assertEqual((self.webroot / "local-private.txt").read_bytes(),
                          b"preserve this untracked file\n")
         self.assertEqual(self.host.php_checks, [PHP, PHP])
+        for path, digest in APPROVED_FILES.items():
+            self.assertEqual(hashlib.sha256((self.webroot / path).read_bytes()).hexdigest(), digest)
         journal = self.host.journal(KEY)
         self.assertEqual((journal["previous"], journal["sha"], journal["untrackedCount"]),
                          (self.base, self.sha, 1))
@@ -196,16 +203,28 @@ class SiteQaTests(unittest.TestCase):
         self.assertEqual(self.host.deploys, [])
         self.assertEqual(self.host.identity(), self.base)
 
-    def test_change_outside_the_two_authorized_paths_is_rejected(self):
-        (self.seed / "adm" / "index.php").write_bytes(b"unrelated edit\n")
+    def test_other_approved_artifact_can_modify_rename_delete_and_add_binary_files(self):
+        self.run_delivery()
+        binary = b"\x00\x01\xffapproved asset\n"
+        (self.seed / "assets").mkdir()
+        (self.seed / "assets" / "image.bin").write_bytes(binary)
+        (self.seed / "adm" / "index.php").write_bytes(b"<?php echo 'approved update';\n")
+        git("mv", "zeroops-check.txt", "service-status.txt", cwd=self.seed)
+        git("rm", "adm/zeroops-server-check.php", cwd=self.seed)
         git("add", ".", cwd=self.seed)
-        git("commit", "-qm", "outside scope", cwd=self.seed)
+        git("commit", "-qm", "another approved artifact", cwd=self.seed)
         sha = git("rev-parse", "HEAD", cwd=self.seed)
         git("push", "-q", str(self.source), "qa", cwd=self.seed)
-        record = self.run_delivery(sha=sha, artifactDigest=self.host.archive_digest(str(self.source), sha))
-        self.assertEqual(record["state"], "failed")
-        self.assertEqual(self.host.deploys, [])
-        self.assertIn("so autoriza", record["message"])
+        record = self.run_delivery(idempotencyKey="aaaaaaaa-2222-4333-8444-555555555555",
+                                   ticket="different-ticket", sha=sha,
+                                   artifactDigest=self.host.archive_digest(str(self.source), sha))
+        self.assertEqual(record["state"], "succeeded")
+        self.assertEqual(self.host.identity(), sha)
+        self.assertEqual((self.webroot / "assets" / "image.bin").read_bytes(), binary)
+        self.assertEqual((self.webroot / "service-status.txt").read_bytes(), MARKER)
+        self.assertFalse((self.webroot / "zeroops-check.txt").exists())
+        self.assertFalse((self.webroot / "adm" / "zeroops-server-check.php").exists())
+        self.assertEqual((self.webroot / "local-private.txt").read_bytes(), b"preserve this untracked file\n")
 
     def test_php_validation_failure_blocks_publication(self):
         def invalid(body):
@@ -216,16 +235,97 @@ class SiteQaTests(unittest.TestCase):
         self.assertEqual(self.host.deploys, [])
         self.assertIn("PHP syntax", record["message"])
 
-    def test_content_outside_the_reviewed_diagnostic_is_rejected(self):
+    def test_changed_diagnostic_without_the_approved_digest_is_rejected(self):
         (self.seed / "adm" / "zeroops-server-check.php").write_bytes(b"<?php print_r($_SERVER);\n")
         git("add", ".", cwd=self.seed)
         git("commit", "-qm", "unsafe", cwd=self.seed)
         sha = git("rev-parse", "HEAD", cwd=self.seed)
         git("push", "-q", str(self.source), "qa", cwd=self.seed)
-        record = self.run_delivery(sha=sha, artifactDigest=self.host.archive_digest(str(self.source), sha))
+        record = self.run_delivery(sha=sha)
         self.assertEqual(record["state"], "failed")
         self.assertEqual(self.host.deploys, [])
-        self.assertIn("filtrado", record["message"])
+        self.assertIn("Digest", record["message"])
+
+    def test_new_symlink_is_rejected_before_touching_the_site(self):
+        file = self.seed / "redirect"
+        file.write_bytes(b"../outside")
+        digest = git("hash-object", "-w", str(file), cwd=self.seed)
+        git("update-index", "--add", "--cacheinfo", "120000," + digest + ",redirect", cwd=self.seed)
+        git("commit", "-qm", "unsafe symlink", cwd=self.seed)
+        sha = git("rev-parse", "HEAD", cwd=self.seed)
+        git("push", "-q", str(self.source), "qa", cwd=self.seed)
+        record = self.run_delivery(sha=sha, artifactDigest=self.host.archive_digest(str(self.source), sha))
+        self.assertEqual(record["state"], "failed")
+        self.assertIn("symlinks", record["message"])
+        self.assertEqual(self.host.deploys, [])
+        self.assertFalse(os.path.lexists(self.webroot / "redirect"))
+
+    def test_configured_project_and_branch_are_used_for_the_entire_publication(self):
+        branch = "quality-validation"
+        git("branch", "-m", branch, cwd=self.seed)
+        git("push", "-q", str(self.source), branch, cwd=self.seed)
+        git("--git-dir", str(self.target), "branch", branch, self.base)
+        self.host.site_git("branch", "-m", branch)
+        config = site.SiteConfig(dict(self.env, ZEROOPS_ROLLOUT_TARGET_BRANCH=branch,
+                                      ZEROOPS_ROLLOUT_ALLOWED_REFS=branch,
+                                      ZEROOPS_SITE_PROJECT_ID="another-project",
+                                      ZEROOPS_SITE_REPOSITORY_ID="another-repository"))
+        self.host = FixtureHost(config)
+        self.operator = site.SiteOperator(config, self.host, log=lambda event: None)
+        record = self.run_delivery(ref=branch, ticket="unrelated-ticket")
+        self.assertEqual(record["state"], "succeeded")
+        self.assertEqual(self.host.identity(), self.sha)
+        self.assertEqual(self.host.callbacks[-1]["sha"], self.sha)
+
+    def http_host(self, checks):
+        config = site.SiteConfig(dict(self.env, ZEROOPS_SITE_HTTP_CHECKS=json.dumps(checks)))
+        return site.SiteHost(config)
+
+    def response(self, status, body):
+        response = io.BytesIO(body)
+        response.status = status
+        return response
+
+    def test_http_verification_rejects_stale_served_bytes_even_with_the_right_git_sha(self):
+        self.run_delivery()
+        host = self.http_host([{"url": "https://site.example.invalid/zeroops-check.txt",
+                                "artifactPath": "zeroops-check.txt"}])
+        for body, healthy in ((MARKER, True), (b"previous cached content", False)):
+            opener = Mock()
+            opener.open.side_effect = [self.response(200, b"healthy"), self.response(200, body)]
+            with patch.object(site.ssl, "create_default_context"), \
+                    patch.object(site.urllib.request, "build_opener", return_value=opener):
+                self.assertEqual(host.runtime(), (self.sha, healthy))
+            self.assertEqual(opener.open.call_args[0][0].full_url,
+                             "https://site.example.invalid/zeroops-check.txt")
+
+    def test_protected_probe_rejects_exposed_server_keys_without_printing_the_response(self):
+        self.run_delivery()
+        host = self.http_host([{"url": "https://site.example.invalid/adm/zeroops-server-check.php",
+                                "statuses": [200, 302], "forbiddenText": ["SERVER_NAME"]}])
+        opener = Mock()
+        opener.open.side_effect = [self.response(200, b"healthy"),
+                                   self.response(200, b"SERVER_NAME: private-value")]
+        output = io.StringIO()
+        with patch.object(site.ssl, "create_default_context"), \
+                patch.object(site.urllib.request, "build_opener", return_value=opener), \
+                patch.object(sys, "stdout", output):
+            self.assertEqual(host.runtime(), (self.sha, False))
+        self.assertIn("site.health_failed", output.getvalue())
+        self.assertNotIn("private-value", output.getvalue())
+
+    def test_probe_rejects_redirects_and_urls_outside_the_configured_origin(self):
+        self.run_delivery()
+        host = self.http_host([{"url": "https://site.example.invalid/zeroops-check.txt",
+                                "artifactPath": "zeroops-check.txt"}])
+        opener = Mock()
+        opener.open.side_effect = [self.response(200, b"healthy"), self.response(302, b"")]
+        with patch.object(site.ssl, "create_default_context"), \
+                patch.object(site.urllib.request, "build_opener", return_value=opener):
+            self.assertEqual(host.runtime(), (self.sha, False))
+        self.assertIsNone(site.NoRedirect().redirect_request(None, None, 302, "", {}, "https://other.invalid/"))
+        with self.assertRaisesRegex(ValueError, "origem"):
+            self.http_host([{"url": "https://other.invalid/marker", "artifactPath": "marker"}])
 
     def test_restart_reconciles_completed_publisher_without_repeating_git_merge(self):
         self.operator.submit(self.payload())

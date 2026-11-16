@@ -6,6 +6,7 @@ const binding = {
   projectId: 'project',
   repositoryId: 'repository',
   url: 'https://github.com/example/site.git',
+  targetBranch: 'qa',
   allowedRefs: ['qa'],
 };
 const row = {
@@ -50,4 +51,26 @@ test('does not turn a decryption failure or an invalid credential into success',
   );
   for (const token of ['', 'token\ninjected', 'x'.repeat(501)])
     assert.throws(() => boundCredential(row, binding, () => token), /invalida/);
+});
+
+test('uses the configured branch for a different project without changing the provider', () => {
+  const other = {
+    projectId: 'other-project',
+    repositoryId: 'other-repository',
+    url: 'https://github.com/another-owner/application.git',
+    targetBranch: 'staging',
+    allowedRefs: ['staging'],
+  };
+  const repository = {
+    ...row,
+    project_id: other.projectId,
+    id: other.repositoryId,
+    url: other.url,
+    base_branch: other.targetBranch,
+  };
+  assert.equal(boundCredential(repository, other, () => 'fixture-token'), 'fixture-token');
+  assert.throws(
+    () => boundCredential(repository, { ...other, targetBranch: 'qa' }, () => 'fixture-token'),
+    /Binding/,
+  );
 });

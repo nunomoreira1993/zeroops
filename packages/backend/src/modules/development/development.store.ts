@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   DEVELOPMENT_BRANCH_PREFIX,
   developmentScopeInput,
+  FLOW_SUCCESS,
   flowReviewConfig,
   type DevelopmentCommand,
   type DevelopmentFileChange,
@@ -203,6 +204,58 @@ export function reviewDecisionRight(
   if (listed) return { allowed: true, override: false };
   if (member.role === 'admin' && review.adminOverride) return { allowed: true, override: true };
   return { allowed: false, override: false };
+}
+
+/** As mesmas aprovações atuais alimentam a UI, o quórum do motor e os gates da entrega. */
+export async function validReviewApprovals(
+  client: Queryable,
+  input: {
+    projectId: string;
+    stepId: string;
+    headSha: string;
+    scopeHash: string;
+    authorId: string;
+    review: FlowReviewConfig;
+  },
+) {
+  const decisions = await client.query<{
+    actor_id: string;
+    display_name: string;
+    role: User['role'];
+    override_used: boolean;
+  }>(
+    `SELECT d.actor_id,u.display_name,m.role,d.override_used
+       FROM development_review_decisions d
+       JOIN users u ON u.id=d.actor_id AND NOT u.disabled
+       JOIN project_memberships m ON m.user_id=d.actor_id AND m.project_id=$4 AND NOT m.disabled
+      WHERE d.step_id=$1 AND d.head_sha=$2 AND d.scope_hash=$3 AND d.port=$5 AND d.invalidated_at IS NULL
+      ORDER BY d.created_at`,
+    [input.stepId, input.headSha, input.scopeHash, input.projectId, FLOW_SUCCESS],
+  );
+  const approvals = new Map<
+    string,
+    { actorId: string; displayName: string; override: boolean }
+  >();
+  for (const decision of decisions.rows) {
+    const right = reviewDecisionRight(
+      { id: decision.actor_id, role: decision.role },
+      input.review,
+      input.authorId,
+    );
+    const valid = decision.override_used
+      ? input.review.adminOverride &&
+        decision.role === 'admin' &&
+        decision.actor_id !== input.authorId &&
+        right.allowed
+      : right.allowed && !right.override;
+    if (valid)
+      approvals.set(decision.actor_id, {
+        actorId: decision.actor_id,
+        displayName: decision.display_name,
+        override: Boolean(decision.override_used),
+      });
+  }
+  return [...approvals.values()];
 }
 
 export { flowReviewConfig };
@@ -676,6 +729,7 @@ export class DevelopmentStore {
           scope_hash: string;
           comment_body: string | null;
           override_used: boolean;
+          administrative_author: boolean;
           invalidated_at: Date | null;
           invalidation_reason: string | null;
           created_at: Date;
@@ -759,6 +813,7 @@ export class DevelopmentStore {
           scopeHash: item.scope_hash,
           comment: item.comment_body,
           override: Boolean(item.override_used),
+          administrativeAuthor: Boolean(item.administrative_author),
           invalidatedAt: item.invalidated_at ? new Date(item.invalidated_at).toISOString() : null,
           invalidationReason: item.invalidation_reason,
           createdAt: new Date(item.created_at).toISOString(),
@@ -797,24 +852,21 @@ export class DevelopmentStore {
     if (!node) return null;
     const review = flowReviewConfig({ op: node.op, config: node.config ?? {} });
     if (!review) return null;
-    const artifact = (
-      await this.db.query<{ head_sha: string | null }>(
-        'SELECT head_sha FROM development_workspaces WHERE ticket_id=$1 AND node_id=$2 ORDER BY updated_at DESC LIMIT 1',
-        [ticketId, review.sourceNode],
-      )
-    ).rows[0];
+    const artifact = await reviewArtifact(this.db, ticketId, review.sourceNode);
     const eligible = await eligibleReviewers(this.db, member.projectId, review, authorId);
-    const approvals = artifact?.head_sha
-      ? Number(
-          (
-            await this.db.query<{ total: number }>(
-              `SELECT COUNT(DISTINCT actor_id) AS total FROM development_review_decisions
-                WHERE step_id=$1 AND head_sha=$2 AND port='success' AND invalidated_at IS NULL`,
-              [step.id, artifact.head_sha],
-            )
-          ).rows[0]?.total ?? 0,
-        )
+    const approvals = artifact
+      ? (
+          await validReviewApprovals(this.db, {
+            projectId: member.projectId,
+            stepId: step.id,
+            headSha: artifact.headSha,
+            scopeHash: artifact.scopeHash,
+            authorId,
+            review,
+          })
+        ).length
       : 0;
+    const right = reviewDecisionRight(member, review, authorId);
     return {
       sourceNode: review.sourceNode,
       view: {
@@ -824,7 +876,9 @@ export class DevelopmentStore {
         required: requiredApprovals(review, eligible.length),
         approvals,
         reviewers: eligible.map(({ id, displayName }) => ({ id, displayName })),
-        canDecide: reviewDecisionRight(member, review, authorId).allowed,
+        canDecide: right.allowed,
+        administrativeAuthor:
+          member.role === 'admin' && member.id === authorId && right.allowed && !right.override,
       },
     };
   }
